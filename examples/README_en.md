@@ -111,7 +111,7 @@ npm run test:video-polling
 
 Compares server-side polling (server waits) and client-side polling (client polls manually).
 
-> Detailed documentation on image and video generation: [IMAGE_VIDEO_GENERATION_GUIDE.md](../IMAGE_VIDEO_GENERATION_GUIDE.md)
+> Detailed documentation on image and video generation: [IMAGE_VIDEO_GENERATION_GUIDE_en.md](../IMAGE_VIDEO_GENERATION_GUIDE_en.md)
 
 ## Modifying Examples
 

@@ -127,7 +127,7 @@ Update model list from Qwen Chat metadata:
 npm run models:sync
 ```
 
-Detailed report: [docs/QWEN_CHAT_MODELS.md](docs/QWEN_CHAT_MODELS.md)
+Detailed report: [docs/QWEN_CHAT_MODELS_en.md](docs/QWEN_CHAT_MODELS_en.md)
 
 ### Chat Completions
 
@@ -207,7 +207,7 @@ Legacy DashScope mode is still available:
 }
 ```
 
-Details: [IMAGE_VIDEO_GENERATION_GUIDE.md](IMAGE_VIDEO_GENERATION_GUIDE.md) and [docs/IMAGE_GENERATION.md](docs/IMAGE_GENERATION.md)
+Details: [IMAGE_VIDEO_GENERATION_GUIDE_en.md](IMAGE_VIDEO_GENERATION_GUIDE_en.md) and [docs/IMAGE_GENERATION_en.md](docs/IMAGE_GENERATION_en.md)
 
 ## Video generation via Qwen Chat
 
@@ -265,7 +265,7 @@ Base URL: http://host.docker.internal:3264/api
 API Key: dummy-key
 ```
 
-Full instructions: [docs/OPENWEBUI_SETUP.md](docs/OPENWEBUI_SETUP.md)
+Full instructions: [docs/OPENWEBUI_SETUP_en.md](docs/OPENWEBUI_SETUP_en.md)
 
 ## Hermes Agent / LiteLLM / Claude Code
 
@@ -361,11 +361,11 @@ curl http://localhost:3264/api/videos/status
 
 ## Documentation
 
-- [docs/FORK_DEMO_QUICKSTART.md](docs/FORK_DEMO_QUICKSTART.md) — quick start for demos/videos.
-- [docs/QWEN_CHAT_MODELS.md](docs/QWEN_CHAT_MODELS.md) — Qwen Chat model synchronization report.
-- [IMAGE_VIDEO_GENERATION_GUIDE.md](IMAGE_VIDEO_GENERATION_GUIDE.md) — image and video generation via `chatType`.
-- [docs/IMAGE_GENERATION.md](docs/IMAGE_GENERATION.md) — DashScope/Qwen Image endpoints.
-- [docs/OPENWEBUI_SETUP.md](docs/OPENWEBUI_SETUP.md) — Open WebUI connection guide.
+- [docs/FORK_DEMO_QUICKSTART_en.md](docs/FORK_DEMO_QUICKSTART_en.md) — quick start for demos/videos.
+- [docs/QWEN_CHAT_MODELS_en.md](docs/QWEN_CHAT_MODELS_en.md) — Qwen Chat model synchronization report.
+- [IMAGE_VIDEO_GENERATION_GUIDE_en.md](IMAGE_VIDEO_GENERATION_GUIDE_en.md) — image and video generation via `chatType`.
+- [docs/IMAGE_GENERATION_en.md](docs/IMAGE_GENERATION_en.md) — DashScope/Qwen Image endpoints.
+- [docs/OPENWEBUI_SETUP_en.md](docs/OPENWEBUI_SETUP_en.md) — Open WebUI connection guide.
 - [examples/hermes/config-snippet.yaml](examples/hermes/config-snippet.yaml) — Hermes Agent provider.
 - [examples/litellm/qwen_litellm.yaml](examples/litellm/qwen_litellm.yaml) — LiteLLM bridge.
 
