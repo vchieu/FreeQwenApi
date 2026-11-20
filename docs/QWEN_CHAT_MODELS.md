@@ -1,5 +1,7 @@
 # Синхронизация моделей Qwen Chat
 
+> 🌐 [English](QWEN_CHAT_MODELS_en.md) | **Русский** | [Tiếng Việt](QWEN_CHAT_MODELS_vi.md)
+
 Сгенерировано: 2026-06-05T13:56:59.888Z
 
 Источник: prerendered-метаданные моделей с https://chat.qwen.ai/.

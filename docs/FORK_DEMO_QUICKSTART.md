@@ -1,5 +1,7 @@
 # Быстрый старт для демо обновлённого fork FreeQwenApi
 
+> 🌐 [English](FORK_DEMO_QUICKSTART_en.md) | **Русский** | [Tiếng Việt](FORK_DEMO_QUICKSTART_vi.md)
+
 Этот fork подготовлен под практичный сценарий для видео и демонстраций:
 
 - синхронизация актуального списка моделей Qwen Chat (`qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-plus`);

@@ -1,5 +1,7 @@
 # Настройка Open WebUI для работы с FreeQwenApi
 
+> 🌐 [English](OPENWEBUI_SETUP_en.md) | **Русский** | [Tiếng Việt](OPENWEBUI_SETUP_vi.md)
+
 ## 1. Подключение к API
 
 ### Шаг 1: Администрирование

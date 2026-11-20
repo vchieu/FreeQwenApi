@@ -1,5 +1,7 @@
 # Настройка генерации изображений
 
+> 🌐 [English](IMAGE_GENERATION_en.md) | **Русский** | [Tiếng Việt](IMAGE_GENERATION_vi.md)
+
 ## Получение API ключа DashScope777
 
 1. Зарегистрируйтесь на платформе Alibaba Cloud DashScope:

@@ -7,20 +7,20 @@ echo ║  FreeQwenApi - API Test                ║
 echo ╚════════════════════════════════════════╝
 echo.
 
-echo Запуск Node.js тестов...
+echo Running Node.js tests...
 echo.
 
 cd /d D:\Users\Dima\Desktop\FreeQwenApi
 
-echo Test 1: Обычный запрос (non-streaming)
+echo Test 1: Normal request (non-streaming)
 node scripts/run_tests.js
 echo.
 
-echo Test 2: Streaming тест
+echo Test 2: Streaming test
 node scripts/test_streaming.js
 echo.
 
-echo Test 3: Интерактивный чат (введите exit для выхода)
+echo Test 3: Interactive chat (type exit to quit)
 node scripts/interactive_chat.js
 echo.
 
