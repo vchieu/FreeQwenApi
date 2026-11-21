@@ -13,7 +13,7 @@ function isPlaywright(context) {
 async function getPage(context) {
     if (context && typeof context.goto === 'function') return context;
     if (context && typeof context.newPage === 'function') return await context.newPage();
-    throw new Error('Неверный контекст: не страница Puppeteer, не контекст Playwright');
+    throw new Error('Invalid context: not a Puppeteer instance, not a Playwright context');
 }
 
 async function promptUser(question) {
@@ -41,7 +41,7 @@ export async function checkAuthentication(context) {
         const page = await getPage(context);
         const isPW = isPlaywright(context);
 
-        logInfo('Проверка авторизации...');
+        logInfo('Checking authentication...');
 
         try {
             await page.goto(CHAT_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
@@ -50,35 +50,35 @@ export async function checkAuthentication(context) {
 
             const pageTitle = await page.title();
             if (pageTitle.includes('Verification')) {
-                logWarn('Обнаружена страница верификации. Пожалуйста, пройдите верификацию вручную.');
-                await promptUser('После прохождения верификации нажмите ENTER для продолжения...');
-                logInfo('Верификация подтверждена пользователем.');
+                logWarn('Verification stage detected. Please pass the verification in the browser.');
+                await promptUser('After passing verification, press ENTER to continue...');
+                logInfo('Verification confirmed by user.');
             }
 
             const loginCount = await countLoginContainers(page, isPW);
 
             if (loginCount === 0) {
-                logInfo('Авторизация обнаружена');
+                logInfo('Authentication detected');
                 setAuthenticationStatus(true);
                 try {
                     await extractAuthToken(context, true);
                     await saveSession(context);
-                    logInfo('Сессия обновлена');
-                } catch (e) { logError('Не удалось обновить сессию', e); }
+                    logInfo('Session updated');
+                } catch (e) { logError('Failed to update session', e); }
                 if (isPW) await page.close();
                 return true;
             }
 
             console.log('------------------------------------------------------');
-            console.log('               НЕОБХОДИМА АВТОРИЗАЦИЯ');
+            console.log('               MANUAL AUTHENTICATION REQUIRED');
             console.log('------------------------------------------------------');
-            console.log('1. Войдите в систему через GitHub или другой способ в открытом браузере');
-            console.log('2. Дождитесь завершения процесса авторизации');
-            console.log('3. Нажмите ENTER в этой консоли');
+            console.log('1. Log in to the system via GitHub or another method in the opened browser');
+            console.log('2. Wait for the authentication process to complete');
+            console.log('3. Press ENTER in this console');
             console.log('------------------------------------------------------');
 
-            await promptUser('После успешной авторизации нажмите ENTER для продолжения...');
-            logInfo('Пользователь подтвердил завершение авторизации.');
+            await promptUser('After successful authentication, press ENTER to continue...');
+            logInfo('User confirmed authentication completion.');
 
             await page.reload({ waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
             await delay(3000);
@@ -86,7 +86,7 @@ export async function checkAuthentication(context) {
             const loginCountAfter = await countLoginContainers(page, isPW);
 
             if (loginCountAfter === 0) {
-                logInfo('Авторизация подтверждена.');
+                logInfo('Authentication confirmed.');
                 setAuthenticationStatus(true);
                 await saveSession(context);
                 await extractAuthToken(context, true);
@@ -94,7 +94,7 @@ export async function checkAuthentication(context) {
                 return true;
             }
 
-            logWarn('Авторизация не обнаружена.');
+            logWarn('Authentication not detected.');
             setAuthenticationStatus(false);
             return false;
         } catch (error) {
@@ -102,7 +102,7 @@ export async function checkAuthentication(context) {
             throw error;
         }
     } catch (error) {
-        logError('Ошибка при проверке авторизации', error);
+        logError('Error checking authentication', error);
         setAuthenticationStatus(false);
         return false;
     }
@@ -113,20 +113,20 @@ export async function startManualAuthentication(context, skipRestart = false) {
         const page = await getPage(context);
         const isPW = isPlaywright(context);
 
-        logInfo('Открытие страницы для ручной авторизации...');
+        logInfo('Opening page for manual authentication...');
 
         try {
             await page.goto(AUTH_SIGNIN_URL, { waitUntil: 'load', timeout: PAGE_TIMEOUT });
 
             console.log('------------------------------------------------------');
-            console.log('               НЕОБХОДИМА АВТОРИЗАЦИЯ');
+            console.log('               MANUAL AUTHENTICATION REQUIRED');
             console.log('------------------------------------------------------');
-            console.log('1. Войдите в систему в открытом браузере');
-            console.log('2. Дождитесь завершения процесса авторизации');
-            console.log('3. Нажмите ENTER в этой консоли');
+            console.log('1. Log in to the system in the opened browser');
+            console.log('2. Wait for the authentication process to complete');
+            console.log('3. Press ENTER in this console');
             console.log('------------------------------------------------------');
 
-            await promptUser('После успешной авторизации нажмите ENTER для продолжения...');
+            await promptUser('After successful authentication, press ENTER to continue...');
 
             await page.goto(CHAT_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
             await delay(RETRY_DELAY);
@@ -134,17 +134,17 @@ export async function startManualAuthentication(context, skipRestart = false) {
             const loginCount = await countLoginContainers(page, isPW);
 
             if (loginCount === 0) {
-                logInfo('Авторизация подтверждена.');
+                logInfo('Authentication confirmed.');
                 setAuthenticationStatus(true);
                 await saveSession(context);
                 await extractAuthToken(context, true);
-                logInfo('Сессия сохранена успешно!');
+                logInfo('Session saved successfully!');
                 if (isPW) await page.close();
                 if (!skipRestart) await restartBrowserInHeadlessMode();
                 return true;
             }
 
-            logWarn('Авторизация не удалась.');
+            logWarn('Authentication failed.');
             setAuthenticationStatus(false);
             return false;
         } catch (error) {
@@ -152,7 +152,7 @@ export async function startManualAuthentication(context, skipRestart = false) {
             throw error;
         }
     } catch (error) {
-        logError('Ошибка при ручной авторизации', error);
+        logError('Error during manual authentication', error);
         setAuthenticationStatus(false);
         return false;
     }
@@ -162,8 +162,8 @@ export async function checkVerification(page) {
     try {
         const pageTitle = await page.title();
         if (pageTitle.includes('Verification')) {
-            logWarn('Обнаружена страница верификации');
-            await promptUser('Пройдите верификацию и нажмите ENTER...');
+            logWarn('Verification stage detected');
+            await promptUser('Please pass the verification and press ENTER...');
             return true;
         }
         return false;

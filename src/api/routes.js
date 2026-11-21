@@ -15,39 +15,39 @@ import crypto from 'crypto';
 import { listTokens, markInvalid, markRateLimited, markValid, addTokenFromString, deleteAccount, decodeTokenInfo, updateAccountToken, setLabel } from './tokenManager.js';
 import { FORGETMEAI_WATERMARK } from '../utils/branding.js';
 
-// Функция для генерирования детерминированного chatId на основе истории
+// Function for generating a deterministic chatId based on history
 function generateChatIdFromHistory(messages) {
     if (!Array.isArray(messages) || messages.length === 0) {
         return null;
     }
-    
-    // Фильтруем служебные сообщения Open WebUI
-    // Игнорируем сообщения, которые начинаются с "### Task:" или "History:"
+
+    // Filter out Open WebUI fake messages
+    // Ignore messages that start with "### Task:" or "History:"
     const realMessages = messages.filter(m => {
         if (m.role !== 'user') return true;
         const content = typeof m.content === 'string' ? m.content : '';
         return !content.startsWith('### Task:') && !content.startsWith('History:');
     });
-    
-    // Если остались только служебные сообщения, используем исходные
+
+    // If only fake messages remain, use the originals
     const messagesToUse = realMessages.length > 0 ? realMessages : messages;
-    
-    // Используем хеш первого реального сообщения пользователя для создания стабильного ID
+
+    // Use the content of the first real user message to create a stable ID
     const userMessages = messagesToUse
         .filter(m => m.role === 'user')
-        .slice(0, 1) // Берём первое сообщение пользователя
+        .slice(0, 1) // Take the first user message
         .map(m => typeof m.content === 'string' ? m.content : JSON.stringify(m.content))
         .join('||');
-    
+
     if (!userMessages) return null;
-    
-    // Создаём хеш для детерминированного ID
+
+    // Create a hash for the deterministic ID
     const hash = crypto
         .createHash('sha256')
         .update(userMessages)
         .digest('hex')
         .substring(0, 16);
-    
+
     return `chat_${hash}`;
 }
 
@@ -147,13 +147,13 @@ function shouldPersistSessionContext(scope = null) {
     return Boolean(normalizedScope) || ALLOW_UNSCOPED_SESSION_CHAT_RESTORE;
 }
 
-// Глобальное хранилище для маппинга между сгенерированными ID и реальными Qwen chatId
+// Global cache for mapping between generated IDs and real Qwen chatIds
 const chatIdMap = new Map();
 
 function mapChatId(generatedId, qwenChatId) {
     if (generatedId) {
         chatIdMap.set(generatedId, qwenChatId);
-        logDebug(`Маппинг чата: ${generatedId} -> ${qwenChatId}`);
+        logDebug(`Chat mapping: ${generatedId} -> ${qwenChatId}`);
     }
 }
 
@@ -167,20 +167,20 @@ async function resolveQwenChatId(effectiveChatId, mappedModel) {
 
     if (mapped) {
         qwenChatId = mapped;
-        logInfo(`🔁 Используется сопоставленный Qwen chatId: ${qwenChatId} (from ${effectiveChatId})`);
+        logInfo(`ðŸ”„ Using cached Qwen chatId: ${qwenChatId} (from ${effectiveChatId})`);
         return qwenChatId;
     }
 
     if (effectiveChatId && effectiveChatId.startsWith('chat_')) {
         try {
-            const created = await createChatV2(mappedModel, 'Сессия OpenWebUI');
+            const created = await createChatV2(mappedModel, 'OpenWebUI session');
             if (created && created.chatId) {
                 mapChatId(effectiveChatId, created.chatId);
                 qwenChatId = created.chatId;
-                logInfo(`🔨 Создан Qwen chat ${qwenChatId} и привязан к ${effectiveChatId}`);
+                logInfo(`ðŸ”„ Created Qwen chat ${qwenChatId} and linked to ${effectiveChatId}`);
             }
         } catch (error) {
-            logDebug(`Не удалось создать Qwen chat для ${effectiveChatId}: ${error.message}`);
+            logDebug(`Failed to create Qwen chat for ${effectiveChatId}: ${error.message}`);
         }
     }
 
@@ -210,15 +210,15 @@ function isOpenWebUiMetaRequest(messages) {
 }
 
 // ============================================
-// СЕССИОННАЯ СИСТЕМА ДЛЯ ОТСЛЕЖИВАНИЯ ЧАТОВ
+// SESSION SYSTEM FOR CHAT RESTORATION
 // ============================================
-// Scoped-сессии (по conversation_id/chat_id) включены всегда.
-// Unscoped fallback по IP + User-Agent работает только в legacy-режиме
-// через ALLOW_UNSCOPED_SESSION_CHAT_RESTORE=true.
+// Scoped sessions (by conversation_id/chat_id) are always enabled.
+// Unscoped fallback by IP + User-Agent works only in legacy mode
+// via ALLOW_UNSCOPED_SESSION_CHAT_RESTORE=true.
 const sessionToChatMap = new Map(); // session-key -> {chatId, parentId, timestamp}
 
-// Одноразовые чаты (без conversation_id) убираем из истории Qwen:
-// неудачные/пустые — всегда (режим failed), успешные — только при AUTO_DELETE_CHATS=all.
+// One-shot chats (without conversation_id) are deleted from Qwen history:
+// failed/empty - always (mode "failed"), successful - only with AUTO_DELETE_CHATS=all.
 function cleanupEphemeralChat(result, effectiveChatId, isMeta) {
     if (isMeta || effectiveChatId || !result?.chatId) return;
 
@@ -229,7 +229,7 @@ function cleanupEphemeralChat(result, effectiveChatId, isMeta) {
 }
 
 function getSessionKey(req) {
-    // Создаём уникальный ключ сессии на основе IP и User-Agent
+    // Create a unique session key based on IP and User-Agent
     const ip = req.ip || req.connection.remoteAddress || 'unknown';
     const userAgent = req.get('user-agent') || 'unknown';
     return crypto.createHash('sha256').update(`${ip}||${userAgent}`).digest('hex');
@@ -267,7 +267,7 @@ function saveChatIdForSession(req, chatId, parentId, scope = null) {
     const scopeSuffix = normalizedScope ? ` (scope=${normalizedScope})` : "";
     logDebug(`Saved chatId ${chatId} for session ${sessionKey.substring(0, 8)}${scopeSuffix}`);
 }
-// Очистка старых сессий каждые 10 минут
+// Clean up expired sessions every 10 minutes
 setInterval(() => {
     const now = Date.now();
     const oneHourAgo = now - 3600000;
@@ -279,13 +279,13 @@ setInterval(() => {
         }
     }
     if (cleaned > 0) {
-        logDebug(`Очищено ${cleaned} старых сессий`);
+        logDebug(`Cleaned ${cleaned} expired sessions`);
     }
-}, 600000); // 10 минут
+}, 600000); // 10 minutes
 
 const router = express.Router();
 
-// ─── Multer для загрузки файлов ──────────────────────────────────────────────
+// --- Multer for file uploads ------------------------------------------------
 
 const storage = multer.diskStorage({
     destination(req, file, cb) {
@@ -300,7 +300,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage, limits: { fileSize: MAX_FILE_SIZE } });
 
-// ─── Auth middleware ─────────────────────────────────────────────────────────
+// --- Auth middleware ---------------------------------------------------------
 
 function authMiddleware(req, res, next) {
     const apiKeys = getApiKeys();
@@ -308,14 +308,14 @@ function authMiddleware(req, res, next) {
 
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        logError('Отсутствует или некорректный заголовок авторизации');
-        return res.status(401).json({ error: 'Требуется авторизация' });
+        logError('Missing or invalid authorization header');
+        return res.status(401).json({ error: 'Authorization required' });
     }
 
     const token = authHeader.substring(7).trim();
     if (!apiKeys.includes(token)) {
-        logError('Предоставлен недействительный API ключ');
-        return res.status(401).json({ error: 'Недействительный токен' });
+        logError('Unauthorized invalid API key');
+        return res.status(401).json({ error: 'Invalid token' });
     }
     next();
 }
@@ -326,35 +326,35 @@ router.use((req, res, next) => {
     next();
 });
 
-// ─── Helpers: message parsing ────────────────────────────────────────────────
+// --- Helpers: message parsing -----------------------------------------------
 
 function parseOpenAIMessages(messages) {
     const systemMsg = messages.find(msg => msg.role === 'system');
     const systemMessage = systemMsg ? systemMsg.content : null;
     const lastUserMessage = messages.filter(msg => msg.role === 'user').pop();
-    
+
     if (!lastUserMessage) {
         return { messageContent: null, systemMessage };
     }
-    
+
     let messageContent = lastUserMessage.content;
-    
-    // Преобразуем OpenAI format content array во внутренний формат
+
+    // Convert OpenAI format content array to internal format
     if (Array.isArray(messageContent)) {
         messageContent = messageContent.map(item => {
             if (item.type === 'text') {
                 return { type: 'text', text: item.text };
             } else if (item.type === 'image_url' && item.image_url) {
-                // OpenAI format: image_url: { url: '...' }
+                // OpenAI Format: image_url: { url: '...' }
                 return { type: 'image', image: item.image_url.url };
             } else if (item.type === 'image') {
-                // Уже во внутреннем формате
+                // Already in internal format
                 return { type: 'image', image: item.image };
             }
             return item;
         });
     }
-    
+
     return { messageContent, systemMessage };
 }
 
@@ -399,7 +399,7 @@ function buildStatelessTranscript(messages) {
             parts.push(`${msg.role || 'message'}: ${stringifyOpenAIContent(msg.content)}`);
         }
     }
-    return parts.join('\n\n');
+    return parts.join('\n');
 }
 
 
@@ -632,7 +632,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls) {
     res.write('data: ' + JSON.stringify({
         ...base,
         choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
-    }) + '\n\n');
+    }) + '\n');
     for (const call of toolCalls) {
         res.write('data: ' + JSON.stringify({
             ...base,
@@ -648,24 +648,24 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls) {
                 },
                 finish_reason: null
             }]
-        }) + '\n\n');
+        }) + '\n');
     }
     res.write('data: ' + JSON.stringify({
         ...base,
         choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]
-    }) + '\n\n');
-    res.write('data: [DONE]\n\n');
+    }) + '\n');
+    res.write('data: [DONE]\n');
     res.end();
 }
 
-// ─── Helpers: streaming ──────────────────────────────────────────────────────
+// --- Helpers: streaming -----------------------------------------------------
 
 async function handleStreamingResponse(res, mappedModel, messageContent, chatId, parentId, combinedTools, toolChoice, systemMessage) {
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    const writeSse = (payload) => res.write('data: ' + JSON.stringify(payload) + '\n\n');
+    const writeSse = (payload) => res.write('data: ' + JSON.stringify(payload) + '\n');
 
     writeSse({
         id: 'chatcmpl-stream', object: 'chat.completion.chunk',
@@ -680,7 +680,7 @@ async function handleStreamingResponse(res, mappedModel, messageContent, chatId,
             writeSse({
                 id: 'chatcmpl-stream', object: 'chat.completion.chunk',
                 created: Math.floor(Date.now() / 1000), model: mappedModel,
-                choices: [{ index: 0, delta: { content: `Ошибка: ${result.error}` }, finish_reason: null }]
+                choices: [{ index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: null }]
             });
         } else if (result.choices?.[0]?.message) {
             const content = String(result.choices[0].message.content || '');
@@ -701,16 +701,16 @@ async function handleStreamingResponse(res, mappedModel, messageContent, chatId,
             created: Math.floor(Date.now() / 1000), model: mappedModel,
             choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
         });
-        res.write('data: [DONE]\n\n');
+        res.write('data: [DONE]\n');
         res.end();
     } catch (error) {
-        logError('Ошибка при обработке потокового запроса', error);
+        logError('Error handling streaming request', error);
         writeSse({
             id: 'chatcmpl-stream', object: 'chat.completion.chunk',
             created: Math.floor(Date.now() / 1000), model: mappedModel,
             choices: [{ index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }]
         });
-        res.write('data: [DONE]\n\n');
+        res.write('data: [DONE]\n');
         res.end();
     }
 }
@@ -732,16 +732,16 @@ function handleNonStreamingResponse(res, result, mappedModel) {
     });
 }
 
-// ─── Routes ──────────────────────────────────────────────────────────────────
+// --- Routes -----------------------------------------------------------------
 
 router.post('/chat', async (req, res) => {
     try {
         const { message, messages, model, chatId, parentId, stream, chatType, size, waitForCompletion } = req.body;
 
-        // Поддержка как message, так и messages для совместимости
+        // Support both message and messages for compatibility
         let messageContent = message;
         let systemMessage = null;
-        let allMessages = messages; // Сохраняем всю историю
+        let allMessages = messages; // Preserve full history
         const isMeta = isOpenWebUiMetaRequest(messages);
 
         if (messages && Array.isArray(messages)) {
@@ -751,42 +751,42 @@ router.post('/chat', async (req, res) => {
         }
 
         if (!messageContent) {
-            logError('Запрос без сообщения');
-            return res.status(400).json({ error: 'Сообщение не указано' });
+            logError('Request without message');
+            return res.status(400).json({ error: 'Message not specified' });
         }
 
-        logInfo(`Получен запрос: ${typeof messageContent === 'string' ? messageContent.substring(0, 50) + (messageContent.length > 50 ? '...' : '') : 'Составное сообщение'}`);
+        logInfo(`Received request: ${typeof messageContent === 'string' ? messageContent.substring(0, 50) + (messageContent.length > 50 ? '...' : '') : 'Composite message'}`);
         if (systemMessage) {
             logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
         }
         if (chatId && !isMeta) {
-            logInfo(`Используется chatId: ${chatId}, parentId: ${parentId || 'null'}`);
+            logInfo(`Using chatId: ${chatId}, parentId: ${parentId || 'null'}`);
         } else if (isMeta) {
-            logDebug('OpenWebUI meta-запрос: используем отдельный чат (без привязки к сессии)');
+            logDebug('OpenWebUI meta-request: using separate chat (no history link)');
         }
         if (allMessages && allMessages.length > 1) {
-            logInfo(`История содержит ${allMessages.length} сообщений`);
+            logInfo(`History contains ${allMessages.length} messages`);
         }
 
         let mappedModel = model || DEFAULT_MODEL;
         if (model) {
             mappedModel = getMappedModel(model);
             if (mappedModel !== model) {
-                logInfo(`Модель "${model}" заменена на "${mappedModel}"`);
+                logInfo(`Model "${model}" replaced with "${mappedModel}"`);
             }
         }
-        logInfo(`Используется модель: ${mappedModel}`);
+        logInfo(`Using model: ${mappedModel}`);
 
-        // Поддержка стриминга для OpenWebUI
+        // Streaming support for OpenWebUI
         if (stream) {
             res.setHeader('Content-Type', 'text/event-stream');
             res.setHeader('Cache-Control', 'no-cache');
             res.setHeader('Connection', 'keep-alive');
-            // Важно для OpenWebUI - не кэшировать
+            // Important for OpenWebUI - do not buffer
             res.setHeader('X-Accel-Buffering', 'no');
 
             const writeSse = (payload) => {
-                res.write('data: ' + JSON.stringify(payload) + '\n\n');
+                res.write('data: ' + JSON.stringify(payload) + '\n');
             };
 
             try {
@@ -831,11 +831,11 @@ router.post('/chat', async (req, res) => {
                         created: Math.floor(Date.now() / 1000),
                         model: mappedModel || DEFAULT_MODEL,
                         choices: [
-                            { index: 0, delta: { content: `Ошибка: ${result.error}` }, finish_reason: 'stop' }
+                            { index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: 'stop' }
                         ]
                     });
                 } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
-                    // Qwen вернул JSON/обычный ответ вместо SSE - отправляем контент одним чанком
+                    // Qwen returned JSON/normal response instead of SSE - send final as single chunk
                     const content = result.choices[0].message.content;
                     logDebug(`JSON response content length: ${content.length}`);
                     if (typeof streamingCallback === 'function') {
@@ -854,9 +854,9 @@ router.post('/chat', async (req, res) => {
                 } else {
                     logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
                 }
-                // Чанки уже были отправлены через streamingCallback, не дублируем!
+                // Chunks were already sent via streamingCallback, don't duplicate!
 
-                // Финальный чанк
+                // Final chunk
                 writeSse({
                     id: 'chatcmpl-' + Date.now(),
                     object: 'chat.completion.chunk',
@@ -866,11 +866,11 @@ router.post('/chat', async (req, res) => {
                         { index: 0, delta: {}, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n\n');
+                res.write('data: [DONE]\n');
                 res.end();
                 return;
             } catch (error) {
-                logError('Ошибка при обработке потокового запроса', error);
+                logError('Error handling streaming request', error);
                 writeSse({
                     id: 'chatcmpl-stream',
                     object: 'chat.completion.chunk',
@@ -880,7 +880,7 @@ router.post('/chat', async (req, res) => {
                         { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n\n');
+                res.write('data: [DONE]\n');
                 res.end();
                 return;
             }
@@ -890,9 +890,9 @@ router.post('/chat', async (req, res) => {
 
         if (result.choices && result.choices[0] && result.choices[0].message) {
             const responseLength = result.choices[0].message.content ? result.choices[0].message.content.length : 0;
-            logInfo(`Ответ успешно сформирован для запроса, длина ответа: ${responseLength}`);
-            
-            // Сохраняем историю чата
+            logInfo(`Response successfully formatted for request, response length: ${responseLength}`);
+
+            // Save chat history
             if (result.chatId) {
                 try {
                     const currentChat = loadHistory(result.chatId);
@@ -902,17 +902,17 @@ router.post('/chat', async (req, res) => {
                     ];
                     saveHistory(result.chatId, { ...currentChat, messages: updatedMessages });
                 } catch (e) {
-                    logDebug(`Не удалось сохранить историю: ${e.message}`);
+                    logDebug(`Failed to save history: ${e.message}`);
                 }
             }
         } else if (result.error) {
-            logInfo(`Получена ошибка в ответе: ${result.error}`);
+            logInfo(`Received error in response: ${result.error}`);
         }
 
         res.json(result);
     } catch (error) {
-        logError('Ошибка при обработке запроса', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error processing request', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
@@ -938,14 +938,14 @@ router.get('/health', async (req, res) => {
             timestamp: new Date().toISOString()
         });
     } catch (error) {
-        logError('Ошибка health check', error);
-        res.status(500).json({ ok: false, error: 'Health-проверка не удалась' });
+        logError('Health check error', error);
+        res.status(500).json({ ok: false, error: 'Health check failed' });
     }
 });
 
 router.get('/models', async (req, res) => {
     try {
-        logInfo('Запрос на получение списка моделей');
+        logInfo('Request for model list');
         const modelsRaw = getAllModels();
         const openAiModels = {
             object: 'list',
@@ -957,19 +957,19 @@ router.get('/models', async (req, res) => {
                 permission: []
             }))
         };
-        logInfo(`Возвращено ${openAiModels.data.length} моделей (OpenAI формат)`);
+        logInfo(`Returned ${openAiModels.data.length} models (OpenAI format)`);
         res.json(openAiModels);
     } catch (error) {
-        logError('Ошибка при получении списка моделей', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error getting model list', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-// Прокси скачивания внешних медиа (картинки/видео/файлы Qwen CDN).
-// Нужен, т.к. fetch-blob с фронта к CDN блокируется CORS. Строгий whitelist + SSRF-guard.
+// Proxy for external media (images/videos/files from Qwen CDN).
+// Required because fetch-blob from CDN side is blocked by CORS. Strict whitelist + SSRF-guard.
 const DOWNLOAD_HOSTS = ['qwenlm.ai', 'aliyuncs.com', 'alicdn.com', 'aliyun.com'];
-// Валидация URL для прокси: только https, без IP-литералов/localhost, hostname в whitelist
-// доверенных CDN Qwen/Aliyun (домены не контролируются третьими лицами → DNS-rebinding неприменим).
+// URL validation for proxy: only https, no IP literals/localhost, hostname in whitelist
+// of trusted Qwen/Aliyun CDN (domains are not controllable by arbitrary IPs - DNS-rebinding inapplicable).
 function validateDownloadUrl(raw) {
     let u;
     try { u = new URL(String(raw)); } catch { return null; }
@@ -983,11 +983,11 @@ router.get('/download', async (req, res) => {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), 60_000);
     try {
-        if (!req.query.url) { clearTimeout(timer); return res.status(400).json({ error: 'Параметр url обязателен' }); }
+        if (!req.query.url) { clearTimeout(timer); return res.status(400).json({ error: 'Parameter url is required' }); }
         let u = validateDownloadUrl(req.query.url);
-        if (!u) { clearTimeout(timer); return res.status(403).json({ error: 'URL не разрешён (только https и домены Qwen/Aliyun CDN)' }); }
+        if (!u) { clearTimeout(timer); return res.status(403).json({ error: 'URL not allowed (only https and Qwen/Aliyun CDN domains)' }); }
 
-        // Редиректы не следуем автоматически — каждый hop валидируем заново (защита от SSRF через redirect).
+        // Redirects are not followed automatically - each hop is validated anew (protection against SSRF via redirect).
         let upstream, hops = 0;
         for (;;) {
             upstream = await fetch(u.toString(), { redirect: 'manual', signal: ctrl.signal });
@@ -995,13 +995,13 @@ router.get('/download', async (req, res) => {
                 const loc = upstream.headers.get('location');
                 let next = null;
                 if (loc) { try { next = validateDownloadUrl(new URL(loc, u).toString()); } catch { next = null; } }
-                if (!loc || ++hops > 3) { clearTimeout(timer); return res.status(502).json({ error: 'Недопустимая цепочка редиректов' }); }
-                if (!next) { clearTimeout(timer); return res.status(403).json({ error: 'Редирект на недопустимый адрес' }); }
+                if (!loc || ++hops > 3) { clearTimeout(timer); return res.status(502).json({ error: 'Too many redirects' }); }
+                if (!next) { clearTimeout(timer); return res.status(403).json({ error: 'Redirect to disallowed address' }); }
                 u = next; continue;
             }
             break;
         }
-        if (!upstream.ok || !upstream.body) { clearTimeout(timer); return res.status(502).json({ error: `Источник вернул ${upstream.status}` }); }
+        if (!upstream.ok || !upstream.body) { clearTimeout(timer); return res.status(502).json({ error: `Upstream returned ${upstream.status}` }); }
 
         const name = String(req.query.name || u.pathname.split('/').pop() || 'download')
             .replace(/[^\w.\-]+/g, '_').slice(0, 120) || 'download';
@@ -1020,15 +1020,15 @@ router.get('/download', async (req, res) => {
         res.end();
     } catch (error) {
         clearTimeout(timer);
-        logError('Ошибка проксирования скачивания', error);
-        if (!res.headersSent) res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Proxy streaming error', error);
+        if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
         else try { res.end(); } catch { /* noop */ }
     }
 });
 
 router.get('/status', async (req, res) => {
     try {
-        logInfo('Запрос статуса авторизации');
+        logInfo('Auth status request');
         const tokens = listTokens();
         const accounts = await Promise.all(tokens.map(async t => {
             const accInfo = { id: t.id, status: 'UNKNOWN', resetAt: t.resetAt || null };
@@ -1048,34 +1048,34 @@ router.get('/status', async (req, res) => {
 
         const browserContext = getBrowserContext();
         if (!browserContext) {
-            logError('Браузер не инициализирован');
-            return res.json({ authenticated: false, message: 'Браузер не инициализирован', accounts });
+            logError('Browser is not initialized');
+            return res.json({ authenticated: false, message: 'Browser is not initialized', accounts });
         }
 
         if (getAuthenticationStatus()) return res.json({ accounts });
 
         await checkAuthentication(browserContext);
         const isAuthenticated = getAuthenticationStatus();
-        logInfo(`Статус авторизации: ${isAuthenticated ? 'активна' : 'требуется авторизация'}`);
-        res.json({ authenticated: isAuthenticated, message: isAuthenticated ? 'Авторизация активна' : 'Требуется авторизация', accounts });
+        logInfo(`Auth status: ${isAuthenticated ? 'active' : 'authentication required'}`);
+        res.json({ authenticated: isAuthenticated, message: isAuthenticated ? 'Authentication is active' : 'Authentication required', accounts });
     } catch (error) {
-        logError('Ошибка при проверке статуса авторизации', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error checking auth status', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-// ─── Управление аккаунтами (для дашборда) ──────────────────────────────────
-// Управление аккаунтами чувствительно (токены), поэтому доступно только с
-// localhost — защита от доступа из LAN (HOST=0.0.0.0 слушает на всех интерфейсах).
+// --- Account management (for dashboard) -------------------------------------
+// Account management is explicit (tokens), so it is available only from
+// localhost - protection against LAN access (HOST=0.0.0.0 exposes to entire network).
 function localOnly(req, res, next) {
     const ip = req.socket?.remoteAddress || '';
     if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return next();
-    logWarn(`Отклонён не-локальный доступ к /accounts с ${ip}`);
-    return res.status(403).json({ error: 'Управление аккаунтами доступно только с localhost' });
+    logWarn(`Blocked non-local access to /accounts from ${ip}`);
+    return res.status(403).json({ error: 'Account management is available only from localhost' });
 }
 
-// CSRF-защита для мутирующих запросов: ACAO:* разрешает cross-origin вызовы,
-// поэтому запрещаем запросы, чей Origin не совпадает с хостом сервера.
+// CSRF protection for mutating requests: ACAO:* allows cross-origin calls,
+// so we reject requests whose Origin does not match the server origin.
 function sameOriginOnly(req, res, next) {
     const origin = req.get('origin');
     if (origin) {
@@ -1085,10 +1085,10 @@ function sameOriginOnly(req, res, next) {
         if (/^(chrome-extension|moz-extension|safari-web-extension):\/\//i.test(origin)) return next();
         try {
             if (new URL(origin).host !== req.get('host')) {
-                return res.status(403).json({ error: 'Cross-origin запрос запрещён' });
+                return res.status(403).json({ error: 'Cross-origin request denied' });
             }
         } catch {
-            return res.status(403).json({ error: 'Некорректный Origin' });
+            return res.status(403).json({ error: 'Invalid Origin' });
         }
     }
     return next();
@@ -1114,22 +1114,22 @@ router.get('/accounts', localOnly, sameOriginOnly, (req, res) => {
         });
         res.json({ accounts });
     } catch (error) {
-        logError('Ошибка при получении списка аккаунтов', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error getting account list', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 router.post('/accounts', localOnly, sameOriginOnly, (req, res) => {
     try {
         const token = req.body?.token;
-        if (!token) return res.status(400).json({ error: 'Не передан token' });
+        if (!token) return res.status(400).json({ error: 'Token not provided' });
         const result = addTokenFromString(token, req.body?.label);
         if (result.error) return res.status(400).json(result);
-        logInfo(`Добавлен аккаунт через дашборд: ${result.id}`);
+        logInfo(`Added account via dashboard: ${result.id}`);
         res.json({ ok: true, id: result.id });
     } catch (error) {
-        logError('Ошибка при добавлении аккаунта', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error adding account', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
@@ -1137,22 +1137,22 @@ router.delete('/accounts/:id', localOnly, sameOriginOnly, (req, res) => {
     try {
         const result = deleteAccount(req.params.id);
         if (result.error) return res.status(400).json(result);
-        logInfo(`Удалён аккаунт через дашборд: ${req.params.id}`);
+        logInfo(`Deleted account via dashboard: ${req.params.id}`);
         res.json({ ok: true });
     } catch (error) {
-        logError('Ошибка при удалении аккаунта', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error deleting account', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-// Проверить валидность одного аккаунта (реальный запрос к Qwen).
-// POST, т.к. меняет состояние (mark*); за sameOriginOnly — защита от CSRF.
+// Check validity of a single account (real request to Qwen).
+// POST, because it mutates state (mark*); sameOriginOnly - CSRF protection.
 router.post('/accounts/:id/check', localOnly, sameOriginOnly, async (req, res) => {
     try {
         const id = req.params.id;
-        if (!/^acc_[a-zA-Z0-9]+$/.test(id)) return res.status(400).json({ error: 'Некорректный id аккаунта' });
+        if (!/^acc_[a-zA-Z0-9]+$/.test(id)) return res.status(400).json({ error: 'Invalid account id' });
         const t = listTokens().find(x => x.id === id);
-        if (!t) return res.status(404).json({ error: 'Аккаунт не найден' });
+        if (!t) return res.status(404).json({ error: 'Account not found' });
         const info = decodeTokenInfo(t.token);
         const r = await testToken(t.token);
         let status = 'ERROR';
@@ -1162,34 +1162,34 @@ router.post('/accounts/:id/check', localOnly, sameOriginOnly, async (req, res) =
         const resetAt = status === 'WAIT' ? new Date(Date.now() + 24 * 3600 * 1000).toISOString() : (t.resetAt || null);
         res.json({ id, status, exp: info.exp, resetAt });
     } catch (error) {
-        logError('Ошибка проверки аккаунта', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error checking account', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-// Обновить токен аккаунта (relogin вручную из дашборда).
+// Update account token (relogin manually from dashboard).
 router.post('/accounts/:id/update', localOnly, sameOriginOnly, (req, res) => {
     try {
         const result = updateAccountToken(req.params.id, req.body?.token);
         if (result.error) return res.status(400).json(result);
-        logInfo(`Обновлён токен аккаунта через дашборд: ${req.params.id}`);
+        logInfo(`Updated account token via dashboard: ${req.params.id}`);
         res.json(result);
     } catch (error) {
-        logError('Ошибка обновления токена аккаунта', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error updating account token', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-// Установить/изменить человекочитаемый ярлык аккаунта (для различения в пуле).
+// Set/change human-readable account label (for distinction in pool).
 router.post('/accounts/:id/label', localOnly, sameOriginOnly, (req, res) => {
     try {
         const result = setLabel(req.params.id, req.body?.label);
         if (result.error) return res.status(400).json(result);
-        logInfo(`Изменён ярлык аккаунта через дашборд: ${req.params.id}`);
+        logInfo(`Changed account label via dashboard: ${req.params.id}`);
         res.json(result);
     } catch (error) {
-        logError('Ошибка изменения ярлыка аккаунта', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error changing account label', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
@@ -1197,21 +1197,21 @@ router.post('/chats', async (req, res) => {
     try {
         const { name, model } = req.body;
         const chatModel = model ? getMappedModel(model) : DEFAULT_MODEL;
-        logInfo(`Создание нового чата${name ? ` с именем: ${name}` : ''}, модель: ${chatModel}`);
-        const result = await createChatV2(chatModel, name || 'Новый чат');
-        if (result.error) { logError(`Ошибка создания чата: ${result.error}`); return res.status(500).json({ error: result.error }); }
-        logInfo(`Создан новый чат v2 с ID: ${result.chatId}`);
+        logInfo(`Creating new chat${name ? ` with name: ${name}` : ''}, model: ${chatModel}`);
+        const result = await createChatV2(chatModel, name || 'New chat');
+        if (result.error) { logError(`Error creating chat: ${result.error}`); return res.status(500).json({ error: result.error }); }
+        logInfo(`Created new chat v2 with ID: ${result.chatId}`);
         res.json({ chatId: result.chatId, success: true });
     } catch (error) {
-        logError('Ошибка при создании чата', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error creating chat', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 router.get('/chat/completions', (req, res) => {
     res.status(405).json({
-        error: 'Метод не поддерживается',
-        message: 'Используйте POST /api/chat/completions'
+        error: 'Method not supported',
+        message: 'Use POST /api/chat/completions'
     });
 });
 
@@ -1224,23 +1224,23 @@ router.post('/chat/completions', async (req, res) => {
         const conversationHint = extractConversationHint(req);
         const conversationScope = conversationHint ? `conversation:${conversationHint}` : null;
         const forceNewChat = shouldForceNewChat(req);
-        logInfo(`Получен OpenAI-совместимый запрос${stream ? ' (stream)' : ''}`);
+        logInfo(`Received OpenAI-compatible request ${stream ? ' (stream)' : ''}`);
 
         if (!messages || !Array.isArray(messages) || messages.length === 0) {
-            logError('Запрос без сообщений');
-            return res.status(400).json({ error: 'Сообщения не указаны' });
+            logError('Request without messages');
+            return res.status(400).json({ error: 'Messages not specified' });
         }
 
         const isMeta = isOpenWebUiMetaRequest(messages);
 
-        // Используем переданный chatId ИЛИ восстанавливаем из сессии
+        // Use provided chatId OR restore from session
         let effectiveChatId = explicitChatId;
         let effectiveParentId = explicitParentId;
 
         if (forceNewChat && !explicitChatId && !isMeta) {
             effectiveChatId = `chat_${crypto.randomBytes(8).toString('hex')}`;
             effectiveParentId = null;
-            logInfo(`Принудительно запрошен новый чат (newChat/resetChat): ${effectiveChatId}`);
+            logInfo(`Explicitly requested new chat (newChat/resetChat): ${effectiveChatId}`);
         }
 
         if (!effectiveChatId && !isMeta) {
@@ -1274,40 +1274,40 @@ router.post('/chat/completions', async (req, res) => {
                     }
                 }
             } else {
-                logDebug('chatId/conversation_id не переданы, unscoped session fallback отключён');
+                logDebug('chatId/conversation_id not provided, unscoped session fallback disabled');
             }
         }
 
-        // Извлекаем system message если есть
+        // Extract system message if present
         const systemMsg = messages.find(msg => msg.role === 'system');
         const systemMessage = systemMsg ? systemMsg.content : null;
         const { combinedTools } = buildCombinedTools(tools, functions, tool_choice);
 
         const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
         if (preparedInput.missingUser) {
-            logError('В запросе нет сообщений от пользователя');
-            return res.status(400).json({ error: 'В запросе нет сообщений от пользователя' });
+            logError('No user messages in request');
+            return res.status(400).json({ error: 'No user messages in request' });
         }
 
         let messageContent = preparedInput.messageContent;
-        
-        // Преобразуем OpenAI format content array во внутренний формат
+
+        // Convert OpenAI format content array to internal format
         if (Array.isArray(messageContent)) {
             messageContent = messageContent.map(item => {
                 if (item.type === 'text') {
                     return { type: 'text', text: item.text };
                 } else if (item.type === 'image_url' && item.image_url) {
-                    // OpenAI format: image_url: { url: '...' }
+                    // OpenAI Format: image_url: { url: '...' }
                     return { type: 'image', image: item.image_url.url };
                 } else if (item.type === 'image') {
-                    // Уже во внутреннем формате
+                    // Already in internal format
                     return { type: 'image', image: item.image };
                 }
                 return item;
             });
         }
-        
-        const files = preparedInput.files || []; // ← ИЗВЛЕКАЕМ FILES
+
+        const files = preparedInput.files || []; // SUPPORT FILES
         if (preparedInput.folded) {
             logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
         }
@@ -1315,27 +1315,27 @@ router.post('/chat/completions', async (req, res) => {
         if (isMeta) {
             effectiveChatId = null;
             effectiveParentId = null;
-            logDebug('OpenWebUI meta-запрос: используем отдельный чат (без привязки к сессии)');
+            logDebug('OpenWebUI meta-request: using separate chat (no history link)');
         }
 
         let mappedModel = model ? getMappedModel(model) : DEFAULT_MODEL;
         if (model && mappedModel !== model) {
-            logInfo(`Модель "${model}" заменена на "${mappedModel}"`);
+            logInfo(`Model "${model}" replaced with "${mappedModel}"`);
         }
-        logInfo(`Используется модель: ${mappedModel}`);
+        logInfo(`Using model: ${mappedModel}`);
         if (systemMessage) logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
 
-        const qwenTools = null; // Qwen Chat web API не умеет OpenAI tool schemas; эмулируем через JSON prompt ниже.
+        const qwenTools = null; // Qwen Chat web API has no OpenAI tool schemas; we emulate via JSON prompt below.
         const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools);
 
         if (toolAwareSystemMessage) {
             logInfo(`System message: ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
         }
 
-        // Логируем полную историю сообщений
-        logInfo(`История содержит ${messages.length} сообщений: ${messages.map(m => m.role).join(', ')}`);
+        // Log full message history
+        logInfo(`History contains ${messages.length} messages: ${messages.map(m => m.role).join(', ')}`);
         if (effectiveChatId) {
-            logInfo(`Используется chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
+            logInfo(`Using chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
         }
 
         if (stream) {
@@ -1348,7 +1348,7 @@ router.post('/chat/completions', async (req, res) => {
             res.setHeader('Transfer-Encoding', 'chunked');
 
             const writeSse = (payload) => {
-                res.write('data: ' + JSON.stringify(payload) + '\n\n');
+                res.write('data: ' + JSON.stringify(payload) + '\n');
             };
 
             try {
@@ -1378,7 +1378,7 @@ router.post('/chat/completions', async (req, res) => {
                     mappedModel,
                     qwenChatId,
                     effectiveParentId,
-                    files, // ← ПЕРЕДАЁМ FILES
+                    files, // SUPPORT FILES
                     qwenTools,
                     tool_choice,
                     toolAwareSystemMessage,
@@ -1389,7 +1389,7 @@ router.post('/chat/completions', async (req, res) => {
                     streamingCallback
                 );
 
-                // Одноразовый чат: неудачный удаляем сразу, успешный — по флагу.
+                // One-shot chat: delete failed immediately, successful - by policy.
                 cleanupEphemeralChat(result, effectiveChatId, isMeta);
 
                 if (captureToolCalls) {
@@ -1400,12 +1400,12 @@ router.post('/chat/completions', async (req, res) => {
                     }
                 }
 
-                // Сохраняем chatId в сессию для следующих запросов
+                // Save chatId to session for subsequent requests
                 if (!isMeta && result.chatId) {
-                    // Если мы использовали сгенерированный effectiveChatId — сохраните маппинг
+                    // If we used a generated effectiveChatId - save the mapping
                     if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
                         mapChatId(effectiveChatId, result.chatId);
-                        logDebug(`Маппинг сохранён: ${effectiveChatId} -> ${result.chatId}`);
+                        logDebug(`Mapping saved: ${effectiveChatId} -> ${result.chatId}`);
                     }
                     if (shouldPersistSessionContext(conversationScope)) {
                         saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
@@ -1419,11 +1419,11 @@ router.post('/chat/completions', async (req, res) => {
                         created: Math.floor(Date.now() / 1000),
                         model: mappedModel || DEFAULT_MODEL,
                         choices: [
-                            { index: 0, delta: { content: `Ошибка: ${result.error}` }, finish_reason: null }
+                            { index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: null }
                         ]
                     });
                 } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
-                    // Qwen вернул JSON/обычный ответ вместо SSE - отправляем контент одним чанком
+                    // Qwen returned JSON/normal response instead of SSE - send final as single chunk
                     const content = result.choices[0].message.content;
                     logDebug(`JSON response content length: ${content.length}`);
                     if (typeof streamingCallback === 'function') {
@@ -1442,7 +1442,7 @@ router.post('/chat/completions', async (req, res) => {
                 } else {
                     logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
                 }
-                // Чанки уже были отправлены через streamingCallback, не дублируем!
+                // Chunks were already sent via streamingCallback, don't duplicate!
 
                 writeSse({
                     id: 'chatcmpl-stream',
@@ -1453,11 +1453,11 @@ router.post('/chat/completions', async (req, res) => {
                         { index: 0, delta: {}, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n\n');
+                res.write('data: [DONE]\n');
                 res.end();
 
             } catch (error) {
-                logError('Ошибка при обработке потокового запроса', error);
+                logError('Error handling streaming request', error);
                 writeSse({
                     id: 'chatcmpl-stream',
                     object: 'chat.completion.chunk',
@@ -1467,21 +1467,21 @@ router.post('/chat/completions', async (req, res) => {
                         { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n\n');
+                res.write('data: [DONE]\n');
                 res.end();
             }
         } else {
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
             const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, qwenTools, tool_choice, toolAwareSystemMessage);
 
-            // Одноразовый чат: неудачный удаляем сразу, успешный — по флагу.
+            // One-shot chat: delete failed immediately, successful - by policy.
             cleanupEphemeralChat(result, effectiveChatId, isMeta);
 
-            // Сохраняем chatId в сессию для следующих запросов
+            // Save chatId to session for subsequent requests
             if (!isMeta && result.chatId) {
                 if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
                     mapChatId(effectiveChatId, result.chatId);
-                    logDebug(`Маппинг сохранён: ${effectiveChatId} -> ${result.chatId}`);
+                    logDebug(`Mapping saved: ${effectiveChatId} -> ${result.chatId}`);
                 }
                 if (shouldPersistSessionContext(conversationScope)) {
                     saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
@@ -1521,7 +1521,7 @@ router.post('/chat/completions', async (req, res) => {
                 parentId: result.parentId
             };
 
-            // Сохраняем историю чата
+            // Save chat history
             if (result.chatId) {
                 try {
                     const currentChat = loadHistory(result.chatId);
@@ -1532,19 +1532,19 @@ router.post('/chat/completions', async (req, res) => {
                     const updatedMessages = messages.concat([responseMessage]);
                     saveHistory(result.chatId, { ...currentChat, messages: updatedMessages });
                 } catch (e) {
-                    logDebug(`Не удалось сохранить историю: ${e.message}`);
+                    logDebug(`Failed to save history: ${e.message}`);
                 }
             }
 
             res.json(openaiResponse);
         }
     } catch (error) {
-        logError('Ошибка при обработке запроса', error);
-        res.status(500).json({ error: { message: 'Внутренняя ошибка сервера', type: "server_error" } });
+        logError('Error processing request', error);
+        res.status(500).json({ error: { message: 'Internal server error', type: "server_error" } });
     }
 });
 
-// OpenAI совместимый эндпоинт v1 (для Open WebUI и других клиентов)
+// OpenAI-compatible v1 endpoint (for Open WebUI and other clients)
 router.post('/v1/chat/completions', async (req, res) => {
     try {
         const { messages, model, stream, tools, functions, tool_choice, chatId } = req.body;
@@ -1555,23 +1555,23 @@ router.post('/v1/chat/completions', async (req, res) => {
         const conversationScope = conversationHint ? `conversation:${conversationHint}` : null;
         const forceNewChat = shouldForceNewChat(req);
 
-        logInfo(`Получен OpenAI v1 запрос${stream ? ' (stream)' : ''}`);
+        logInfo(`Received OpenAI v1 request ${stream ? ' (stream)' : ''}`);
 
         if (!messages || !Array.isArray(messages) || messages.length === 0) {
-            logError('Запрос без сообщений');
-            return res.status(400).json({ error: 'Сообщения не указаны' });
+            logError('Request without messages');
+            return res.status(400).json({ error: 'Messages not specified' });
         }
 
         const isMeta = isOpenWebUiMetaRequest(messages);
 
-        // Используем переданный chatId ИЛИ восстанавливаем из сессии
+        // Use provided chatId OR restore from session
         let effectiveChatId = explicitChatId;
         let effectiveParentId = explicitParentId;
 
         if (forceNewChat && !explicitChatId && !isMeta) {
             effectiveChatId = `chat_${crypto.randomBytes(8).toString('hex')}`;
             effectiveParentId = null;
-            logInfo(`Принудительно запрошен новый чат (newChat/resetChat): ${effectiveChatId}`);
+            logInfo(`Explicitly requested new chat (newChat/resetChat): ${effectiveChatId}`);
         }
 
         if (!effectiveChatId && !isMeta) {
@@ -1605,40 +1605,40 @@ router.post('/v1/chat/completions', async (req, res) => {
                     }
                 }
             } else {
-                logDebug('chatId/conversation_id не переданы, unscoped session fallback отключён');
+                logDebug('chatId/conversation_id not provided, unscoped session fallback disabled');
             }
         }
 
-        // Извлекаем system message если есть
+        // Extract system message if present
         const systemMsg = messages.find(msg => msg.role === 'system');
         const systemMessage = systemMsg ? systemMsg.content : null;
         const { combinedTools } = buildCombinedTools(tools, functions, tool_choice);
 
         const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
         if (preparedInput.missingUser) {
-            logError('В запросе нет сообщений от пользователя');
-            return res.status(400).json({ error: 'В запросе нет сообщений от пользователя' });
+            logError('No user messages in request');
+            return res.status(400).json({ error: 'No user messages in request' });
         }
 
         let messageContent = preparedInput.messageContent;
-        
-        // Преобразуем OpenAI format content array во внутренний формат
+
+        // Convert OpenAI format content array to internal format
         if (Array.isArray(messageContent)) {
             messageContent = messageContent.map(item => {
                 if (item.type === 'text') {
                     return { type: 'text', text: item.text };
                 } else if (item.type === 'image_url' && item.image_url) {
-                    // OpenAI format: image_url: { url: '...' }
+                    // OpenAI Format: image_url: { url: '...' }
                     return { type: 'image', image: item.image_url.url };
                 } else if (item.type === 'image') {
-                    // Уже во внутреннем формате
+                    // Already in internal format
                     return { type: 'image', image: item.image };
                 }
                 return item;
             });
         }
-        
-        const files = preparedInput.files || []; // ← ИЗВЛЕКАЕМ FILES
+
+        const files = preparedInput.files || []; // SUPPORT FILES
         if (preparedInput.folded) {
             logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
         }
@@ -1646,29 +1646,29 @@ router.post('/v1/chat/completions', async (req, res) => {
         if (isMeta) {
             effectiveChatId = null;
             effectiveParentId = null;
-            logDebug('OpenWebUI meta-запрос: используем отдельный чат (без привязки к сессии)');
+            logDebug('OpenWebUI meta-request: using separate chat (no history link)');
         }
 
         let mappedModel = model ? getMappedModel(model) : DEFAULT_MODEL;
         if (model && mappedModel !== model) {
-            logInfo(`Модель "${model}" заменена на "${mappedModel}"`);
+            logInfo(`Model "${model}" replaced with "${mappedModel}"`);
         }
-        logInfo(`Используется модель: ${mappedModel}`);
+        logInfo(`Using model: ${mappedModel}`);
 
         if (systemMessage) {
             logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
         }
 
-        const qwenTools = null; // Qwen Chat web API не умеет OpenAI tool schemas; эмулируем через JSON prompt ниже.
+        const qwenTools = null; // Qwen Chat web API has no OpenAI tool schemas; we emulate via JSON prompt below.
         const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools);
         if (toolAwareSystemMessage) {
             logInfo(`System message: ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
         }
 
-        // Логируем полную историю сообщений
-        logInfo(`История содержит ${messages.length} сообщений: ${messages.map(m => m.role).join(', ')}`);
+        // Log full message history
+        logInfo(`History contains ${messages.length} messages: ${messages.map(m => m.role).join(', ')}`);
         if (effectiveChatId) {
-            logInfo(`Используется chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
+            logInfo(`Using chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
         }
 
         if (stream) {
@@ -1681,7 +1681,7 @@ router.post('/v1/chat/completions', async (req, res) => {
             res.setHeader('Transfer-Encoding', 'chunked');
 
             const writeSse = (payload) => {
-                res.write('data: ' + JSON.stringify(payload) + '\n\n');
+                res.write('data: ' + JSON.stringify(payload) + '\n');
             };
 
             try {
@@ -1694,7 +1694,7 @@ router.post('/v1/chat/completions', async (req, res) => {
                 if (stream && !captureToolCalls) {
                     streamingCallback = (chunk) => {
                         hasStreamedChunks = true;
-                        // OpenWebUI не нуждается в role в чанках - только контент
+                        // OpenWebUI does not expect role in chunks - only content
                         writeSse({
                             id: 'chatcmpl-' + Date.now(),
                             object: 'chat.completion.chunk',
@@ -1706,13 +1706,13 @@ router.post('/v1/chat/completions', async (req, res) => {
                         });
                     };
                 }
-                
+
                 const result = await sendMessage(
                     messageContent,
                     mappedModel,
                     qwenChatId,
                     effectiveParentId,
-                    files, // ← ИЗВЛЕКАЕМ FILES
+                    files, // SUPPORT FILES
                     qwenTools,
                     tool_choice,
                     toolAwareSystemMessage,
@@ -1731,7 +1731,7 @@ router.post('/v1/chat/completions', async (req, res) => {
                     }
                 }
 
-                // Сохраняем chatId в сессию для следующих запросов
+                // Save chatId to session for subsequent requests
                 if (!isMeta && result.chatId) {
                     if (shouldPersistSessionContext(conversationScope)) {
                         saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
@@ -1745,11 +1745,11 @@ router.post('/v1/chat/completions', async (req, res) => {
                         created: Math.floor(Date.now() / 1000),
                         model: mappedModel || DEFAULT_MODEL,
                         choices: [
-                            { index: 0, delta: { content: `Ошибка: ${result.error}` }, finish_reason: 'stop' }
+                            { index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: 'stop' }
                         ]
                     });
                 } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
-                    // Qwen вернул JSON/обычный ответ вместо SSE - отправляем контент одним чанком
+                    // Qwen returned JSON/normal response instead of SSE - send final as single chunk
                     const content = result.choices[0].message.content;
                     logDebug(`JSON response content length: ${content.length}`);
                     if (typeof streamingCallback === 'function') {
@@ -1768,7 +1768,7 @@ router.post('/v1/chat/completions', async (req, res) => {
                 } else {
                     logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
                 }
-                // Чанки уже были отправлены через streamingCallback, не дублируем!
+                // Chunks were already sent via streamingCallback, don't duplicate!
 
                 writeSse({
                     id: 'chatcmpl-stream',
@@ -1779,11 +1779,11 @@ router.post('/v1/chat/completions', async (req, res) => {
                         { index: 0, delta: {}, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n\n');
+                res.write('data: [DONE]\n');
                 res.end();
 
             } catch (error) {
-                logError('Ошибка при обработке потокового запроса', error);
+                logError('Error handling streaming request', error);
                 writeSse({
                     id: 'chatcmpl-stream',
                     object: 'chat.completion.chunk',
@@ -1793,7 +1793,7 @@ router.post('/v1/chat/completions', async (req, res) => {
                         { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n\n');
+                res.write('data: [DONE]\n');
                 res.end();
             }
         } else {
@@ -1801,12 +1801,12 @@ router.post('/v1/chat/completions', async (req, res) => {
 
             const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage);
 
-            // Сохраняем chatId в сессии для следующих запросов
+            // Save chatId to session for subsequent requests
             if (!isMeta && result.chatId) {
-                // Если мы использовали сгенерированный effectiveChatId — сохраните маппинг
+                // If we used a generated effectiveChatId - save the mapping
                 if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
                     mapChatId(effectiveChatId, result.chatId);
-                    logDebug(`Маппинг сохранён: ${effectiveChatId} -> ${result.chatId}`);
+                    logDebug(`Mapping saved: ${effectiveChatId} -> ${result.chatId}`);
                 }
                 if (shouldPersistSessionContext(conversationScope)) {
                     saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
@@ -1819,7 +1819,7 @@ router.post('/v1/chat/completions', async (req, res) => {
                 });
             }
 
-            // Извлекаем контент сообщения
+            // Extract final message content
             let messageText = '';
             if (result.choices && result.choices[0] && result.choices[0].message) {
                 messageText = result.choices[0].message.content || '';
@@ -1850,21 +1850,21 @@ router.post('/v1/chat/completions', async (req, res) => {
                     completion_tokens: 0,
                     total_tokens: 0
                 },
-                // Передаём метаданные для сохранения контекста
+                // Pass through metadata for context preservation
                 x_qwen_chat_id: result.chatId,
                 x_qwen_parent_id: result.parentId || result.response_id
             };
 
-            // Сохраняем историю чата для v1 эндпоинта
+            // Save chat history for v1 endpoint
             if (result.chatId) {
-                // Сохраняем chatId в сессии для последующих запросов от этого клиента
+                // Save chatId to session for subsequent requests from the same client
                 if (!isMeta) {
                     try {
                         if (shouldPersistSessionContext(conversationScope)) {
                             saveChatIdForSession(req, result.chatId, result.parentId || result.response_id, conversationScope);
                         }
                     } catch (e) {
-                        logDebug(`Не удалось сохранить chatId в сессии: ${e.message}`);
+                        logDebug(`Failed to save chatId to session: ${e.message}`);
                     }
                 }
 
@@ -1877,104 +1877,104 @@ router.post('/v1/chat/completions', async (req, res) => {
                     const updatedMessages = messages.concat([responseMessage]);
                     saveHistory(result.chatId, { ...currentChat, messages: updatedMessages });
                 } catch (e) {
-                    logDebug(`Не удалось сохранить историю: ${e.message}`);
+                    logDebug(`Failed to save history: ${e.message}`);
                 }
             }
 
             res.json(openaiResponse);
         }
     } catch (error) {
-        logError('Ошибка при обработке v1 запроса', error);
-        res.status(500).json({ error: { message: 'Внутренняя ошибка сервера', type: "server_error" } });
+        logError('Error processing v1 request', error);
+        res.status(500).json({ error: { message: 'Internal server error', type: "server_error" } });
     }
 });
 
 router.post('/files/getstsToken', async (req, res) => {
     try {
-        logInfo(`Запрос на получение STS токена: ${JSON.stringify(req.body)}`);
+        logInfo(`Request for STS token: ${JSON.stringify(req.body)}`);
         const fileInfo = req.body;
         if (!fileInfo?.filename || !fileInfo?.filesize || !fileInfo?.filetype) {
-            logError('Некорректные данные о файле');
-            return res.status(400).json({ error: 'Некорректные данные о файле' });
+            logError('Invalid file data');
+            return res.status(400).json({ error: 'Invalid file data' });
         }
         res.json(await getStsToken(fileInfo));
     } catch (error) {
-        logError('Ошибка при получении STS токена', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error getting STS token', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 router.post('/files/upload', upload.single('file'), async (req, res) => {
     try {
-        if (!req.file) { logError('Файл не был загружен'); return res.status(400).json({ error: 'Файл не был загружен' }); }
-        logInfo(`Файл загружен на сервер: ${req.file.originalname} (${req.file.size} байт)`);
+        if (!req.file) { logError('File was not uploaded'); return res.status(400).json({ error: 'File was not uploaded' }); }
+        logInfo(`File uploaded to server: ${req.file.originalname} (${req.file.size} bytes)`);
 
         const result = await uploadFileToQwen(req.file.path);
 
         try { fs.unlinkSync(req.file.path); } catch { /* file already removed or inaccessible */ }
 
         if (result.success) {
-            logInfo(`Файл успешно загружен в OSS: ${result.fileName}`);
+            logInfo(`File successfully uploaded to OSS: ${result.fileName}`);
             res.json({ success: true, file: { name: result.fileName, url: result.url, size: req.file.size, type: req.file.mimetype } });
         } else {
-            logError(`Ошибка при загрузке файла в OSS: ${result.error}`);
-            res.status(500).json({ error: 'Ошибка при загрузке файла' });
+            logError(`Error uploading file to OSS: ${result.error}`);
+            res.status(500).json({ error: 'Error uploading file' });
         }
     } catch (error) {
-        logError('Ошибка при загрузке файла', error);
+        logError('Error uploading file', error);
         if (req.file?.path) { try { fs.unlinkSync(req.file.path); } catch { /* ignore */ } }
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-// Эндпоинт для сохранения истории чата (для работы с Open WebUI)
+// Endpoint for saving chat history (for Open WebUI)
 router.post('/chats/:chatId/history', async (req, res) => {
     try {
         const { chatId } = req.params;
         const { messages } = req.body;
 
-        logInfo(`Запрос сохранения истории для чата: ${chatId}`);
+        logInfo(`Request to save history for chat: ${chatId}`);
 
         if (!messages || !Array.isArray(messages)) {
-            logError('История сообщений не указана или некорректна');
-            return res.status(400).json({ error: 'История сообщений должна быть массивом' });
+            logError('Message history not specified or invalid');
+            return res.status(400).json({ error: 'Message history must be an array' });
         }
 
-        // Здесь можно добавить логику сохранения истории
-        // Для теперь просто подтверждаем сохранение
+        // Here you can add logic for saving history
+        // For now just confirm saving
         res.json({
             success: true,
             chatId: chatId,
             messagesCount: messages.length
         });
     } catch (error) {
-        logError('Ошибка при сохранении истории чата', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error saving chat history', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
-// Эндпоинт для получения истории чата (для работы с Open WebUI)
+// Endpoint for getting chat history (for Open WebUI)
 router.get('/chats/:chatId/history', async (req, res) => {
     try {
         const { chatId } = req.params;
 
-        logInfo(`Запрос истории для чата: ${chatId}`);
+        logInfo(`History request for chat: ${chatId}`);
 
-        // Здесь можно добавить логику получения истории из БД
-        // Для теперь возвращаем пустую историю
+        // Here you can add logic for getting history from DB
+        // For now return empty history
         res.json({
             success: true,
             chatId: chatId,
             messages: []
         });
     } catch (error) {
-        logError('Ошибка при получении истории чата', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error getting chat history', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 // ============================================
-// МЕДИА-ЭНДПОИНТЫ QWEN CHAT / DASHSCOPE
+// IMAGE/VIDEO GENERATION ENDPOINTS QWEN CHAT / DASHSCOPE
 // ============================================
 
 const CHAT_MEDIA_MODEL = 'qwen3-vl-plus';
@@ -2041,26 +2041,26 @@ function buildVideoResponse({ result, prompt, model, waitForCompletion }) {
 
 /**
  * POST /api/images/generations
- * По умолчанию генерирует изображения через Qwen Chat (`chatType: t2i`).
- * Для старого DashScope-режима передайте `provider: "dashscope"`.
+ * By default generates images via Qwen Chat (`chatType: t2i`).
+ * For legacy DashScope mode pass `provider: "dashscope"`.
  */
 router.post('/images/generations', async (req, res) => {
     try {
         const { prompt, model, n, size, response_format, provider } = req.body;
 
-        logInfo('Получен запрос на генерацию изображения');
-        logDebug(`Запрос: ${prompt?.substring(0, 100)}${prompt?.length > 100 ? '...' : ''}`);
+        logInfo('Received image generation request');
+        logDebug(`Prompt: ${prompt?.substring(0, 100)}${prompt?.length > 100 ? '...' : ''}`);
 
         if (!prompt) {
-            return res.status(400).json({ error: 'Параметр "prompt" обязателен' });
+            return res.status(400).json({ error: 'Parameter "prompt" is required' });
         }
 
         if (provider === 'dashscope') {
             const apiKey = process.env.DASHSCOPE_API_KEY;
             if (!apiKey) {
                 return res.status(503).json({
-                    error: 'DashScope API генерации изображений не настроен',
-                    message: 'Установите переменную окружения DASHSCOPE_API_KEY или используйте provider=qwen-chat'
+                    error: 'DashScope image generation API is not configured',
+                    message: 'Set the DASHSCOPE_API_KEY environment variable or use provider=qwen-chat'
                 });
             }
 
@@ -2074,8 +2074,8 @@ router.post('/images/generations', async (req, res) => {
             });
 
             if (result.error) {
-                logError(`Ошибка генерации DashScope: ${result.error}`);
-                return res.status(500).json({ error: 'Ошибка генерации изображения', message: result.error });
+                logError(`DashScope generation error: ${result.error}`);
+                return res.status(500).json({ error: 'Image generation error', message: result.error });
             }
 
             return res.json(buildOpenAiImageResponse({
@@ -2104,39 +2104,39 @@ router.post('/images/generations', async (req, res) => {
         );
 
         if (result.error) {
-            logError(`Ошибка генерации Qwen Chat image: ${result.error}`);
-            return res.status(500).json({ error: 'Ошибка генерации изображения через Qwen Chat', message: result.error, details: result.details });
+            logError(`Qwen Chat image generation error: ${result.error}`);
+            return res.status(500).json({ error: 'Image generation error via Qwen Chat', message: result.error, details: result.details });
         }
 
         const imageUrl = extractMediaUrl(result, 'image') || result.choices?.[0]?.message?.content || null;
         if (!imageUrl) {
             return res.status(502).json({
-                error: 'Qwen Chat не вернул URL изображения',
+                error: 'Qwen Chat did not return image URL',
                 raw: result
             });
         }
 
-        logInfo(`Изображение Qwen Chat сгенерировано: ${imageUrl}`);
+        logInfo(`Qwen Chat image generated: ${imageUrl}`);
         return res.json(buildOpenAiImageResponse({ imageUrl, prompt, model: chatModel, raw: result }));
     } catch (error) {
-        logError('Ошибка при генерации изображения', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера', message: error.message });
+        logError('Error generating image', error);
+        res.status(500).json({ error: 'Internal server error', message: error.message });
     }
 });
 
 /**
- * POST /api/videos/generations - Генерация видео через Qwen Chat (`chatType: t2v`).
+ * POST /api/videos/generations - Video generation via Qwen Chat (`chatType: t2v`).
  */
 router.post('/videos/generations', async (req, res) => {
     try {
         const { prompt, model, size, wait, waitForCompletion } = req.body;
         const shouldWait = waitForCompletion ?? wait ?? true;
 
-        logInfo('Получен запрос на генерацию видео через Qwen Chat');
-        logDebug(`Видео-запрос: ${prompt?.substring(0, 100)}${prompt?.length > 100 ? '...' : ''}`);
+        logInfo('Received video generation request via Qwen Chat');
+        logDebug(`Video prompt: ${prompt?.substring(0, 100)}${prompt?.length > 100 ? '...' : ''}`);
 
         if (!prompt) {
-            return res.status(400).json({ error: 'Параметр "prompt" обязателен' });
+            return res.status(400).json({ error: 'Parameter "prompt" is required' });
         }
 
         const chatModel = getMappedModel(model || CHAT_MEDIA_MODEL);
@@ -2156,27 +2156,27 @@ router.post('/videos/generations', async (req, res) => {
         );
 
         if (result.error) {
-            logError(`Ошибка генерации Qwen Chat video: ${result.error}`);
-            return res.status(500).json({ error: 'Ошибка генерации видео через Qwen Chat', message: result.error, details: result.details, task_id: result.task_id });
+            logError(`Qwen Chat video generation error: ${result.error}`);
+            return res.status(500).json({ error: 'Video generation error via Qwen Chat', message: result.error, details: result.details, task_id: result.task_id });
         }
 
         const response = buildVideoResponse({ result, prompt, model: chatModel, waitForCompletion: shouldWait });
-        logInfo(response.video_url ? `Видео Qwen Chat сгенерировано: ${response.video_url}` : `Видео-задача создана: ${response.task_id}`);
+        logInfo(response.video_url ? `Qwen Chat video generated: ${response.video_url}` : `Video task created: ${response.task_id}`);
         return res.json(response);
     } catch (error) {
-        logError('Ошибка при генерации видео', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера', message: error.message });
+        logError('Error generating video', error);
+        res.status(500).json({ error: 'Internal server error', message: error.message });
     }
 });
 
 /**
- * GET /api/tasks/status/:taskId - статус долгой задачи Qwen Chat (видео и будущие async-функции).
+ * GET /api/tasks/status/:taskId - Status of a long-running Qwen Chat task (video and other async jobs).
  */
 router.get('/tasks/status/:taskId', async (req, res) => {
     try {
         const { taskId } = req.params;
         const wait = ['1', 'true', 'yes'].includes(String(req.query.wait || '').toLowerCase());
-        if (!taskId) return res.status(400).json({ error: 'taskId обязателен' });
+        if (!taskId) return res.status(400).json({ error: 'taskId is required' });
 
         const result = await pollQwenTaskStatus(taskId, wait);
         if (result.error && !result.data) {
@@ -2184,13 +2184,13 @@ router.get('/tasks/status/:taskId', async (req, res) => {
         }
         return res.json({ watermark: FORGETMEAI_WATERMARK, ...result });
     } catch (error) {
-        logError('Ошибка при проверке статуса задачи', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера', message: error.message });
+        logError('Error checking task status', error);
+        res.status(500).json({ error: 'Internal server error', message: error.message });
     }
 });
 
 /**
- * GET /api/images/models - модели для генерации изображений.
+ * GET /api/images/models - Models for image generation.
  */
 router.get('/images/models', async (req, res) => {
     try {
@@ -2220,13 +2220,13 @@ router.get('/images/models', async (req, res) => {
             ]
         });
     } catch (error) {
-        logError('Ошибка при получении списка моделей изображений', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error getting image model list', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 /**
- * GET /api/videos/models - модели для генерации видео через Qwen Chat.
+ * GET /api/videos/models - Models for video generation via Qwen Chat.
  */
 router.get('/videos/models', async (req, res) => {
     res.json({
@@ -2245,7 +2245,7 @@ router.get('/videos/models', async (req, res) => {
 });
 
 /**
- * GET /api/images/status - Проверка статуса генерации изображений.
+ * GET /api/images/status - Check image generation API status.
  */
 router.get('/images/status', async (req, res) => {
     try {
@@ -2260,26 +2260,26 @@ router.get('/images/status', async (req, res) => {
             qwenChat: {
                 available: qwenChatAvailable,
                 model: CHAT_MEDIA_MODEL,
-                message: qwenChatAvailable ? 'Qwen Chat генерация изображений доступна' : 'Нет активных аккаунтов Qwen Chat'
+                message: qwenChatAvailable ? 'Qwen Chat image generation is available' : 'No active Qwen Chat accounts'
             },
             dashscope: {
                 available: dashScopeAvailable,
                 apiKeyConfigured: !!apiKey,
                 message: dashScopeAvailable
-                    ? 'DashScope API генерации изображений доступен'
+                    ? 'DashScope image generation API is available'
                     : apiKey
-                        ? 'DashScope API недоступен или неверные учётные данные'
-                        : 'DASHSCOPE_API_KEY не настроен'
+                        ? 'DashScope API unavailable or invalid credentials'
+                        : 'DASHSCOPE_API_KEY not configured'
             }
         });
     } catch (error) {
-        logError('Ошибка при проверке статуса API изображений', error);
-        res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+        logError('Error checking image API status', error);
+        res.status(500).json({ error: 'Internal server error' });
     }
 });
 
 /**
- * GET /api/videos/status - Проверка готовности видео-генерации Qwen Chat.
+ * GET /api/videos/status - Check Qwen Chat video generation readiness.
  */
 router.get('/videos/status', async (req, res) => {
     const tokens = listTokens();
@@ -2290,7 +2290,7 @@ router.get('/videos/status', async (req, res) => {
         available: availableAccounts > 0,
         model: CHAT_MEDIA_MODEL,
         accounts: { total: tokens.length, available: availableAccounts },
-        message: availableAccounts > 0 ? 'Qwen Chat генерация видео доступна' : 'Нет активных аккаунтов Qwen Chat'
+        message: availableAccounts > 0 ? 'Qwen Chat video generation is available' : 'No active Qwen Chat accounts'
     });
 });
 

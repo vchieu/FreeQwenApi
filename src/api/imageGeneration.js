@@ -1,10 +1,10 @@
-// imageGeneration.js - Модуль для генерации изображений через Qwen Image API
+// imageGeneration.js - Module for image generation via Qwen Image API
 import axios from 'axios';
 import { logInfo, logError, logDebug } from '../logger/index.js';
 
 const DASHSCOPE_API_BASE = 'https://dashscope-intl.aliyuncs.com/api/v1';
 
-// Модели для генерации изображений
+// Models for image generation
 const IMAGE_GENERATION_MODELS = [
     'qwen-image-max',
     'qwen-image-plus',
@@ -15,25 +15,25 @@ const IMAGE_GENERATION_MODELS = [
 ];
 
 /**
- * Генерация изображения по текстовому описанию
- * @param {string} prompt - Текстовое описание изображения
- * @param {string} model - Модель для генерации
- * @param {object} options - Дополнительные параметры
- * @returns {Promise<object>} - Результат генерации
+ * Generate image from text prompt
+ * @param {string} prompt - Text description of image
+ * @param {string} model - Model for generation
+ * @param {object} options - Additional parameters
+ * @returns {Promise<object>} - Generation result
  */
 export async function generateImage(prompt, model = 'qwen-image-plus', options = {}) {
     const apiKey = process.env.DASHSCOPE_API_KEY;
-    
+
     if (!apiKey) {
-        logError('API ключ DASHSCOPE_API_KEY не установлен');
+        logError('API key DASHSCOPE_API_KEY is not configured');
         return {
-            error: 'API ключ DASHSCOPE_API_KEY не установлен. Пожалуйста, настройте переменную окружения.'
+            error: 'API key DASHSCOPE_API_KEY is not configured. Please set the environment variable.'
         };
     }
 
     try {
-        logInfo(`Генерация изображения через ${model}...`);
-        logDebug(`Запрос: ${prompt.substring(0, 100)}${prompt.length > 100 ? '...' : ''}`);
+        logInfo(`Generating image via ${model}...`);
+        logDebug(`Prompt: ${prompt.substring(0, 100)}${prompt.length > 100 ? '...' : ''}`);
 
         const payload = {
             model: model,
@@ -49,9 +49,9 @@ export async function generateImage(prompt, model = 'qwen-image-plus', options =
             }
         };
 
-        // Асинхронный запрос для Wan моделей
+        // Async request for Wan models
         const isWanModel = model.startsWith('wan');
-        const endpoint = isWanModel 
+        const endpoint = isWanModel
             ? `${DASHSCOPE_API_BASE}/services/aigc/text2image/image-synthesis`
             : `${DASHSCOPE_API_BASE}/services/aigc/text2image/image-synthesis`;
 
@@ -66,16 +66,16 @@ export async function generateImage(prompt, model = 'qwen-image-plus', options =
 
         const data = response.data;
 
-        // Асинхронный режим - получаем task_id и опрашиваем статус
+        // Async mode - get task_id and poll status
         if (data.output?.task_id) {
-            logInfo(`Задача создана: ${data.output.task_id}`);
+            logInfo(`Task created: ${data.output.task_id}`);
             return await pollTaskStatus(data.output.task_id, apiKey);
         }
 
-        // Синхронный режим - сразу получаем результат
+        // Sync mode - get result immediately
         if (data.output?.results && data.output.results.length > 0) {
             const imageUrl = data.output.results[0].url;
-            logInfo(`Изображение сгенерировано: ${imageUrl}`);
+            logInfo(`Image generated: ${imageUrl}`);
             return {
                 success: true,
                 imageUrl: imageUrl,
@@ -86,27 +86,27 @@ export async function generateImage(prompt, model = 'qwen-image-plus', options =
         }
 
         return {
-            error: 'Неожиданный формат ответа от API',
+            error: 'Unexpected response format from API',
             rawData: data
         };
 
     } catch (error) {
-        logError('Ошибка при генерации изображения', error);
+        logError('Error generating image', error);
         return {
-            error: error.response?.data?.message || error.message || 'Неизвестная ошибка'
+            error: error.response?.data?.message || error.message || 'Unknown error'
         };
     }
 }
 
 /**
- * Опрос статуса задачи генерации изображения
- * @param {string} taskId - ID задачи
- * @param {string} apiKey - API ключ
- * @returns {Promise<object>} - Результат генерации
+ * Poll task status for image generation
+ * @param {string} taskId - Task ID
+ * @param {string} apiKey - API key
+ * @returns {Promise<object>} - Generation result
  */
 async function pollTaskStatus(taskId, apiKey) {
     const maxAttempts = 60;
-    const pollInterval = 2000; // 2 секунды
+    const pollInterval = 2000; // 2 seconds
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
         try {
@@ -122,12 +122,12 @@ async function pollTaskStatus(taskId, apiKey) {
             const task = response.data;
             const taskStatus = task.output?.task_status;
 
-            logDebug(`Статус задачи ${taskId}: ${taskStatus} (попытка ${attempt + 1}/${maxAttempts})`);
+            logDebug(`Task status ${taskId}: ${taskStatus} (attempt ${attempt + 1}/${maxAttempts})`);
 
             if (taskStatus === 'SUCCEEDED') {
                 const imageUrl = task.output?.results?.[0]?.url;
                 if (imageUrl) {
-                    logInfo(`Изображение сгенерировано: ${imageUrl}`);
+                    logInfo(`Image generated: ${imageUrl}`);
                     return {
                         success: true,
                         imageUrl: imageUrl,
@@ -135,52 +135,52 @@ async function pollTaskStatus(taskId, apiKey) {
                         model: task.input?.model || 'unknown'
                     };
                 }
-                return { error: 'Изображение не найдено в результате' };
+                return { error: 'Image not found in result' };
             }
 
             if (taskStatus === 'FAILED' || taskStatus === 'CANCELLED') {
                 return {
-                    error: `Задача завершена со статусом: ${taskStatus}`,
-                    message: task.output?.message || 'Неизвестная ошибка'
+                    error: `Task completed with status: ${taskStatus}`,
+                    message: task.output?.message || 'Unknown error'
                 };
             }
 
-            // PENDING или RUNNING - продолжаем опрос
+            // PENDING or RUNNING - continue polling
             await new Promise(resolve => setTimeout(resolve, pollInterval));
 
         } catch (error) {
-            logError(`Ошибка при опросе задачи ${taskId}`, error);
+            logError(`Error polling task ${taskId}`, error);
             if (attempt === maxAttempts - 1) {
-                return { error: `Ошибка опроса: ${error.message}` };
+                return { error: `Polling error: ${error.message}` };
             }
             await new Promise(resolve => setTimeout(resolve, pollInterval));
         }
     }
 
-    return { error: 'Превышено время ожидания генерации изображения' };
+    return { error: 'Image generation timeout exceeded' };
 }
 
 /**
- * Получить список доступных моделей генерации изображений
- * @returns {string[]} - Список моделей
+ * Get list of available image generation models
+ * @returns {string[]} - List of models
  */
 export function getAvailableImageModels() {
     return IMAGE_GENERATION_MODELS;
 }
 
 /**
- * Проверка доступности API генерации изображений
- * @returns {Promise<boolean>} - Статус доступности
+ * Check image generation API availability
+ * @returns {Promise<boolean>} - Availability status
  */
 export async function checkImageApiAvailability() {
     const apiKey = process.env.DASHSCOPE_API_KEY;
-    
+
     if (!apiKey) {
         return false;
     }
 
     try {
-        // Простой тестовый запрос для проверки API
+        // Quick test request to check API
         await axios.get(`${DASHSCOPE_API_BASE}/models`, {
             headers: {
                 'Authorization': `Bearer ${apiKey}`
@@ -189,7 +189,7 @@ export async function checkImageApiAvailability() {
         });
         return true;
     } catch (error) {
-        logDebug(`API генерации изображений недоступен: ${error.message}`);
+        logDebug(`Image generation API unavailable: ${error.message}`);
         return false;
     }
 }

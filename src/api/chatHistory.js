@@ -12,7 +12,7 @@ const HISTORY_DIR = path.resolve(__dirname, '..', '..', SESSION_DIR, 'history');
 export function initHistoryDirectory() {
     if (!fs.existsSync(HISTORY_DIR)) {
         fs.mkdirSync(HISTORY_DIR, { recursive: true });
-        logInfo(`Создана директория для истории чатов: ${HISTORY_DIR}`);
+        logInfo(`Created directory for chat history: ${HISTORY_DIR}`);
     }
 }
 
@@ -24,12 +24,12 @@ export function createChat(chatName) {
     const chatId = generateChatId();
     const chatInfo = {
         id: chatId,
-        name: chatName || `Новый чат ${new Date().toLocaleString()}`,
+        name: chatName || `New chat ${new Date().toLocaleString()}`,
         created: Date.now(),
         messages: []
     };
     saveHistory(chatId, chatInfo);
-    logInfo(`Создан новый чат [${chatId}] с именем "${chatInfo.name}"`);
+    logInfo(`Created new chat [${chatId}] with name "${chatInfo.name}"`);
     return chatId;
 }
 
@@ -37,7 +37,7 @@ export function createChat(chatName) {
  * Sanitize chatId to prevent path traversal (CWE-22).
  * Rejects any value containing path separators, traversal sequences,
  * or characters outside the allowed set [a-zA-Z0-9_-].
- * Returns null for invalid values — callers must handle null gracefully.
+ * Returns null for invalid values - callers must handle null gracefully.
  */
 function sanitizeChatId(chatId) {
     if (typeof chatId !== 'string' || !chatId) return null;
@@ -67,10 +67,10 @@ export function saveHistory(chatId, data) {
         initHistoryDirectory();
         const historyFilePath = getHistoryFilePath(chatId);
         fs.writeFileSync(historyFilePath, JSON.stringify(data, null, 2), 'utf8');
-        logDebug(`История чата ${chatId} успешно сохранена`);
+        logDebug(`Chat history ${chatId} successfully saved`);
         return true;
     } catch (error) {
-        logError(`Ошибка при сохранении истории чата ${chatId}`, error);
+        logError(`Error saving chat history ${chatId}`, error);
         return false;
     }
 }
@@ -80,42 +80,42 @@ export function loadHistory(chatId) {
         const historyFilePath = getHistoryFilePath(chatId);
         if (fs.existsSync(historyFilePath)) {
             const rawData = fs.readFileSync(historyFilePath, 'utf8');
-            logDebug(`Данные чата ${chatId} успешно загружены`);
+            logDebug(`Chat data ${chatId} successfully loaded`);
 
             let data;
             try {
                 data = JSON.parse(rawData);
-                logDebug(`Данные чата ${chatId} успешно распарсены`);
+                logDebug(`Chat data ${chatId} successfully parsed`);
             } catch (parseErr) {
-                logError(`Ошибка при парсинге данных чата ${chatId}`, parseErr);
+                logError(`Error parsing chat data ${chatId}`, parseErr);
                 return {
                     id: chatId,
-                    name: `Восстановленный чат ${new Date().toLocaleString()}`,
+                    name: `Restored chat ${new Date().toLocaleString()}`,
                     created: Date.now(),
                     messages: []
                 };
             }
 
-            // Поддержка обратной совместимости со старым форматом
+            // Backward compatibility with old array format
             if (Array.isArray(data)) {
-                logDebug(`Чат ${chatId} использует устаревший формат, выполняется конвертация`);
+                logDebug(`Chat ${chatId} uses old array format, performing conversion`);
                 return {
                     id: chatId,
-                    name: `Чат от ${new Date().toLocaleString()}`,
+                    name: `Chat from ${new Date().toLocaleString()}`,
                     created: Date.now(),
                     messages: data,
                     wasConverted: true
                 };
             }
 
-            // Проверяем наличие обязательных полей
+            // Check for required fields
             if (!data.messages) {
-                logInfo(`Чат ${chatId} не содержит сообщений, инициализируем пустой массив`);
+                logInfo(`Chat ${chatId} does not contain messages, initializing empty array`);
                 data.messages = [];
             }
 
             if (!data.name) {
-                data.name = `Чат ${chatId.substring(0, 6)}`;
+                data.name = `Chat ${chatId.substring(0, 6)}`;
             }
 
             if (!data.created) {
@@ -128,17 +128,17 @@ export function loadHistory(chatId) {
 
             return data;
         } else {
-            logInfo(`Файл истории для чата ${chatId} не найден`);
+            logInfo(`History file for chat ${chatId} not found`);
         }
     } catch (error) {
-        logError(`Ошибка при загрузке истории чата ${chatId}`, error);
+        logError(`Error loading chat history ${chatId}`, error);
     }
 
-    // Если не удалось загрузить, создаем новые данные
-    logInfo(`Создаем новую историю для чата ${chatId}`);
+    // If loading failed, create new data
+    logInfo(`Creating new history for chat ${chatId}`);
     return {
         id: chatId,
-        name: `Новый чат ${new Date().toLocaleString()}`,
+        name: `New chat ${new Date().toLocaleString()}`,
         created: Date.now(),
         messages: []
     };
@@ -148,7 +148,7 @@ export function chatExists(chatId) {
     try {
         const historyFilePath = getHistoryFilePath(chatId);
         const exists = fs.existsSync(historyFilePath);
-        logDebug(`Проверка существования чата ${chatId}: ${exists ? 'найден' : 'не найден'}`);
+        logDebug(`Chat existence check ${chatId}: ${exists ? 'found' : 'not found'}`);
         return exists;
     } catch (error) {
         logError(`Invalid chatId in chatExists: ${error.message}`);
@@ -159,7 +159,7 @@ export function chatExists(chatId) {
 export function renameChat(chatId, newName) {
     try {
         if (!chatExists(chatId)) {
-            logError(`Попытка переименовать несуществующий чат ${chatId}`);
+            logError(`Rename attempt for non-existent chat ${chatId}`);
             return false;
         }
 
@@ -168,13 +168,13 @@ export function renameChat(chatId, newName) {
         chatData.name = newName;
         const success = saveHistory(chatId, chatData);
         if (success) {
-            logInfo(`Чат ${chatId} переименован: "${oldName}" -> "${newName}"`);
+            logInfo(`Chat ${chatId} renamed: "${oldName}" -> "${newName}"`);
         } else {
-            logError(`Не удалось переименовать чат ${chatId}`);
+            logError(`Failed to rename chat ${chatId}`);
         }
         return success;
     } catch (error) {
-        logError(`Ошибка при переименовании чата ${chatId}`, error);
+        logError(`Error renaming chat ${chatId}`, error);
         return false;
     }
 }
@@ -183,19 +183,19 @@ export function addUserMessage(chatId, content) {
     const timestamp = Math.floor(Date.now() / 1000);
     const messageId = crypto.randomUUID();
 
-    // Определяем тип содержимого и его длину для логирования
+    // Determine content type and length for logging
     let contentDesc;
     if (Array.isArray(content)) {
-        // Составное сообщение (текст + изображения)
+        // Composite message (text + image)
         const textParts = content.filter(item => item.type === 'text');
         const imageParts = content.filter(item => item.type === 'image');
         const fileParts = content.filter(item => item.type === 'file');
 
-        contentDesc = `составное сообщение (${textParts.length} текст., ${imageParts.length} изобр., ${fileParts.length} файл.)`;
+        contentDesc = `composite message (${textParts.length} text, ${imageParts.length} images, ${fileParts.length} files)`;
     } else if (typeof content === 'object' && content !== null) {
-        contentDesc = 'объект-сообщение';
+        contentDesc = 'object-message';
     } else {
-        contentDesc = `текст длиной ${String(content).length}`;
+        contentDesc = `text of length ${String(content).length}`;
     }
 
     const message = {
@@ -206,7 +206,7 @@ export function addUserMessage(chatId, content) {
         chat_type: "t2t"
     };
 
-    logInfo(`Добавление сообщения пользователя в чат ${chatId}: ${contentDesc}`);
+    logInfo(`Adding user message to chat ${chatId}: ${contentDesc}`);
     return addMessageToHistory(chatId, message);
 }
 
@@ -223,7 +223,7 @@ export function addAssistantMessage(chatId, content, info = {}) {
         chat_type: "t2t"
     };
 
-    logInfo(`Добавление ответа ассистента в чат ${chatId}, длина: ${content.length}`);
+    logInfo(`Adding assistant response to chat ${chatId}, length: ${content.length}`);
     return addMessageToHistory(chatId, message);
 }
 
@@ -232,17 +232,17 @@ function addMessageToHistory(chatId, message) {
         let chatData = loadHistory(chatId);
 
         if (chatData.messages.length >= MAX_HISTORY_LENGTH) {
-            logInfo(`Чат ${chatId} достиг максимальной длины (${MAX_HISTORY_LENGTH}), удаляем старые сообщения`);
+            logInfo(`Chat ${chatId} reached max length (${MAX_HISTORY_LENGTH}), removing oldest messages`);
             chatData.messages = [chatData.messages[0], ...chatData.messages.slice(chatData.messages.length - MAX_HISTORY_LENGTH + 2)];
         }
 
         chatData.messages.push(message);
         saveHistory(chatId, chatData);
-        logDebug(`Сообщение ${message.id} успешно добавлено в чат ${chatId}`);
+        logDebug(`Message ${message.id} successfully added to chat ${chatId}`);
 
         return message.id;
     } catch (error) {
-        logError(`Ошибка при добавлении сообщения в историю чата ${chatId}`, error);
+        logError(`Error adding message to chat history ${chatId}`, error);
         return null;
     }
 }
@@ -251,7 +251,7 @@ export function getAllChats() {
     try {
         initHistoryDirectory();
         const files = fs.readdirSync(HISTORY_DIR);
-        logDebug(`Получен список файлов чатов: ${files.length} файлов`);
+        logDebug(`Received list of chat files: ${files.length} files`);
 
         let convertedCount = 0;
         const chats = files
@@ -266,7 +266,7 @@ export function getAllChats() {
 
                 return {
                     id: chatId,
-                    name: chatData.name || `Чат ${chatId.substring(0, 6)}`,
+                    name: chatData.name || `Chat ${chatId.substring(0, 6)}`,
                     created: chatData.created || 0,
                     messageCount: chatData.messages ? chatData.messages.length : 0,
                     userMessageCount: chatData.messages ?
@@ -275,13 +275,13 @@ export function getAllChats() {
             });
 
         if (convertedCount > 0) {
-            logInfo(`Конвертировано ${convertedCount} чатов из устаревшего формата`);
+            logInfo(`Converted ${convertedCount} chats from old format`);
         }
 
-        logInfo(`Обработано ${chats.length} чатов`);
+        logInfo(`Processed ${chats.length} chats`);
         return chats.sort((a, b) => b.created - a.created);
     } catch (error) {
-        logError('Ошибка при получении списка чатов', error);
+        logError('Error getting chat list', error);
         return [];
     }
 }
@@ -291,13 +291,13 @@ export function deleteChat(chatId) {
         const historyFilePath = getHistoryFilePath(chatId);
         if (fs.existsSync(historyFilePath)) {
             fs.unlinkSync(historyFilePath);
-            logInfo(`Чат ${chatId} успешно удален`);
+            logInfo(`Chat ${chatId} successfully deleted`);
             return true;
         } else {
-            logError(`Попытка удаления несуществующего чата ${chatId}`);
+            logError(`Delete attempt for non-existent chat ${chatId}`);
         }
     } catch (error) {
-        logError(`Ошибка при удалении чата ${chatId}`, error);
+        logError(`Error deleting chat ${chatId}`, error);
     }
     return false;
 }
@@ -305,25 +305,25 @@ export function deleteChat(chatId) {
 export function deleteChatsAutomatically(criteria = {}) {
     try {
         const { olderThan, userMessageCountLessThan, messageCountLessThan, maxChats } = criteria;
-        logInfo(`Автоудаление чатов с критериями: ${JSON.stringify(criteria)}`);
+        logInfo(`Auto-deleting chats with criteria: ${JSON.stringify(criteria)}`);
 
         const chats = getAllChats();
-        logInfo(`Найдено ${chats.length} чатов для проверки`);
+        logInfo(`Found ${chats.length} chats for review`);
 
         let chatsToDelete = [...chats];
 
-        // Фильтрация по возрасту (в миллисекундах)
+        // Filter by age (in milliseconds)
         if (olderThan) {
             const cutoffTime = Date.now() - olderThan;
             const oldChatsCount = chatsToDelete.filter(chat => chat.created < cutoffTime).length;
-            logInfo(`Чатов старше ${olderThan}мс (${new Date(cutoffTime).toLocaleString()}): ${oldChatsCount}`);
+            logInfo(`Chats older than ${olderThan}ms (${new Date(cutoffTime).toLocaleString()}): ${oldChatsCount}`);
             chatsToDelete = chatsToDelete.filter(chat => chat.created < cutoffTime);
         }
 
         if (userMessageCountLessThan !== undefined) {
             const lowUserMsgChatsCount = chatsToDelete.filter(chat =>
                 chat.userMessageCount < userMessageCountLessThan).length;
-            logInfo(`Чатов с менее чем ${userMessageCountLessThan} сообщений пользователя: ${lowUserMsgChatsCount}`);
+            logInfo(`Chats with less than ${userMessageCountLessThan} user messages: ${lowUserMsgChatsCount}`);
             chatsToDelete = chatsToDelete.filter(chat =>
                 chat.userMessageCount < userMessageCountLessThan);
         }
@@ -331,13 +331,13 @@ export function deleteChatsAutomatically(criteria = {}) {
         if (messageCountLessThan !== undefined) {
             const lowMsgChatsCount = chatsToDelete.filter(chat =>
                 chat.messageCount < messageCountLessThan).length;
-            logInfo(`Чатов с менее чем ${messageCountLessThan} сообщений всего: ${lowMsgChatsCount}`);
+            logInfo(`Chats with less than ${messageCountLessThan} total messages: ${lowMsgChatsCount}`);
             chatsToDelete = chatsToDelete.filter(chat =>
                 chat.messageCount < messageCountLessThan);
         }
 
         if (maxChats && chats.length > maxChats) {
-            logInfo(`Общее количество чатов (${chats.length}) превышает лимит (${maxChats}), удаляем старые чаты`);
+            logInfo(`Total number of chats (${chats.length}) exceeds limit (${maxChats}), removing oldest chats`);
             const sortedChats = [...chats].sort((a, b) => a.created - b.created);
             const oldestChats = sortedChats.slice(0, chats.length - maxChats);
 
@@ -348,9 +348,9 @@ export function deleteChatsAutomatically(criteria = {}) {
             });
         }
 
-        // Удаление выбранных чатов
+        // Delete selected chats
         const deletedChats = [];
-        logInfo(`Найдено ${chatsToDelete.length} чатов для удаления`);
+        logInfo(`Found ${chatsToDelete.length} chats to delete`);
 
         for (const chat of chatsToDelete) {
             if (deleteChat(chat.id)) {
@@ -358,14 +358,14 @@ export function deleteChatsAutomatically(criteria = {}) {
             }
         }
 
-        logInfo(`Удалено ${deletedChats.length} чатов`);
+        logInfo(`Deleted ${deletedChats.length} chats`);
         return {
             success: true,
             deletedCount: deletedChats.length,
             deletedChats
         };
     } catch (error) {
-        logError('Ошибка при автоматическом удалении чатов', error);
+        logError('Error during automatic chat deletion', error);
         return {
             success: false,
             error: error.message

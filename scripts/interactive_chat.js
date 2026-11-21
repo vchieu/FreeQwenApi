@@ -21,7 +21,7 @@ function question(prompt) {
 async function streamChat(userMessage) {
     try {
         console.log('\n🤖 Assistant: ', '');
-        
+
         const response = await axios.post(
             API_URL,
             {
@@ -45,12 +45,12 @@ async function streamChat(userMessage) {
 
         let fullContent = '';
         let chunkCount = 0;
-        
+
         await new Promise((resolve, reject) => {
             response.data.on('data', (chunk) => {
                 const text = chunk.toString();
                 const lines = text.split('\n').filter(line => line.trim());
-                
+
                 for (const line of lines) {
                     if (line.startsWith('data: ')) {
                         try {
@@ -67,19 +67,19 @@ async function streamChat(userMessage) {
                     }
                 }
             });
-            
+
             response.data.on('end', () => {
                 console.log('\n');
                 resolve();
             });
-            
+
             response.data.on('error', reject);
         });
 
         return fullContent;
 
     } catch (error) {
-        console.error('\n❌ Ошибка:', error.message);
+        console.error('\n❌ Error:', error.message);
         if (error.response?.status === 404) {
             console.error('Server not running at', API_URL);
         }
@@ -88,14 +88,14 @@ async function streamChat(userMessage) {
 }
 
 async function main() {
-    console.log('╔════════════════════════════════════════╗');
-    console.log('║  FreeQwenApi - Interactive Chat        ║');
-    console.log('║  Type "exit" to quit                   ║');
-    console.log('╚════════════════════════════════════════╝\n');
+    console.log('═══════════════════════════════════════════════════════════');
+    console.log('║   FreeQwenApi - Interactive Chat        ║');
+    console.log('║   Type "exit" to quit                   ║');
+    console.log('═══════════════════════════════════════════════════════════\n');
 
     while (true) {
-        const userInput = await question('👤 You: ');
-        
+        const userInput = await question('🧑 You: ');
+
         if (userInput.toLowerCase() === 'exit') {
             console.log('\n👋 Goodbye!');
             rl.close();

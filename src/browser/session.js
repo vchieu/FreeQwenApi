@@ -34,7 +34,7 @@ export async function saveSession(context, accountId = null) {
             const sessionPath = getSessionFilePath(accountId, 'cookies.json');
             ensureDir(path.dirname(sessionPath));
             fs.writeFileSync(sessionPath, JSON.stringify(cookies, null, 2));
-            logInfo('Сессия Puppeteer сохранена');
+            logInfo('Puppeteer session saved');
             return true;
         }
 
@@ -42,14 +42,14 @@ export async function saveSession(context, accountId = null) {
             const sessionPath = getSessionFilePath(accountId, 'state.json');
             ensureDir(path.dirname(sessionPath));
             await context.storageState({ path: sessionPath });
-            logInfo('Сессия Playwright сохранена');
+            logInfo('Playwright session saved');
             return true;
         }
 
-        logError('Неизвестный тип контекста браузера');
+        logError('Unknown browser context type');
         return false;
     } catch (error) {
-        logError('Ошибка при сохранении сессии', error);
+        logError('Error saving session', error);
         return false;
     }
 }
@@ -64,19 +64,19 @@ export async function loadSession(context, accountId = null) {
             if (fs.existsSync(sessionPath)) {
                 const cookies = JSON.parse(fs.readFileSync(sessionPath, 'utf8'));
                 await context.setCookie(...cookies);
-                logInfo('Сессия Puppeteer загружена');
+                logInfo('Puppeteer session loaded');
                 return true;
             }
         } else if (isPlaywright) {
             const sessionPath = getSessionFilePath(accountId, 'state.json');
             if (fs.existsSync(sessionPath)) {
                 await context.storageState({ path: sessionPath });
-                logInfo('Сессия Playwright загружена');
+                logInfo('Playwright session loaded');
                 return true;
             }
         }
     } catch (error) {
-        logError('Ошибка при загрузке сессии', error);
+        logError('Error loading session', error);
     }
     return false;
 }
@@ -91,10 +91,10 @@ export function clearSession(accountId = null) {
         for (const p of paths) {
             if (fs.existsSync(p)) { fs.unlinkSync(p); cleared = true; }
         }
-        if (cleared) logInfo('Сессия очищена');
+        if (cleared) logInfo('Session cleared');
         return cleared;
     } catch (error) {
-        logError('Ошибка при очистке сессии', error);
+        logError('Error clearing session', error);
         return false;
     }
 }
@@ -111,11 +111,11 @@ export function saveAuthToken(token) {
         initSessionDirectory();
         if (token) {
             fs.writeFileSync(TOKEN_FILE, token, 'utf8');
-            logInfo('Токен авторизации сохранен');
+            logInfo('Auth token saved');
             return true;
         }
     } catch (error) {
-        logError('Ошибка при сохранении токена авторизации', error);
+        logError('Error saving auth token', error);
     }
     return false;
 }
@@ -124,11 +124,11 @@ export function loadAuthToken() {
     try {
         if (fs.existsSync(TOKEN_FILE)) {
             const token = fs.readFileSync(TOKEN_FILE, 'utf8');
-            logInfo('Токен авторизации загружен');
+            logInfo('Auth token loaded');
             return token;
         }
     } catch (error) {
-        logError('Ошибка при загрузке токена авторизации', error);
+        logError('Error loading auth token', error);
     }
     return null;
 }

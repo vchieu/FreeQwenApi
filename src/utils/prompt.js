@@ -1,9 +1,9 @@
 import readline from 'readline';
 
 /**
- * Интерактивный ввод из stdin.
- * @param {string} question — текст вопроса
- * @returns {Promise<string>} — ответ пользователя (trimmed)
+ * Interactive input from stdin.
+ * @param {string} question — question text
+ * @returns {Promise<string>} — user answer (trimmed)
  */
 export function prompt(question) {
     const rl = readline.createInterface({ input: process.stdin, output: process.stdout });

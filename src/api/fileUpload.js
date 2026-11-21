@@ -14,22 +14,22 @@ const DOCUMENT_FILE_TYPE = 'document';
 
 function validateBrowserContext() {
     const browserContext = getBrowserContext();
-    if (!browserContext) throw new Error('Браузер не инициализирован');
+    if (!browserContext) throw new Error('Browser is not initialized');
     return browserContext;
 }
 
 async function validateAuthToken(browserContext) {
     const tokenObj = await getAvailableToken();
     if (tokenObj?.token) {
-        logInfo(`Используется токен из tokenManager: ${tokenObj.id}`);
+        logInfo(`Using token from tokenManager: ${tokenObj.id}`);
         return tokenObj.token;
     }
 
     let token = getAuthToken();
     if (!token) {
-        logInfo('Токен авторизации не найден в памяти, пытаемся извлечь из браузера');
+        logInfo('Auth token not found in memory, trying to extract from browser');
         token = await extractAuthToken(browserContext);
-        if (!token) throw new Error('Не удалось получить токен авторизации');
+        if (!token) throw new Error('Failed to get auth token');
     }
     return token;
 }
@@ -37,7 +37,7 @@ async function validateAuthToken(browserContext) {
 export async function getStsToken(fileInfo) {
     const browserContext = validateBrowserContext();
     const token = await validateAuthToken(browserContext);
-    logInfo(`Запрос STS токена для файла: ${fileInfo.filename}`);
+    logInfo(`Requesting STS token for file: ${fileInfo.filename}`);
 
     let page = null;
     try {
@@ -55,35 +55,35 @@ export async function getStsToken(fileInfo) {
         }, { apiUrl: STS_TOKEN_API_URL, token, fileInfo });
 
         if (result.success) {
-            logInfo(`STS токен успешно получен для файла: ${fileInfo.filename}`);
+            logInfo(`STS token successfully obtained for file: ${fileInfo.filename}`);
             return result.data;
         }
-        logError(`Ошибка при получении STS токена: status=${result.status}, error=${result.errorBody || result.error}`);
-        throw new Error(`Ошибка получения STS токена: ${result.statusText || result.error}`);
+        logError(`Error getting STS token: status=${result.status}, error=${result.errorBody || result.error}`);
+        throw new Error(`Error getting STS token: ${result.statusText || result.error}`);
     } catch (error) {
-        logError(`Ошибка при получении STS токена: ${error.message}`, error);
+        logError(`Error getting STS token: ${error.message}`, error);
         throw error;
     } finally {
-        if (page) { try { pagePool.releasePage(page); } catch (e) { logError('Ошибка при возврате страницы в пул', e); } }
+        if (page) { try { pagePool.releasePage(page); } catch (e) { logError('Error returning page to pool', e); } }
     }
 }
 
 export async function uploadFile(filePath, stsData) {
     const browserContext = validateBrowserContext();
-    logInfo(`Начало загрузки файла: ${filePath}`);
+    logInfo(`Starting file upload: ${filePath}`);
 
     if (!stsData?.file_path || !stsData?.access_key_id || !stsData?.access_key_secret ||
         !stsData?.security_token || !stsData?.region || !stsData?.bucketname) {
-        throw new Error('Некорректные или неполные данные STS токена');
+        throw new Error('Invalid or incomplete STS token data');
     }
 
-    logInfo(`[OSS] Загрузка через браузер`);
-    logInfo(`[OSS] Регион: ${stsData.region}, Бакет: ${stsData.bucketname}`);
+    logInfo(`[OSS] Uploading via browser`);
+    logInfo(`[OSS] Region: ${stsData.region}, Bucket: ${stsData.bucketname}`);
     if (stsData.endpoint) logInfo(`[OSS] Endpoint: ${stsData.endpoint}`);
 
     const fileBuffer = fs.readFileSync(filePath);
     const fileBase64 = fileBuffer.toString('base64');
-    logInfo(`[OSS] Размер файла: ${fileBuffer.length} байт`);
+    logInfo(`[OSS] File size: ${fileBuffer.length} bytes`);
 
     let page = null;
     try {
@@ -120,19 +120,19 @@ export async function uploadFile(filePath, stsData) {
         if (result.success) {
             return { success: true, fileName: path.basename(filePath), url: stsData.file_url, fileId: stsData.file_id, filePath: stsData.file_path };
         }
-        logError(`[OSS] Ошибка загрузки: ${result.error}`);
-        throw new Error(`Ошибка загрузки в OSS: ${result.error}`);
+        logError(`[OSS] Upload error: ${result.error}`);
+        throw new Error(`OSS upload error: ${result.error}`);
     } catch (error) {
-        logError(`Ошибка при загрузке файла в OSS: ${error.message}`, error);
+        logError(`Error uploading file to OSS: ${error.message}`, error);
         throw error;
     } finally {
-        if (page) { try { pagePool.releasePage(page); } catch (e) { logError('Ошибка при возврате страницы в пул', e); } }
+        if (page) { try { pagePool.releasePage(page); } catch (e) { logError('Error returning page to pool', e); } }
     }
 }
 
 export async function uploadFileToQwen(filePath) {
     try {
-        if (!fs.existsSync(filePath)) throw new Error(`Файл не найден: ${filePath}`);
+        if (!fs.existsSync(filePath)) throw new Error(`File not found: ${filePath}`);
 
         const fileName = path.basename(filePath);
         const fileSize = fs.statSync(filePath).size;
@@ -147,7 +147,7 @@ export async function uploadFileToQwen(filePath) {
         const uploadResult = await uploadFile(filePath, stsData);
         return { ...uploadResult, fileInfo, stsData };
     } catch (error) {
-        logError(`Ошибка в процессе загрузки файла: ${error.message}`, error);
+        logError(`Error during file upload process: ${error.message}`, error);
         return { success: false, error: error.message };
     }
 }

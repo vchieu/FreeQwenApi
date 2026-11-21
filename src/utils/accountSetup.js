@@ -21,14 +21,14 @@ function ensureAccountDir(id) {
 
 export async function addAccountInteractive() {
     logInfo('======================================================');
-    logInfo('Добавление нового аккаунта Qwen');
+    logInfo('Adding new Qwen account');
     logInfo(formatForgetMeAiWatermark());
-    logInfo('Браузер откроется, войдите в систему, затем вернитесь к консоли.');
+    logInfo('Browser will open, log in, then return to console.');
     logInfo('======================================================');
 
     const ok = await initBrowser(true, true);
     if (!ok) {
-        logError('Не удалось запустить браузер.');
+        logError('Failed to start browser.');
         return null;
     }
 
@@ -37,11 +37,11 @@ export async function addAccountInteractive() {
 
     if (!token) {
         token = loadAuthToken();
-        if (token) logInfo('Токен получен из сохранённого файла.');
+        if (token) logInfo('Token received from saved file.');
     }
 
     if (!token) {
-        logError('Токен не был получен. Аккаунт не добавлен.');
+        logError('Token was not received. Account not added.');
         await shutdownBrowser();
         return null;
     }
@@ -56,21 +56,21 @@ export async function addAccountInteractive() {
     list.push({ id, token, resetAt: null });
     saveTokens(list);
 
-    logInfo(`Аккаунт '${id}' добавлен. Всего аккаунтов: ${list.length}`);
+    logInfo(`Account '${id}' added. Total accounts: ${list.length}`);
     logInfo('======================================================');
     return id;
 }
 
 export async function interactiveAccountMenu() {
     while (true) {
-        console.log('\n=== Меню управления аккаунтами ===');
+        console.log('\n=== Account management menu ===');
         console.log(formatForgetMeAiWatermark());
-        console.log('1 - Добавить новый аккаунт');
-        console.log('2 - Завершить');
-        const choice = await prompt('Ваш выбор (1/2): ');
+        console.log('1 - Add new account');
+        console.log('2 - Finish');
+        const choice = await prompt('Your choice (1/2): ');
         if (choice === '1') await addAccountInteractive();
         else if (choice === '2') break;
-        else console.log('Неверный выбор.');
+        else console.log('Invalid choice.');
     }
 }
 
@@ -78,63 +78,63 @@ export async function reloginAccountInteractive() {
     const tokens = loadTokens();
     const invalids = tokens.filter(t => t.invalid);
     if (!invalids.length) {
-        console.log('Нет аккаунтов, требующих повторного входа.');
-        await prompt('Нажмите ENTER чтобы вернуться в меню...');
+        console.log('No accounts require re-login.');
+        await prompt('Press ENTER to return to menu...');
         return;
     }
 
-    console.log('\nАккаунты с истекшим токеном:');
+    console.log('\nAccounts with expired token:');
     invalids.forEach((t, idx) => console.log(`${idx + 1} - ${t.id}`));
-    const choice = await prompt('Выберите номер аккаунта для повторного входа: ');
+    const choice = await prompt('Enter account number to re-login: ');
     const num = parseInt(choice, 10);
     if (isNaN(num) || num < 1 || num > invalids.length) {
-        console.log('Неверный выбор.');
+        console.log('Invalid choice.');
         return;
     }
     const account = invalids[num - 1];
 
-    logInfo(`Повторная авторизация для ${account.id}`);
+    logInfo(`Re-authorization for ${account.id}`);
     logInfo(formatForgetMeAiWatermark());
     const ok = await initBrowser(true, true);
-    if (!ok) { logError('Не удалось запустить браузер.'); return; }
+    if (!ok) { logError('Failed to start browser.'); return; }
 
     const token = await extractAuthToken(getBrowserContext(), true);
     await shutdownBrowser();
 
-    if (!token) { logError('Не удалось извлечь токен.'); return; }
+    if (!token) { logError('Failed to extract token.'); return; }
 
     markValid(account.id, token);
     fs.writeFileSync(path.resolve(__dirname, '..', '..', SESSION_DIR, ACCOUNTS_DIR, account.id, 'token.txt'), token, 'utf8');
-    logInfo(`Токен обновлён для ${account.id}`);
+    logInfo(`Token updated for ${account.id}`);
 }
 
 export async function removeAccountInteractive() {
     const tokens = loadTokens();
     if (!tokens.length) {
-        console.log('Нет сохранённых аккаунтов.');
-        await prompt('ENTER чтобы вернуться...');
+        console.log('No saved accounts.');
+        await prompt('Press ENTER to return...');
         return;
     }
 
-    console.log('\nДоступные аккаунты:');
+    console.log('\nAvailable accounts:');
     tokens.forEach((t, idx) => console.log(`${idx + 1} - ${t.id}`));
-    const choice = await prompt('Номер аккаунта, который нужно удалить (или ENTER для отмены): ');
+    const choice = await prompt('Account number to remove (or ENTER to cancel): ');
     if (!choice) return;
     const num = parseInt(choice, 10);
     if (isNaN(num) || num < 1 || num > tokens.length) {
-        console.log('Неверный выбор.');
-        await prompt('ENTER чтобы вернуться...');
+        console.log('Invalid choice.');
+        await prompt('Press ENTER to return...');
         return;
     }
 
     const acc = tokens[num - 1];
-    const confirm = await prompt(`Точно удалить ${acc.id}? (y/N): `);
+    const confirm = await prompt(`Delete ${acc.id} definitively? (y/N): `);
     if (confirm.toLowerCase() !== 'y') return;
 
     removeToken(acc.id);
     const dir = path.resolve(__dirname, '..', '..', SESSION_DIR, ACCOUNTS_DIR, acc.id);
     if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
 
-    logInfo(`Аккаунт ${acc.id} удалён.`);
-    await prompt('ENTER чтобы вернуться...');
+    logInfo(`Account ${acc.id} removed.`);
+    await prompt('Press ENTER to return...');
 }

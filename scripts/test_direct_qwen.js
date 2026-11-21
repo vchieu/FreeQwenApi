@@ -25,22 +25,22 @@ function log(msg) {
 
 async function runTest() {
     try {
-        log('=== Запуск прямого теста Qwen API ===');
-        log('Шаг 1: инициализируем браузер и получаем auth-токен...');
-        
+        log('=== Starting direct Qwen API test ===');
+        log('Step 1: initializing browser and getting auth token...');
+
         // Initialize browser
         await initBrowser();
-        
+
         // Get auth token
         const token = await getAuthorizationToken();
         log(`Got token: ${token ? token.substring(0, 50) + '...' : 'FAILED'}`);
-        
+
         if (!token) {
             log('ERROR: Failed to get auth token');
             await closeBrowser();
             return;
         }
-        
+
         // Prepare payload
         const payload = {
             model: 'qwen-turbo',
@@ -52,12 +52,12 @@ async function runTest() {
             ],
             stream: true
         };
-        
-        log('Шаг 2: отправляем POST напрямую в Qwen v2 API...');
+
+        log('Step 2: sending POST request directly to Qwen v2 API...');
         log(`URL: https://chat.qwen.ai/api/v2/chat/completions`);
         log(`Headers: Authorization: Bearer ${token.substring(0, 30)}...`);
         log(`Payload: ${JSON.stringify(payload)}`);
-        
+
         const startTime = Date.now();
         const response = await axios.post(
             'https://chat.qwen.ai/api/v2/chat/completions',
@@ -72,25 +72,25 @@ async function runTest() {
                 timeout: 30000
             }
         );
-        
-        log(`Шаг 3: ответ получен за ${Date.now() - startTime}мс`);
+
+        log(`Step 3: response received in ${Date.now() - startTime}ms`);
         log(`Status: ${response.status}`);
         log(`Headers: ${JSON.stringify(response.headers, null, 2)}`);
-        
+
         // Parse stream
         let rawChunks = [];
         let fullContent = '';
         let chunkCount = 0;
-        
+
         await new Promise((resolve, reject) => {
             response.data.on('data', (chunk) => {
                 chunkCount++;
                 const chunkStr = chunk.toString('utf-8');
                 log(`[Chunk ${chunkCount}] Raw bytes: ${chunk.length} bytes`);
                 log(`[Chunk ${chunkCount}] Text: ${chunkStr.substring(0, 100)}`);
-                
+
                 rawChunks.push(chunkStr);
-                
+
                 // Try to parse as SSE
                 const lines = chunkStr.split('\n');
                 for (const line of lines) {
@@ -108,23 +108,23 @@ async function runTest() {
                     }
                 }
             });
-            
+
             response.data.on('end', () => {
                 log(`Stream ended after ${chunkCount} chunks`);
                 resolve();
             });
-            
+
             response.data.on('error', (err) => {
                 log(`Stream error: ${err.message}`);
                 reject(err);
             });
         });
-        
-        log(`Шаг 4: разбор stream завершён`);
+
+        log(`Step 4: stream parsing completed`);
         log(`Total chunks received: ${chunkCount}`);
         log(`Full content: "${fullContent}"`);
         log(`Raw chunks: ${JSON.stringify(rawChunks)}`);
-        
+
         // Save results
         const results = {
             status: response.status,
@@ -134,15 +134,15 @@ async function runTest() {
             rawChunks: rawChunks,
             timestamp: new Date().toISOString()
         };
-        
+
         fs.writeFileSync(
             path.join(logsDir, 'direct-qwen-result.json'),
             JSON.stringify(results, null, 2)
         );
         log(`Results saved to direct-qwen-result.json`);
-        
+
         log('=== Test Complete ===');
-        
+
     } catch (error) {
         log(`ERROR: ${error.message}`);
         log(`Stack: ${error.stack}`);

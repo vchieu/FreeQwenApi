@@ -20,7 +20,7 @@ async function requestJson(path, options = {}) {
   }
 
   if (!response.ok) {
-    throw new Error(`${options.method || 'GET'} ${path}: ошибка HTTP ${response.status} ${text.slice(0, 500)}`);
+    throw new Error(`${options.method || 'GET'} ${path}: HTTP error ${response.status} ${text.slice(0, 500)}`);
   }
 
   return data;
@@ -31,11 +31,11 @@ async function main() {
   const models = await requestJson('/models');
   const modelIds = models.data.map(model => model.id);
 
-  console.log(`Аккаунтов в статусе: ${status.accounts?.length ?? 0}`);
-  console.log(`Моделей: ${modelIds.length}`);
+  console.log(`Accounts in status: ${status.accounts?.length ?? 0}`);
+  console.log(`Models: ${modelIds.length}`);
 
   if (!modelIds.includes(MODEL)) {
-    throw new Error(`Smoke-модель ${MODEL} отсутствует в /models`);
+    throw new Error(`Smoke model ${MODEL} missing from /models`);
   }
 
   const completion = await requestJson('/chat/completions', {
@@ -44,17 +44,17 @@ async function main() {
       model: MODEL,
       stream: false,
       messages: [
-        { role: 'user', content: 'Ответь ровно одним словом: работает' }
+        { role: 'user', content: 'Answer with exactly one word: working' }
       ]
     })
   });
 
   const answer = completion.choices?.[0]?.message?.content || '';
   console.log(`${MODEL}: ${answer}`);
-  console.log('Smoke-проверка OK');
+  console.log('Smoke test OK');
 }
 
 main().catch(error => {
-  console.error(`Smoke-проверка не удалась: ${error.message}`);
+  console.error(`Smoke test failed: ${error.message}`);
   process.exit(1);
 });

@@ -23,7 +23,7 @@ export function loadTokens() {
     try {
         return JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
     } catch (e) {
-        logError('TokenManager: ошибка чтения tokens.json', e);
+        logError('TokenManager: error reading tokens.json', e);
         return [];
     }
 }
@@ -33,7 +33,7 @@ export function saveTokens(tokens) {
     try {
         fs.writeFileSync(TOKENS_FILE, JSON.stringify(tokens, null, 2), 'utf8');
     } catch (e) {
-        logError('TokenManager: ошибка сохранения tokens.json', e);
+        logError('TokenManager: error saving tokens.json', e);
     }
 }
 
@@ -85,47 +85,47 @@ export function markValid(id, newToken) {
     }
 }
 
-// Устанавливает человекочитаемый ярлык аккаунта (для различения в пуле).
-// Пустая строка очищает ярлык. Возвращает { ok, id, label } либо { error }.
+// Sets a human-readable label for the account (to distinguish in the pool).
+// Empty string clears the label. Returns { ok, id, label } or { error }.
 export function setLabel(id, rawLabel) {
     if (typeof id !== 'string' || !/^acc_[a-zA-Z0-9]+$/.test(id)) {
-        return { error: 'Некорректный id аккаунта' };
+        return { error: 'Invalid account id' };
     }
     const label = String(rawLabel ?? '').trim().slice(0, 60);
     const tokens = loadTokens();
     const idx = tokens.findIndex(t => t.id === id);
-    if (idx === -1) return { error: 'Аккаунт не найден' };
+    if (idx === -1) return { error: 'Account not found' };
     tokens[idx].label = label;
     saveTokens(tokens);
     return { ok: true, id, label };
 }
 
-// Обновляет токен существующего аккаунта (relogin из дашборда):
-// markValid (обновляет token + сбрасывает invalid/resetAt) + перезапись token.txt.
+// Updates token of an existing account (relogin from dashboard):
+// markValid (updates token + resets invalid/resetAt) + rewrites token.txt.
 export function updateAccountToken(id, rawToken) {
     if (typeof id !== 'string' || !/^acc_[a-zA-Z0-9]+$/.test(id)) {
-        return { error: 'Некорректный id аккаунта' };
+        return { error: 'Invalid account id' };
     }
     const token = String(rawToken || '').trim();
     if (!token.startsWith('eyJ') || token.split('.').length !== 3) {
-        return { error: 'Невалидный токен: ожидается JWT (eyJ...)' };
+        return { error: 'Invalid token: expected JWT (eyJ...)' };
     }
     const tokens = loadTokens();
     const acc = tokens.find(t => t.id === id);
-    if (!acc) return { error: 'Аккаунт не найден' };
+    if (!acc) return { error: 'Account not found' };
     if (tokens.some(t => t.id !== id && t.token === token)) {
-        return { error: 'Этот токен уже используется другим аккаунтом' };
+        return { error: 'This token is already used by another account' };
     }
     const dir = path.join(ACCOUNTS_PATH, id);
     if (!path.resolve(dir).startsWith(path.resolve(ACCOUNTS_PATH) + path.sep)) {
-        return { error: 'Недопустимый путь аккаунта' };
+        return { error: 'Invalid account path' };
     }
     markValid(id, token);
     try {
         fs.mkdirSync(dir, { recursive: true });
         fs.writeFileSync(path.join(dir, 'token.txt'), token, 'utf8');
     } catch (e) {
-        logError('TokenManager: не удалось записать token.txt для ' + id, e);
+        logError('TokenManager: failed to write token.txt for ' + id, e);
     }
     const info = decodeTokenInfo(token);
     return { ok: true, id, exp: info.exp };
@@ -135,7 +135,7 @@ export function listTokens() {
     return loadTokens();
 }
 
-// Декодирует payload JWT без проверки подписи — для отображения срока и id аккаунта.
+// Decodes JWT payload without signature verification — to display expiration and account id.
 export function decodeTokenInfo(token) {
     try {
         const payload = JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString());
@@ -145,16 +145,16 @@ export function decodeTokenInfo(token) {
     }
 }
 
-// Добавляет токен вручную (из дашборда), без запуска браузера.
-// Возвращает { id } при успехе либо { error }.
+// Adds token manually (from dashboard), without launching browser.
+// Returns { id } on success or { error }.
 export function addTokenFromString(rawToken, label) {
     const token = String(rawToken || '').trim();
     if (!token.startsWith('eyJ') || token.split('.').length !== 3) {
-        return { error: 'Невалидный токен: ожидается JWT (eyJ...)' };
+        return { error: 'Invalid token: expected JWT (eyJ...)' };
     }
     const tokens = loadTokens();
     if (tokens.some(t => t.token === token)) {
-        return { error: 'Этот токен уже добавлен' };
+        return { error: 'This token is already added' };
     }
     let n = 2;
     const ids = new Set(tokens.map(t => t.id));
@@ -170,21 +170,21 @@ export function addTokenFromString(rawToken, label) {
     return { id };
 }
 
-// Полностью удаляет аккаунт: запись в tokens.json и папку с token.txt.
+// Completely removes an account: entry in tokens.json and folder with token.txt.
 export function deleteAccount(id) {
-    // Защита от path traversal: id попадает в путь файловой системы.
+    // Protection against path traversal: id is used in filesystem path.
     if (typeof id !== 'string' || !/^acc_[a-zA-Z0-9]+$/.test(id)) {
-        return { error: 'Некорректный id аккаунта' };
+        return { error: 'Invalid account id' };
     }
     const dir = path.join(ACCOUNTS_PATH, id);
     if (!path.resolve(dir).startsWith(path.resolve(ACCOUNTS_PATH) + path.sep)) {
-        return { error: 'Недопустимый путь аккаунта' };
+        return { error: 'Invalid account path' };
     }
     removeToken(id);
     try {
         if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
     } catch (e) {
-        logError('TokenManager: не удалось удалить папку аккаунта ' + id, e);
+        logError('TokenManager: failed to delete account folder ' + id, e);
     }
     return { ok: true };
 }
