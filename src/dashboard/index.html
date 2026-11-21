@@ -262,7 +262,6 @@
         <div class="row"><label class="k">Model</label><div class="val" id="defModel">qwen3.7-max</div><button class="sm" data-copy="defModel" aria-label="Copy"><svg class="ic"><use href="#i-copy"/></svg></button></div>
         <div class="row" style="margin-top:var(--s3)">
           <button class="sm" id="copyCurl"><svg class="ic"><use href="#i-copy"/></svg>cURL</button>
-          <button class="sm" id="copyPy"><svg class="ic"><use href="#i-copy"/></svg>Python</button>
         </div>
         <div class="hint">OpenAI SDK → <code>/api/v1</code>, Open WebUI → <code>/api</code>.</div>
       </div>
@@ -340,11 +339,6 @@ $('#copyCurl').onclick=()=>copyText(`curl ${apiV1}/chat/completions \\
 -H "Authorization: Bearer sk-qwen" \\
 -H "Content-Type: application/json" \\
 -d '{"model":"qwen3.7-max","messages":[{"role":"user","content":"Hello"}]}'`);
-$('#copyPy').onclick=()=>copyText(`from openai import OpenAI
-client = OpenAI(base_url="${apiV1}", api_key="sk-qwen")
-r = client.chat.completions.create(model="qwen3.7-max",
-messages=[{"role":"user","content":"Hello"}])
-print(r.choices[0].message.content)`);
 
 // Status + KPI --------------------------------------------------------------
 async function loadHealth(){

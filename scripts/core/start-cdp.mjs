@@ -65,7 +65,12 @@ async function main() {
 
     const proxy = spawn(process.execPath, ['index.js'], {
         cwd: process.cwd(),
-        env: { ...process.env, QWEN_CDP_URL: CDP_URL },
+        env: {
+            ...process.env,
+            QWEN_CDP_URL: CDP_URL,
+            SKIP_ACCOUNT_MENU: '1',
+            NON_INTERACTIVE: '1'
+        },
         stdio: 'inherit',
     });
 
