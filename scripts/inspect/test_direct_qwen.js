@@ -4,12 +4,12 @@
  */
 
 const axios = require('axios');
-const { initBrowser, authenticateUser, getAuthorizationToken } = require('../src/browser/auth');
-const { getPage, closeBrowser } = require('../src/browser/browser');
+const { initBrowser, authenticateUser, getAuthorizationToken } = require('../../src/browser/auth');
+const { getPage, closeBrowser } = require('../../src/browser/browser');
 const fs = require('fs');
 const path = require('path');
 
-const logsDir = path.join(__dirname, '..', 'logs');
+const logsDir = path.join(__dirname, '..', '..', 'logs');
 if (!fs.existsSync(logsDir)) {
     fs.mkdirSync(logsDir, { recursive: true });
 }

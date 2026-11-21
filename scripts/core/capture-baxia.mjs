@@ -5,7 +5,7 @@
 //
 // Usage:
 //   1. Start Chrome with --remote-debugging-port=9222 and log in to chat.qwen.ai
-//   2. QWEN_CDP_URL=http://127.0.0.1:9222 node scripts/capture-baxia.mjs
+//   2. QWEN_CDP_URL=http://127.0.0.1:9222 node scripts/core/capture-baxia.mjs
 //   3. Send one message in the Qwen tab
 //
 // The captured headers are written to session/baxia.json (override with
