@@ -2,7 +2,7 @@ import { getBrowserContext, getAuthenticationStatus, setAuthenticationStatus, en
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
 import { shutdownBrowser, initBrowser } from '../browser/browser.js';
 import { saveAuthToken } from '../browser/session.js';
-import { getAvailableToken, markRateLimited, removeInvalidToken } from './tokenManager.js';
+import { getAvailableToken, markRateLimited, removeInvalidToken, markValid } from './tokenManager.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -29,7 +29,7 @@ let browserTokenRateLimited = false;
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// ─── Page helpers ────────────────────────────────────────────────────────────
+// --- Page helpers ----------------------------------------------------------
 
 async function getPage(context) {
     if (context && typeof context.newPage === 'function') {
@@ -37,9 +37,9 @@ async function getPage(context) {
     }
 
     if (context && typeof context.goto === 'function') {
-        // Если передана Puppeteer Page, не переиспользуем её как рабочую:
-        // создаём отдельную вкладку из того же браузера, чтобы избежать гонок
-        // и случайного закрытия базовой страницы.
+        // If a Puppeteer Page was passed, don't reuse it as a worker:
+        // create a separate tab from the same browser to avoid races
+        // and accidental closing of the base page.
         if (typeof context.browser === 'function') {
             try {
                 const browser = context.browser();
@@ -47,18 +47,18 @@ async function getPage(context) {
                     return await browser.newPage();
                 }
             } catch (error) {
-                logWarn(`Не удалось создать новую страницу из текущего контекста: ${error.message}`);
+                logWarn(`Failed to create new page from current context: ${error.message}`);
             }
         }
 
         if (typeof context.isClosed === 'function' && context.isClosed()) {
-            throw new Error('Базовая страница браузера закрыта');
+            throw new Error('Base browser page is closed');
         }
 
         return context;
     }
 
-    throw new Error('Неверный контекст: не страница Puppeteer, не контекст Playwright');
+    throw new Error('Invalid context: not a Puppeteer instance, not a Playwright context');
 }
 
 export const pagePool = {
@@ -72,17 +72,17 @@ export const pagePool = {
             const page = this.pages.pop();
             try {
                 if (page === baseContext) {
-                    logWarn('Базовая страница не должна быть в пуле, пропускаем');
+                    logWarn('Base page should not be in pool, skipping');
                     continue;
                 }
                 if (page.isClosed()) {
-                    logWarn('Страница из пула закрыта, пропускаем');
+                    logWarn('Page from pool is closed, skipping');
                     continue;
                 }
                 await page.evaluate(() => document.readyState);
                 return page;
             } catch (e) {
-                logWarn(`Страница из пула протухла (${e.message?.substring(0, 60)}), создаём новую`);
+                logWarn(`Page from pool is stale (${e.message?.substring(0, 60)}), creating new`);
                 if (page !== baseContext) {
                     try { await page.close(); } catch { /* already dead */ }
                 }
@@ -95,12 +95,12 @@ export const pagePool = {
         if (!authToken) {
             try {
                 authToken = await newPage.evaluate(() => localStorage.getItem('token'));
-                logInfo('Токен авторизации получен из браузера');
+                logInfo('Auth token obtained from browser');
                 if (authToken) {
                     saveAuthToken(authToken);
                 }
             } catch (e) {
-                logError('Ошибка при получении токена авторизации', e);
+                logError('Error getting auth token', e);
             }
         }
 
@@ -114,14 +114,14 @@ export const pagePool = {
 
         const baseContext = getBrowserContext();
         if (page === baseContext) {
-            // Базовую страницу держим отдельно от пула.
+            // Base page is kept separately from the pool.
             return;
         }
 
         if (this.pages.length < this.maxSize) {
             this.pages.push(page);
         } else {
-            page.close().catch(e => logError('Ошибка при закрытии страницы', e));
+            page.close().catch(e => logError('Error closing page', e));
         }
     },
 
@@ -130,17 +130,17 @@ export const pagePool = {
         for (const page of this.pages) {
             if (page === baseContext) continue;
             try { await page.close(); } catch (e) {
-                logError('Ошибка при закрытии страницы в пуле', e);
+                logError('Error closing page in pool', e);
             }
         }
         this.pages = [];
     }
 };
 
-// ─── Task polling ────────────────────────────────────────────────────────────
+// --- Task polling ----------------------------------------------------------
 
 export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POLL_MAX_ATTEMPTS, interval = TASK_POLL_INTERVAL) {
-    logInfo(`Начинаем опрос статуса задачи: ${taskId}`);
+    logInfo(`Starting task status polling: ${taskId}`);
 
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
@@ -165,37 +165,37 @@ export async function pollTaskStatus(taskId, page, token, maxAttempts = TASK_POL
             }, { url: statusUrl, token });
 
             if (!result.success) {
-                logWarn(`Ошибка при проверке статуса (попытка ${attempt}/${maxAttempts}): ${result.error}`);
+                logWarn(`Error checking status (attempt ${attempt}/${maxAttempts}): ${result.error}`);
                 if (attempt < maxAttempts) await delay(interval);
                 continue;
             }
 
             const taskData = result.data;
             const taskStatus = taskData.task_status || taskData.status || 'unknown';
-            logDebug(`Статус задачи (${attempt}/${maxAttempts}): ${taskStatus}`);
+            logDebug(`Task status (${attempt}/${maxAttempts}): ${taskStatus}`);
 
             if (taskStatus === 'completed' || taskStatus === 'success') {
-                logInfo('Задача завершена успешно');
+                logInfo('Task completed successfully');
                 return { success: true, status: 'completed', data: taskData };
             }
 
             if (taskStatus === 'failed' || taskStatus === 'error') {
-                logError('Задача завершилась с ошибкой');
-                return { success: false, status: 'failed', error: taskData.error || taskData.message || 'Задача завершилась ошибкой', data: taskData };
+                logError('Task failed with error');
+                return { success: false, status: 'failed', error: taskData.error || taskData.message || 'Task failed with error', data: taskData };
             }
 
             if (attempt < maxAttempts) await delay(interval);
         } catch (error) {
-            logError(`Ошибка при опросе задачи (попытка ${attempt}/${maxAttempts})`, error);
+            logError(`Error polling task (attempt ${attempt}/${maxAttempts})`, error);
             if (attempt < maxAttempts) await delay(interval);
         }
     }
 
-    logError(`Превышен лимит попыток (${maxAttempts}) для задачи ${taskId}`);
-    return { success: false, status: 'timeout', error: 'Превышен таймаут polling задачи' };
+    logError(`Polling limit reached (${maxAttempts}) for task ${taskId}`);
+    return { success: false, status: 'timeout', error: 'Task polling timeout exceeded' };
 }
 
-// ─── Token extraction ────────────────────────────────────────────────────────
+// --- Token extraction ------------------------------------------------------
 
 export async function extractAuthToken(context, forceRefresh = false) {
     if (authToken && !forceRefresh) return authToken;
@@ -212,28 +212,28 @@ export async function extractAuthToken(context, forceRefresh = false) {
 
             if (newToken) {
                 authToken = newToken;
-                logInfo('Токен авторизации успешно извлечен');
+                logInfo('Auth token successfully extracted');
                 saveAuthToken(authToken);
                 return authToken;
             }
-            logError('Токен авторизации не найден в браузере');
+            logError('Auth token not found in browser');
             return null;
         } catch (error) {
             if (shouldClosePage) await page.close().catch(() => {});
             throw error;
         }
     } catch (error) {
-        logError('Ошибка при извлечении токена авторизации', error);
+        logError('Error extracting auth token', error);
         return null;
     }
 }
 
-// ─── Models & keys from files ────────────────────────────────────────────────
+// --- Models & keys from files ----------------------------------------------
 
 export function getAvailableModelsFromFile() {
     try {
         if (!fs.existsSync(MODELS_FILE)) {
-            logError(`Файл с моделями не найден: ${MODELS_FILE}`);
+            logError(`Models file not found: ${MODELS_FILE}`);
             return [DEFAULT_MODEL];
         }
         const models = fs.readFileSync(MODELS_FILE, 'utf8')
@@ -241,12 +241,12 @@ export function getAvailableModelsFromFile() {
             .map(l => l.trim())
             .filter(l => l && !l.startsWith('#'));
 
-        logInfo('===== ДОСТУПНЫЕ МОДЕЛИ =====');
+        logInfo('===== AVAILABLE MODELS =====');
         models.forEach(m => logInfo(`- ${m}`));
         logInfo('============================');
         return models;
     } catch (error) {
-        logError('Ошибка при чтении файла с моделями', error);
+        logError('Error reading models file', error);
         return [DEFAULT_MODEL];
     }
 }
@@ -254,12 +254,28 @@ export function getAvailableModelsFromFile() {
 function getAuthKeysFromFile() {
     try {
         if (!fs.existsSync(AUTH_KEYS_FILE)) {
-            const template = `# Файл API-ключей для прокси\n# --------------------------------------------\n# В этом файле перечислены токены, которые\n# прокси будет считать «действительными».\n# Один ключ — одна строка без пробелов.\n#\n# 1) Хотите ОТКЛЮЧИТЬ авторизацию целиком?\n#    Оставьте файл пустым — сервер перестанет\n#    проверять заголовок Authorization.\n#\n# 2) Хотите разрешить доступ нескольким людям?\n#    Впишите каждый ключ в отдельной строке:\n#      d35ab3e1-a6f9-4d...\n#      f2b1cd9c-1b2e-4a...\n#\n# Пустые строки и строки, начинающиеся с «#»,\n# игнорируются.`;
+            const template = `# API keys file for the proxy
+# --------------------------------------------
+# This file lists tokens that the proxy will
+# treat as "valid".
+# One key - one line without spaces.
+#
+# 1) Want to DISABLE authorization entirely?
+#    Leave the file empty - the server will stop
+#    checking the Authorization header.
+#
+# 2) Want to grant access to multiple people?
+#    Write each key on a separate line:
+#      d35ab3e1-a6f9-4d...
+#      f2b1cd9c-1b2e-4a...
+#
+# Empty lines and lines starting with "#"
+# are ignored.`;
             try {
                 fs.writeFileSync(AUTH_KEYS_FILE, template, { encoding: 'utf8', flag: 'wx' });
-                logInfo(`Создан шаблон файла ключей: ${AUTH_KEYS_FILE}`);
+                logInfo(`Created keys template file: ${AUTH_KEYS_FILE}`);
             } catch (e) {
-                logError('Не удалось создать шаблон Authorization.txt', e);
+                logError('Failed to create Authorization.txt template', e);
             }
             return [];
         }
@@ -268,7 +284,7 @@ function getAuthKeysFromFile() {
             .map(l => l.trim())
             .filter(l => l && !l.startsWith('#'));
     } catch (error) {
-        logError('Ошибка при чтении файла с ключами авторизации', error);
+        logError('Error reading auth keys file', error);
         return [];
     }
 }
@@ -284,7 +300,7 @@ export function getAllModels() {
         models: availableModels.map(model => ({
             id: model,
             name: model,
-            description: `Модель ${model}`
+            description: `Model ${model}`
         }))
     };
 }
@@ -294,11 +310,11 @@ export function getApiKeys() {
     return authKeys;
 }
 
-// ─── sendMessage — helper functions ──────────────────────────────────────────
+// --- sendMessage helper functions ------------------------------------------
 
 function validateAndPrepareMessage(message) {
     if (message === null || message === undefined) {
-        return { error: 'Сообщение не может быть пустым' };
+        return { error: 'Message cannot be empty' };
     }
     if (typeof message === 'string') return { content: message };
     if (Array.isArray(message)) {
@@ -307,33 +323,79 @@ function validateAndPrepareMessage(message) {
             (item.type === 'image' && typeof item.image === 'string') ||
             (item.type === 'file' && typeof item.file === 'string')
         );
-        if (!isValid) return { error: 'Некорректная структура составного сообщения' };
+        if (!isValid) return { error: 'Invalid structure of composite message' };
         return { content: message };
     }
-    return { error: 'Неподдерживаемый формат сообщения' };
+    return { error: 'Unsupported message format' };
+}
+
+// Qwen rotates the short-lived access token in localStorage roughly every
+// 15 minutes. A fresh automation tab can be served a stale/long-lived token,
+// so always prefer the token from the existing human Qwen tab.
+async function readTokenFromQwenTab(browserContext) {
+    try {
+        const base = getBrowserContext() || browserContext;
+        const browser = (base && typeof base.browser === 'function') ? base.browser() : null;
+        if (!browser || typeof browser.pages !== 'function') return null;
+
+        const pooled = new Set(pagePool.pages);
+        const candidates = (await browser.pages()).filter(page => {
+            if (!page || (typeof page.isClosed === 'function' && page.isClosed())) return false;
+            const url = page.url();
+            if (!url.includes('chat.qwen.ai')) return false;
+            if (page === base || pooled.has(page)) return false;
+            return true;
+        });
+        candidates.sort((a, b) => Number(b.url().includes('/c/')) - Number(a.url().includes('/c/')));
+
+        for (const page of candidates) {
+            try {
+                const token = await page.evaluate(() => localStorage.getItem('token'));
+                if (token) {
+                    logDebug('Fresh token read from Qwen tab');
+                    return token;
+                }
+            } catch (e) {
+                logWarn(`Could not read token from tab: ${e.message?.substring(0, 80)}`);
+            }
+        }
+    } catch (e) {
+        logWarn(`Failed to read Qwen tab token: ${e.message?.substring(0, 80)}`);
+    }
+    return null;
 }
 
 async function resolveAuthToken(browserContext) {
     const tokenObj = await getAvailableToken();
+    const browserToken = await readTokenFromQwenTab(browserContext);
+
+    if (browserToken) {
+        authToken = browserToken;
+        saveAuthToken(browserToken);
+        if (tokenObj?.id) markValid(tokenObj.id, browserToken);
+        logInfo(`Using fresh browser token${tokenObj ? ` for ${tokenObj.id}` : ''}`);
+        return tokenObj?.id ? { ...tokenObj, token: browserToken } : { id: 'browser', token: browserToken };
+    }
+
     if (tokenObj && tokenObj.token) {
         authToken = tokenObj.token;
-        logInfo(`Используется аккаунт: ${tokenObj.id}`);
+        logInfo(`Using account: ${tokenObj.id}`);
         return tokenObj;
     }
 
     if (browserTokenRateLimited) {
-        logWarn('Browser-токен залимичен, пропускаем fallback');
+        logWarn('Browser token is rate limited, skipping fallback');
         return null;
     }
 
     if (!getAuthenticationStatus()) {
-        logInfo('Проверка авторизации...');
+        logInfo('Checking authentication...');
         const authCheck = await checkAuthentication(browserContext);
         if (!authCheck) return null;
     }
 
     if (!authToken) {
-        logInfo('Получение токена авторизации...');
+        logInfo('Getting auth token...');
         authToken = await extractAuthToken(browserContext);
     }
 
@@ -346,40 +408,51 @@ function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMe
 
     const isVideo = chatType === 't2v';
 
+    // Mirror the shape of a real Qwen UI request. The web API rejects older
+    // hand-built payloads with Internal_Server_Error when these fields are
+    // missing (notably version / chatId / parentId).
     const featureConfig = {
-        thinking_enabled: isVideo,
-        output_schema: 'phase'
+        thinking_enabled: true,
+        output_schema: 'phase',
+        research_mode: 'normal',
+        auto_thinking: true,
+        thinking_mode: 'Auto',
+        thinking_format: 'summary',
+        auto_search: true
     };
     if (isVideo) {
-        featureConfig.research_mode = 'normal';
-        featureConfig.auto_thinking = true;
-        featureConfig.thinking_format = 'summary';
         featureConfig.auto_search = true;
     }
 
     const newMessage = {
+        id: null,
         fid: userMessageId,
         parentId, parent_id: parentId,
+        childrenIds: [assistantChildId],
         role: 'user',
         content: messageContent,
-        chat_type: chatType, sub_chat_type: chatType,
-        timestamp: Math.floor(Date.now() / 1000),
         user_action: 'chat',
-        models: [model],
         files: files || [],
-        childrenIds: [assistantChildId],
+        timestamp: Math.floor(Date.now() / 1000),
+        models: [model],
+        model: '',
+        chat_type: chatType,
+        feature_config: featureConfig,
         extra: { meta: { subChatType: chatType } },
-        feature_config: featureConfig
+        sub_chat_type: chatType
     };
 
     const payload = {
         stream: !isVideo,
+        version: '2.1',
         incremental_output: true,
+        chatId,
+        parentId: parentId || '',
         chat_id: chatId,
         chat_mode: 'normal',
-        messages: [newMessage],
         model,
         parent_id: parentId,
+        messages: [newMessage],
         timestamp: Math.floor(Date.now() / 1000)
     };
 
@@ -430,7 +503,7 @@ function parseNonSseCompletionBody(body) {
 
 async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk) {
     try {
-        if (!token) return { success: false, error: 'Токен авторизации не найден' };
+        if (!token) return { success: false, error: 'Auth token not found' };
         if (typeof fetch !== 'function') return { success: false, error: 'Fetch API is unavailable' };
 
         const response = await fetch(apiUrl, {
@@ -567,13 +640,19 @@ function loadBaxiaHeaders() {
         const raw = JSON.parse(fs.readFileSync(BAXIA_HEADERS_FILE, 'utf8'));
         const src = raw.headers || raw.extraHeaders || raw;
         const out = {};
+        const seen = new Set();
         for (const [k, v] of Object.entries(src)) {
-            if (/^(cookie|content-length|host|authorization|accept-encoding|connection)$/i.test(k)) continue;
+            if (/^(cookie|content-length|host|authorization|accept-encoding|connection|x-request-id)$/i.test(k)) continue;
+            // Headers normalizes casing: sending both "Version" and "version"
+            // produces one comma-joined value, which Qwen rejects.
+            const norm = k.toLowerCase();
+            if (seen.has(norm)) continue;
+            seen.add(norm);
             out[k] = String(v);
         }
         return Object.keys(out).length ? out : null;
     } catch (e) {
-        logWarn(`Не удалось прочитать ${BAXIA_HEADERS_FILE}: ${e.message}`);
+        logWarn(`Failed to read ${BAXIA_HEADERS_FILE}: ${e.message}`);
         return null;
     }
 }
@@ -582,22 +661,20 @@ function loadBaxiaHeaders() {
 // freshest token straight from the tab before each request.
 async function syncTokenFromPage(page, tokenObj = null) {
     try {
-        const fresh = await page.evaluate(() => localStorage.getItem('token'));
+        const fresh = await readTokenFromQwenTab(getBrowserContext())
+            || await page.evaluate(() => localStorage.getItem('token'));
         if (!fresh || fresh === authToken) return;
         authToken = fresh;
         saveAuthToken(fresh);
-        if (tokenObj?.id) {
-            const { markValid } = await import('./tokenManager.js');
-            markValid(tokenObj.id, fresh);
-        }
-        logInfo('Токен обновлён из браузера');
+        if (tokenObj?.id) markValid(tokenObj.id, fresh);
+        logInfo('Token updated from browser');
     } catch (e) {
-        logWarn(`Не удалось обновить токен из браузера: ${e.message}`);
+        logWarn(`Failed to update token from browser: ${e.message}`);
     }
 }
 
-// Удаляет чат из истории Qwen. Используется для одноразовых чатов,
-// созданных под запросы без conversation_id (OpenCode и т.п.).
+// Deletes a chat from Qwen history. Used for one-shot chats
+// created for requests without conversation_id (OpenCode etc.).
 export async function deleteChatV2(chatId) {
     if (!chatId) return false;
 
@@ -633,13 +710,13 @@ export async function deleteChatV2(chatId) {
         }, { id: chatId, token: authToken, extraHeaders: headers });
 
         if (result.ok) {
-            logInfo(`Чат ${chatId} удалён из истории Qwen`);
+            logInfo(`Chat ${chatId} deleted from Qwen history`);
             return true;
         }
-        logWarn(`Не удалось удалить чат ${chatId}: ${result.status || result.error}`);
+        logWarn(`Failed to delete chat ${chatId}: ${result.status || result.error}`);
         return false;
     } catch (e) {
-        logWarn(`Не удалось удалить чат ${chatId}: ${e.message}`);
+        logWarn(`Failed to delete chat ${chatId}: ${e.message}`);
         return false;
     } finally {
         if (page) pagePool.releasePage(page);
@@ -649,13 +726,13 @@ export async function deleteChatV2(chatId) {
 async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
     const baxiaHeaders = loadBaxiaHeaders();
     if (baxiaHeaders && payload?.stream !== false && typeof onChunk === 'function') {
-        logInfo('Baxia-заголовки найдены: запрос пойдёт через браузер (node-streaming пропущен)');
+        logInfo('Baxia headers found: request will go through browser (node-streaming skipped)');
     }
     if (!baxiaHeaders && payload?.stream !== false && typeof onChunk === 'function') {
         const streamedResponse = await executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk);
 
         // Qwen's Aliyun WAF blocks the browserless node-streaming fetch and returns a
-        // non-SSE captcha page (errorBody = WAF html). Do NOT return that — fall through
+        // non-SSE captcha page (errorBody = WAF html). Do NOT return that - fall through
         // to the browser (page.evaluate) path, which carries the real session and is not
         // challenged. Without this, streaming requests surface the captcha as the answer.
         const wafBlockedNodeStream =
@@ -673,29 +750,33 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
             return streamedResponse;
         }
 
-        logWarn(`Node-streaming недоступен (${streamedResponse.error || 'unknown error'}), fallback к browser fetch.`);
+        logWarn(`Node-streaming unavailable (${streamedResponse.error || 'unknown error'}), falling back to browser fetch.`);
     }
 
     const requestBody = { apiUrl, payload, token, headers: baxiaHeaders || null };
 
-    logDebug(`Используем токен: ${token ? 'Токен существует' : 'Токен отсутствует'}`);
+    logDebug(`Using token: ${token ? 'Session token' : 'No token'}`);
     logDebug(`API URL: ${apiUrl}`);
 
     return page.evaluate(async (data) => {
         try {
             const t = data.token;
-            if (!t) return { success: false, error: 'Токен авторизации не найден' };
+            if (!t) return { success: false, error: 'Auth token not found' };
 
             const headers = {
                 'Content-Type': 'application/json',
                 'Authorization': `Bearer ${t}`,
-                'Accept': '*/*'
+                'Accept': 'application/json',
+                'X-Accel-Buffering': 'no'
             };
             if (data.headers) {
                 for (const [k, v] of Object.entries(data.headers)) headers[k] = v;
-                headers['X-Request-Id'] = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2));
                 headers['Authorization'] = `Bearer ${t}`;
             }
+            // The UI always sends exactly one request id. baxia headers no longer
+            // carry one (loadBaxiaHeaders strips it), so add a fresh single id
+            // here. Sending two made Qwen reject with Internal_Server_Error.
+            headers['X-Request-Id'] = crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(16).slice(2);
 
             const response = await fetch(data.apiUrl, {
                 method: 'POST',
@@ -727,7 +808,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
                             Boolean(topLevelCode) ||
                             Boolean(nestedCode);
 
-                        // API иногда возвращает JSON с success=false и code при HTTP 200.
+                        // API sometimes returns JSON with success=false and code at HTTP 200.
                         if (hasStructuredError) {
                             const isRateLimited = topLevelCode === 'RateLimited' || nestedCode === 'RateLimited';
                             return {
@@ -736,7 +817,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
                                 errorBody: body
                             };
                         }
-                        // Валидный JSON-ответ completion (иногда Qwen возвращает так)
+                        // Valid JSON completion response (sometimes Qwen returns this way)
                         if (parsed.choices || parsed.id || (parsed.success === true && parsed.data)) {
                             return { success: true, isTask: false, data: parsed };
                         }
@@ -780,9 +861,24 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
 
                             if (chunk['response.created']) responseId = chunk['response.created'].response_id;
                             if (chunk.choices && chunk.choices[0]) {
-                                const delta = chunk.choices[0].delta;
-                                if (delta && delta.content) fullContent += delta.content;
-                                if (delta && delta.status === 'finished') finished = true;
+                                const choice = chunk.choices[0];
+                                const delta = choice.delta || choice.message;
+                                // Qwen finishes the "thinking_summary" phase with
+                                // status:"finished" before it sends any "answer"
+                                // chunks. Stopping there yields an empty content.
+                                const phase = delta?.phase;
+                                const isThinking = phase === 'thinking_summary' || phase === 'thinking';
+                                const content = delta && (delta.content ?? delta.text ?? delta.output_text);
+                                if (!isThinking) {
+                                    if (typeof content === 'string') {
+                                        fullContent += content;
+                                    } else if (Array.isArray(content)) {
+                                        fullContent += content.map(part => typeof part === 'string' ? part : (part?.text ?? part?.content ?? '')).join('');
+                                    } else if (content && typeof content === 'object') {
+                                        fullContent += String(content.text ?? content.content ?? '');
+                                    }
+                                }
+                                if (choice.finish_reason) finished = true;
                             }
                             if (chunk.usage) usage = chunk.usage;
                         } catch { /* ignore parse errors for individual chunks */ }
@@ -818,21 +914,21 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
 
 async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null) {
     logRaw(JSON.stringify(response));
-    logError(`Ошибка при получении ответа: ${response.error || response.statusText}`);
-    if (response.errorBody) logDebug(`Тело ответа с ошибкой: ${response.errorBody}`);
+    logError(`Error getting response: ${response.error || response.statusText}`);
+    if (response.errorBody) logDebug(`Error response body: ${response.errorBody}`);
 
     if (response.html && response.html.includes('Verification')) {
         setAuthenticationStatus(false);
-        logInfo('Обнаружена необходимость верификации, перезапуск браузера в видимом режиме...');
+        logInfo('Verification required, restarting browser in visible mode...');
         await pagePool.clear();
         authToken = null;
         await shutdownBrowser();
         await initBrowser(true);
-        return { error: 'Требуется верификация. Браузер запущен в видимом режиме.', verification: true, chatId };
+        return { error: 'Verification required. Browser restarted in visible mode.', verification: true, chatId };
     }
 
     if (response.status === 401 || (response.errorBody && (response.errorBody.includes('Unauthorized') || response.errorBody.includes('Token has expired')))) {
-        logWarn(`Токен ${tokenObj?.id} недействителен (401). Удаляем и пробуем другой.`);
+        logWarn(`Token ${tokenObj?.id} is invalid (401). Removing and trying another.`);
         authToken = null;
         browserTokenRateLimited = false;
         if (tokenObj?.id && tokenObj.id !== 'browser') {
@@ -841,12 +937,12 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         }
         const { hasValidTokens } = await import('./tokenManager.js');
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-            // chatId/parentId сбрасываем: при смене аккаунта старый чат
-            // принадлежит прежнему токену и под новым «не существует».
+            // chatId/parentId are reset: when switching accounts the old chat
+            // belongs to the previous token and under the new one "does not exist".
             return sendMessage(message, model, null, null, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
         }
-        logError('Не осталось валидных токенов или исчерпаны попытки.');
-        return { error: 'Все токены недействительны (401). Требуется повторная авторизация.', chatId };
+        logError('No valid tokens left or retries exhausted.');
+        return { error: 'All tokens are invalid (401). Re-authentication required.', chatId };
     }
 
     if (response.status === 429 || (response.errorBody && response.errorBody.includes('RateLimited'))) {
@@ -858,44 +954,53 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
 
         if (tokenObj?.id === 'browser') {
             browserTokenRateLimited = true;
-            logWarn(`Browser-токен достиг лимита. Помечаем на ${hours}ч.`);
+            logWarn(`Browser token reached rate limit. Pausing for ${hours}h.`);
         } else if (tokenObj?.id) {
             markRateLimited(tokenObj.id, hours);
-            logWarn(`Токен ${tokenObj.id} достиг лимита. Помечаем на ${hours}ч и пробуем другой токен...`);
+            logWarn(`Token ${tokenObj.id} reached rate limit. Pausing for ${hours}h and trying another token...`);
         }
 
         authToken = null;
         const { hasValidTokens } = await import('./tokenManager.js');
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-            // chatId/parentId сбрасываем: при смене аккаунта старый чат
-            // принадлежит прежнему токену и под новым «не существует».
+            // chatId/parentId are reset: when switching accounts the old chat
+            // belongs to the previous token and under the new one "does not exist".
             return sendMessage(message, model, null, null, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
         }
-        return { error: `Все токены заблокированы по лимиту (${hours}ч)`, chatId };
+        return { error: `All tokens are rate limited (${hours}h)`, chatId };
     }
 
-    return { error: response.error || response.statusText, details: response.errorBody || 'Нет дополнительных деталей', chatId };
+    let errorMessage = response.error || response.statusText;
+    if (!errorMessage && response.errorBody) {
+        try {
+            const parsed = JSON.parse(response.errorBody);
+            errorMessage = parsed?.data?.code || parsed?.code || parsed?.message || 'Qwen API error';
+        } catch {
+            errorMessage = String(response.errorBody).slice(0, 200);
+        }
+    }
+    return { error: errorMessage || 'Request failed', details: response.errorBody || 'No additional details', chatId };
 }
 
-// ─── Main public API ─────────────────────────────────────────────────────────
+// --- Main public API -------------------------------------------------------
 
 export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null) {
     if (!availableModels) availableModels = getAvailableModelsFromFile();
 
     const browserContext = getBrowserContext();
-    if (!browserContext) return { error: 'Браузер не инициализирован', chatId };
+    if (!browserContext) return { error: 'Browser is not initialized', chatId };
 
-    // Резолвим аккаунт ОДИН раз: одним и тем же токеном создаём чат и
-    // отправляем сообщение — иначе round-robin разнесёт их по разным
-    // аккаунтам и Qwen вернёт «chat is not exist».
+    // Resolve account ONCE: with the same token create the chat and
+    // send the message - otherwise round-robin picks different
+    // accounts and Qwen returns "chat is not exist".
     const tokenObj = await resolveAuthToken(browserContext);
-    if (!tokenObj) return { error: 'Ошибка авторизации: не удалось получить токен', chatId };
+    if (!tokenObj) return { error: 'Auth error: failed to get token', chatId };
 
     if (!chatId) {
-        const newChatResult = await createChatV2(model, 'Новый чат', 0, chatType, tokenObj);
-        if (newChatResult.error) return { error: 'Не удалось создать чат: ' + newChatResult.error };
+        const newChatResult = await createChatV2(model, 'New chat', 0, chatType, tokenObj);
+        if (newChatResult.error) return { error: 'Failed to create chat: ' + newChatResult.error };
         chatId = newChatResult.chatId;
-        logInfo(`Создан новый чат v2 с ID: ${chatId}`);
+        logInfo(`Created new chat v2 with ID: ${chatId}`);
     }
 
     const validated = validateAndPrepareMessage(message);
@@ -908,13 +1013,13 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     if (!model || model.trim() === '') {
         model = DEFAULT_MODEL;
     } else if (!isValidModel(model)) {
-        logWarn(`Модель "${model}" не найдена в списке доступных. Используется модель по умолчанию.`);
+        logWarn(`Model "${model}" not found in available list. Using default model.`);
         model = DEFAULT_MODEL;
     }
-    logInfo(`Используемая модель: "${model}"`);
+    logInfo(`Using model: "${model}"`);
     if (chatType !== 't2t') {
-        const typeLabels = { t2i: 'изображение', t2v: 'видео' };
-        logInfo(`Тип генерации: ${chatType} (${typeLabels[chatType] || chatType})${size ? `, размер: ${size}` : ''}`);
+        const typeLabels = { t2i: 'image', t2v: 'video' };
+        logInfo(`Generation type: ${chatType} (${typeLabels[chatType] || chatType})${size ? `, size: ${size}` : ''}`);
     }
 
     let page = null;
@@ -928,37 +1033,37 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         }
 
         if (!authToken) {
-            logWarn('Токен отсутствует перед отправкой запроса');
+            logWarn('Token missing before sending request');
             authToken = await page.evaluate(() => localStorage.getItem('token'));
-            if (!authToken) return { error: 'Токен авторизации не найден. Требуется перезапуск в ручном режиме.', chatId };
+            if (!authToken) return { error: 'Auth token not found. Restart in visible mode required.', chatId };
             saveAuthToken(authToken);
         }
 
-        logInfo('Отправка запроса к API v2...');
+        logInfo('Sending request to API v2...');
 
         const payload = buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType, size);
         logDebug('=== PAYLOAD V2 ===\n' + JSON.stringify(payload, null, 2));
-        logDebug(`Отправка сообщения в чат ${chatId} с parent_id: ${parentId || 'null'}`);
+        logDebug(`Sending message to chat ${chatId} with parent_id: ${parentId || 'null'}`);
 
         const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
         const response = await executeApiRequest(page, apiUrl, payload, authToken, onChunk);
 
         if (response.success && response.isTask) {
-            logInfo('Обнаружен ответ с задачей (видеогенерация)');
+            logInfo('Response with task detected (video generation)');
             logRaw(JSON.stringify(response.data));
 
             const taskId = extractTaskId(response.data);
             if (!taskId) {
-                logError('Task ID не найден в ответе');
+                logError('Task ID not found in response');
                 pagePool.releasePage(page);
                 page = null;
-                return { error: 'Task ID не найден в ответе', chatId, rawResponse: response.data };
+                return { error: 'Task ID not found in response', chatId, rawResponse: response.data };
             }
 
             logInfo(`Task ID: ${taskId}`);
 
             if (!waitForCompletion) {
-                logInfo('Возвращаем task_id для клиентского polling');
+                logInfo('Returning task_id for client-side polling');
                 pagePool.releasePage(page);
                 page = null;
                 return {
@@ -970,18 +1075,18 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
                     chatId,
                     parentId: response.data.data?.parent_id || taskId,
                     status: 'processing',
-                    message: 'Задача генерации видео создана. Для прогресса используйте GET /api/tasks/status/:taskId.'
+                    message: 'Video generation task created. Use GET /api/tasks/status/:taskId for progress.'
                 };
             }
 
-            logInfo('Начинаем polling для получения видео...');
+            logInfo('Starting polling to get video...');
             const taskResult = await pollTaskStatus(taskId, page, authToken);
 
             pagePool.releasePage(page);
             page = null;
 
             if (taskResult.success && taskResult.status === 'completed') {
-                logInfo('Видео успешно сгенерировано');
+                logInfo('Video successfully generated');
                 const videoUrl = extractVideoUrl(taskResult.data);
                 return {
                     id: taskId,
@@ -1002,45 +1107,45 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
                 };
             }
 
-            logError(`Не удалось получить видео: ${taskResult.error}`);
+            logError(`Failed to get video: ${taskResult.error}`);
             return { error: taskResult.error || 'Video generation failed', status: taskResult.status, chatId, task_id: taskId };
         }
 
         pagePool.releasePage(page);
         page = null;
 
-        // Qwen может ответить HTTP 200 с телом {success:false, data:{code,details}}
-        // (например, "Model not found") или WAF-заглушкой {ret:["FAIL_..."]}.
+        // Qwen may respond HTTP 200 with body {success:false, data:{code,details}}
+        // (e.g. "Model not found") or WAF header {ret:["FAIL_..."]}.
         if (response.success && response.data) {
             const apiData = response.data;
             const wafBlocked = Array.isArray(apiData.ret) && typeof apiData.ret[0] === 'string' && apiData.ret[0].startsWith('FAIL_');
             if (apiData.success === false || wafBlocked) {
                 const apiError = apiData.data || {};
                 const errorMessage = apiError.details || apiError.code
-                    || (wafBlocked ? `WAF: ${apiData.ret[0]}` : 'Qwen API вернул ошибку');
-                logError(`Ошибка Qwen API: ${errorMessage}`);
+                    || (wafBlocked ? `WAF: ${apiData.ret[0]}` : 'Qwen API returned error');
+                logError(`Qwen API error: ${errorMessage}`);
                 return { error: errorMessage, details: JSON.stringify(apiError || apiData).slice(0, 500), chatId };
             }
         }
 
         if (response.success) {
             logRaw(JSON.stringify(response.data));
-            logInfo('Ответ получен успешно');
+            logInfo('Response received successfully');
             response.data.chatId = chatId;
             response.data.parentId = response.data.response_id;
             response.data.id = response.data.id || 'chatcmpl-' + Date.now();
-            
-            // Fallback: если поток чанков не был отдан, отправляем контент единым куском.
+
+            // Fallback: if streaming callback was not invoked, send content as single chunk.
             if (typeof onChunk === 'function' && response.data.choices?.[0]?.message?.content && !response.hasStreamedChunks) {
                 onChunk(response.data.choices[0].message.content);
             }
-            
+
             return response.data;
         }
 
         return handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk);
     } catch (error) {
-        logError('Ошибка при отправке сообщения', error);
+        logError('Error sending message', error);
         return { error: error.toString(), chatId };
     } finally {
         if (page) {
@@ -1049,7 +1154,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     }
 }
 
-// ─── Task response helpers ───────────────────────────────────────────────────
+// --- Task response helpers -------------------------------------------------
 
 function extractTaskId(data) {
     const firstMsg = data.data?.messages?.[0];
@@ -1101,10 +1206,10 @@ function extractVideoUrl(taskData) {
 
 export async function pollQwenTaskStatus(taskId, waitForCompletion = false) {
     const browserContext = getBrowserContext();
-    if (!browserContext) return { error: 'Браузер не инициализирован', task_id: taskId };
+    if (!browserContext) return { error: 'Browser is not initialized', task_id: taskId };
 
     const tokenObj = await resolveAuthToken(browserContext);
-    if (!tokenObj?.token) return { error: 'Ошибка авторизации: не удалось получить токен', task_id: taskId };
+    if (!tokenObj?.token) return { error: 'Auth error: failed to get token', task_id: taskId };
 
     let page = null;
     try {
@@ -1137,25 +1242,25 @@ export function getAuthToken() {
     return authToken;
 }
 
-// ─── createChatV2 ────────────────────────────────────────────────────────────
+// --- createChatV2 ----------------------------------------------------------
 
-export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый чат', retryCount = 0, chatType = 't2t', tokenObj = null) {
+export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', retryCount = 0, chatType = 't2t', tokenObj = null) {
     const browserContext = getBrowserContext();
-    if (!browserContext) return { error: 'Браузер не инициализирован' };
+    if (!browserContext) return { error: 'Browser is not initialized' };
 
-    // tokenObj может прийти от sendMessage — тогда создание чата и отправка
-    // идут под ОДНИМ аккаунтом (иначе round-robin создаст чат на одном
-    // аккаунте, а сообщение уйдёт под другим → «chat is not exist»).
+    // tokenObj may come from sendMessage - then chat creation and sending
+    // go under the SAME account (otherwise round-robin creates chat on one
+    // account, and message is sent under another - "chat is not exist").
     if (!tokenObj) tokenObj = await getAvailableToken();
     if (tokenObj?.token) {
         authToken = tokenObj.token;
-        logInfo(`Используется аккаунт для создания чата: ${tokenObj.id}`);
+        logInfo(`Using account for chat creation: ${tokenObj.id}`);
     }
 
     if (!authToken) {
-        logInfo('Получение токена авторизации для создания чата...');
+        logInfo('Getting auth token for chat creation...');
         authToken = await extractAuthToken(browserContext);
-        if (!authToken) return { error: 'Не удалось получить токен авторизации' };
+        if (!authToken) return { error: 'Failed to get auth token' };
     }
 
     let page = null;
@@ -1190,24 +1295,24 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
         page = null;
 
         if (result.success && result.data.success) {
-            logInfo(`Чат создан: ${result.data.data.id}`);
+            logInfo(`Chat created: ${result.data.data.id}`);
             return { success: true, chatId: result.data.data.id, requestId: result.data.request_id };
         }
 
         const isTransient = result.status >= 500 && result.status < 600;
         if (isTransient && retryCount < MAX_RETRY_COUNT) {
-            logWarn(`Создание чата: ${result.status}, ретрай ${retryCount + 1}/${MAX_RETRY_COUNT} через ${RETRY_DELAY}мс...`);
+            logWarn(`Chat creation: ${result.status}, retry ${retryCount + 1}/${MAX_RETRY_COUNT} after ${RETRY_DELAY}ms...`);
             await delay(RETRY_DELAY);
             return createChatV2(model, title, retryCount + 1, chatType, tokenObj);
         }
 
         const cleanError = isTransient
-            ? `Qwen API недоступен (${result.status}). Повторите позже.`
-            : (result.errorBody || result.error || 'Неизвестная ошибка');
-        logError(`Ошибка при создании чата: ${result.status || 'unknown'} (попытка ${retryCount + 1})`);
+            ? `Qwen API unavailable (${result.status}). Please try again later.`
+            : (result.errorBody || result.error || 'Unknown error');
+        logError(`Error creating chat: ${result.status || 'unknown'} (attempt ${retryCount + 1})`);
         return { error: cleanError };
     } catch (error) {
-        logError('Ошибка при создании чата', error);
+        logError('Error creating chat', error);
         return { error: error.toString() };
     } finally {
         if (page) {
@@ -1216,7 +1321,7 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'Новый ч
     }
 }
 
-// ─── testToken ───────────────────────────────────────────────────────────────
+// --- testToken -------------------------------------------------------------
 
 export async function testToken(token) {
     const browserContext = getBrowserContext();

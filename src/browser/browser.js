@@ -25,14 +25,14 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
 
     const cdpUrl = (process.env.QWEN_CDP_URL || '').trim();
     logInfo(cdpUrl
-        ? `Инициализация браузера: подключение к Chrome по CDP (${cdpUrl})...`
-        : 'Инициализация браузера с Puppeteer Stealth...');
+        ? `Browser initialization: connecting to Chrome via CDP (${cdpUrl})...`
+        : 'Browser initialization with Puppeteer Stealth...');
     try {
         if (cdpUrl) {
             // Attach to YOUR already-running, logged-in Chrome (launch it with
             // --remote-debugging-port=PORT --user-data-dir=<dir>). Reuses a
             // human-trusted session, so qwen serves no captcha and the headless
-            // CDP evaluate no longer hangs — no empty-browser login required.
+            // CDP evaluate no longer hangs - no empty-browser login required.
             browserInstance = await puppeteer.connect({
                 browserURL: cdpUrl,
                 defaultViewport: { width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT }
@@ -115,18 +115,18 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
         });
 
         browserContext = page;
-        logInfo('Браузер инициализирован с максимальной защитой от обнаружения');
+        logInfo('Browser initialized with maximum anti-detection');
 
-        // CDP-connected Chrome is already a real, logged-in session — skip the
+        // CDP-connected Chrome is already a real, logged-in session - skip the
         // interactive empty-browser login/captcha flow.
         if (visibleMode && !cdpUrl) {
             await startManualAuthenticationPuppeteer(page, skipManualRestart);
         }
-        // loadSessionPuppeteer removed — was dead code (always returned false)
+        // loadSessionPuppeteer removed - was dead code (always returned false)
 
         return true;
     } catch (error) {
-        logError('Ошибка при инициализации браузера', error);
+        logError('Error initializing browser', error);
         return false;
     }
 }
@@ -142,31 +142,31 @@ async function saveSessionPuppeteer(page) {
         if (!fs.existsSync(accountDir)) fs.mkdirSync(accountDir, { recursive: true });
 
         fs.writeFileSync(path.join(accountDir, 'cookies.json'), JSON.stringify(cookies, null, 2));
-        logInfo(`Cookies сохранены для аккаунта ${accountId}`);
+        logInfo(`Cookies saved for account ${accountId}`);
         return accountId;
     } catch (error) {
-        logError('Ошибка при сохранении сессии', error);
+        logError('Error saving session', error);
         return null;
     }
 }
 
 async function startManualAuthenticationPuppeteer(page, skipManualRestart) {
     try {
-        logInfo('Открытие страницы для ручной авторизации...');
+        logInfo('Opening page for manual authentication...');
         await page.goto(CHAT_PAGE_URL, { waitUntil: 'networkidle2', timeout: NAVIGATION_TIMEOUT });
         await delay(5000);
 
         console.log('------------------------------------------------------');
-        console.log('               НЕОБХОДИМА АВТОРИЗАЦИЯ');
+        console.log('               MANUAL AUTHENTICATION REQUIRED');
         console.log('------------------------------------------------------');
-        console.log('Пожалуйста, выполните следующие действия:');
-        console.log('1. Войдите в систему в открытом браузере');
-        console.log('2. ВАЖНО: Двигайте мышью естественно, не спешите');
-        console.log('3. Если появится слайдер капчи - решите её медленно');
-        console.log('4. Дождитесь полной загрузки главной страницы');
-        console.log('5. После успешной авторизации нажмите ENTER в консоли');
+        console.log('Please perform the following steps:');
+        console.log('1. Log in to the system in the opened browser');
+        console.log('2. IMPORTANT: Move your mouse naturally, do not rush');
+        console.log('3. If a captcha slider appears - solve it slowly');
+        console.log('4. Wait for the main page to fully load');
+        console.log('5. After successful authentication, press ENTER in the console');
         console.log('------------------------------------------------------');
-        console.log('После успешной авторизации нажмите ENTER для продолжения...');
+        console.log('After successful authentication, press ENTER to continue...');
 
         await new Promise((resolve) => {
             if (process.stdin.isTTY) process.stdin.setRawMode(false);
@@ -176,7 +176,7 @@ async function startManualAuthenticationPuppeteer(page, skipManualRestart) {
                 if (key === '\n' || key === '\r' || key.charCodeAt(0) === 13) {
                     process.stdin.pause();
                     process.stdin.removeListener('data', onData);
-                    logInfo('Получено подтверждение, продолжаем...');
+                    logInfo('Confirmation received, continuing...');
                     resolve();
                 }
             };
@@ -184,7 +184,7 @@ async function startManualAuthenticationPuppeteer(page, skipManualRestart) {
         });
 
         const cookies = await page.cookies();
-        logInfo(`Сохранено ${cookies.length} cookies`);
+        logInfo(`Saved ${cookies.length} cookies`);
 
         const token = await page.evaluate(() =>
             localStorage.getItem('token') || localStorage.getItem('auth_token') ||
@@ -193,71 +193,71 @@ async function startManualAuthenticationPuppeteer(page, skipManualRestart) {
         );
 
         if (token) {
-            logInfo('Токен найден и будет сохранен');
+            logInfo('Token found and will be saved');
             saveAuthToken(token);
         } else {
-            logWarn('Токен не найден в localStorage/sessionStorage');
-            logInfo('Попытка извлечь токен из cookies...');
+            logWarn('Token not found in localStorage/sessionStorage');
+            logInfo('Trying to extract token from cookies...');
             const tokenCookie = cookies.find(c => c.name.toLowerCase().includes('token') || c.name.toLowerCase().includes('auth'));
             if (tokenCookie) {
-                logInfo(`Токен найден в cookie: ${tokenCookie.name}`);
+                logInfo(`Token found in cookie: ${tokenCookie.name}`);
                 saveAuthToken(tokenCookie.value);
             }
         }
 
         const accountId = await saveSessionPuppeteer(page);
-        if (accountId) logInfo(`Сессия сохранена с ID: ${accountId}`);
+        if (accountId) logInfo(`Session saved with ID: ${accountId}`);
 
         setAuthenticationStatus(true);
-        logInfo('Авторизация завершена успешно');
+        logInfo('Authentication completed successfully');
 
         if (!skipManualRestart) await restartBrowserInHeadlessMode();
     } catch (error) {
-        logError('Ошибка при ручной авторизации', error);
+        logError('Error during manual authentication', error);
         throw error;
     }
 }
 
 export async function restartBrowserInHeadlessMode() {
-    logInfo('Перезапуск браузера в фоновом режиме...');
+    logInfo('Restarting browser in headless mode...');
     const token = getAuthToken();
-    if (token) { logDebug('Сохранение токена...'); saveAuthToken(token); await delay(1000); }
+    if (token) { logDebug('Saving token...'); saveAuthToken(token); await delay(1000); }
     await shutdownBrowser();
     await delay(RETRY_DELAY);
     const success = await initBrowser(false);
-    logInfo(success ? 'Браузер перезапущен в фоновом режиме' : 'Ошибка при перезапуске браузера');
+    logInfo(success ? 'Browser restarted in headless mode' : 'Error restarting browser');
 }
 
 export async function shutdownBrowser() {
     try {
-        try { await clearPagePool(); } catch (e) { logError('Ошибка при очистке пула страниц', e); }
+        try { await clearPagePool(); } catch (e) { logError('Error clearing page pool', e); }
 
         const cdpUrl = (process.env.QWEN_CDP_URL || '').trim();
         if (browserInstance && cdpUrl) {
-            // В CDP-режиме browser.close() завершил бы сам Chrome пользователя —
-            // только отключаемся.
-            try { browserInstance.disconnect(); } catch (e) { logError('Ошибка при отключении от Chrome', e); }
+            // In CDP mode browser.close() would shut down the user's Chrome -
+            // so we only disconnect.
+            try { browserInstance.disconnect(); } catch (e) { logError('Error disconnecting from Chrome', e); }
         } else if (browserInstance) {
             try {
                 const pages = await browserInstance.pages();
                 for (const page of pages) await page.close().catch(() => {});
                 await browserInstance.close();
-            } catch (e) { logError('Ошибка при закрытии браузера', e); }
+            } catch (e) { logError('Error closing browser', e); }
         }
         browserContext = null;
         browserInstance = null;
-        logInfo('Браузер закрыт');
+        logInfo('Browser closed');
     } catch (error) {
-        logError('Ошибка при завершении работы браузера', error);
+        logError('Error during browser shutdown', error);
     }
 }
 
-// Проверяет, живо ли CDP-соединение с Chrome, и при необходимости
-// переподключается (например, после падения/перезапуска браузера).
+// Checks whether the CDP connection to Chrome is alive, and reconnects
+// if needed (e.g. after a crash / browser restart).
 export async function ensureBrowserConnection() {
     if (browserInstance && browserInstance.isConnected()) return true;
 
-    logWarn('Соединение с Chrome потеряно, переподключаемся...');
+    logWarn('Connection to Chrome lost, reconnecting...');
     try { browserInstance?.disconnect?.(); } catch { /* already gone */ }
     browserInstance = null;
     browserContext = null;

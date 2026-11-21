@@ -34,14 +34,16 @@ function filterHeaders(headers) {
     return out;
 }
 
-function save(headers, url) {
+function save(headers, url, postData) {
     if (!headers['bx-ua'] && !headers['bx-umidtoken']) return false;
 
     fs.mkdirSync(path.dirname(OUT), { recursive: true });
     fs.writeFileSync(OUT, JSON.stringify({
         capturedAt: new Date().toISOString(),
         url,
-        headers
+        headers,
+        // Kept for payload comparison only; loadBaxiaHeaders() reads .headers.
+        postData: postData || null
     }, null, 2));
     return true;
 }
@@ -61,21 +63,14 @@ await cdp.send('Network.enable');
 
 const pending = new Map();
 
-cdp.on('Network.requestWillBeSent', event => {
-    if (!TARGET.test(event.request.url)) return;
-    pending.set(event.requestId, {
-        url: event.request.url,
-        headers: event.request.headers
-    });
-    console.log('Поймал completions-запрос, жду заголовки...');
-});
+// CDP does not guarantee event order: requestWillBeSentExtraInfo often arrives
+// before requestWillBeSent. Keep both halves and save once we have them.
+function trySave(requestId) {
+    const entry = pending.get(requestId);
+    if (!entry || !entry.url || !entry.extra) return;
 
-cdp.on('Network.requestWillBeSentExtraInfo', event => {
-    const request = pending.get(event.requestId);
-    if (!request) return;
-
-    const headers = filterHeaders({ ...request.headers, ...event.headers });
-    if (!save(headers, request.url)) {
+    const headers = filterHeaders({ ...entry.headers, ...entry.extra });
+    if (!save(headers, entry.url, entry.postData)) {
         console.log('В запросе нет bx-ua/bx-umidtoken — похоже, WAF пропустил его без проверки.');
         return;
     }
@@ -83,6 +78,24 @@ cdp.on('Network.requestWillBeSentExtraInfo', event => {
     console.log(`Сохранено в ${OUT}`);
     console.log('Заголовки:', Object.keys(headers).sort().join(', '));
     process.exit(0);
+}
+
+cdp.on('Network.requestWillBeSent', event => {
+    if (!TARGET.test(event.request.url)) return;
+    const entry = pending.get(event.requestId) || {};
+    entry.url = event.request.url;
+    entry.headers = event.request.headers;
+    entry.postData = event.request.postData;
+    pending.set(event.requestId, entry);
+    console.log('Поймал completions-запрос, жду заголовки...');
+    trySave(event.requestId);
+});
+
+cdp.on('Network.requestWillBeSentExtraInfo', event => {
+    const entry = pending.get(event.requestId) || {};
+    entry.extra = event.headers;
+    pending.set(event.requestId, entry);
+    trySave(event.requestId);
 });
 
 console.log(`Слушаю сеть вкладки: ${page.url()}`);

@@ -1,3 +1,4 @@
+import './src/env.js';
 import express from 'express';
 import bodyParser from 'body-parser';
 import path from 'path';
@@ -20,7 +21,7 @@ const port = Number.parseInt(process.env.PORT ?? PORT, 10);
 const host = process.env.HOST || HOST;
 
 if (Number.isNaN(port) || port <= 0 || port > 65535) {
-    throw new Error(`Некорректное значение переменной PORT: ${process.env.PORT}`);
+    throw new Error(`Invalid PORT value: ${process.env.PORT}`);
 }
 
 function toBoolean(value) {
@@ -33,16 +34,16 @@ const skipAccountMenu = toBoolean(process.env.SKIP_ACCOUNT_MENU) || toBoolean(pr
 function ensureNonInteractiveTokens() {
     const tokens = loadTokens();
     if (!tokens.length) {
-        logError('Не найдено ни одного аккаунта. Запустите скрипт авторизации перед запуском сервера.');
+        logError('No accounts found. Run the auth script before starting the server.');
         process.exit(1);
     }
     const now = Date.now();
     const validTokens = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid);
     if (!validTokens.length) {
-        logError('Все аккаунты недоступны. Перезапустите авторизацию перед запуском сервера.');
+        logError('All accounts are unavailable. Please re-run auth before starting the server.');
         process.exit(1);
     }
-    logInfo(`Автоматический запуск: обнаружено ${tokens.length} аккаунтов, из них ${validTokens.length} активны.`);
+    logInfo(`Auto-start: detected ${tokens.length} accounts, ${validTokens.length} active.`);
 }
 
 app.use(logHttpRequest);
@@ -53,10 +54,10 @@ app.use((err, req, res, next) => {
     const isJsonSyntaxError = err instanceof SyntaxError && err.status === 400 && Object.prototype.hasOwnProperty.call(err, 'body');
 
     if (isJsonSyntaxError) {
-        logWarn(`Некорректный JSON в запросе: ${err.message}`);
+        logWarn(`Invalid JSON in request: ${err.message}`);
         return res.status(400).json({
-            error: 'Некорректный JSON',
-            message: 'Проверьте тело запроса: используйте валидный JSON с двойными кавычками.'
+            error: 'Invalid JSON',
+            message: 'Check the request body: use valid JSON with double quotes.'
         });
     }
 
@@ -79,26 +80,26 @@ app.use('/api', apiRoutes);
 
 app.use((req, res) => {
     logWarn(`404 Not Found: ${req.method} ${req.originalUrl}`);
-    res.status(404).json({ error: 'Эндпоинт не найден' });
+    res.status(404).json({ error: 'Endpoint not found' });
 });
 
 app.use((err, req, res, next) => {
-    logError('Внутренняя ошибка сервера', err);
-    res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+    logError('Internal server error', err);
+    res.status(500).json({ error: 'Internal server error' });
 });
 
 process.on('SIGINT', handleShutdown);
 process.on('SIGTERM', handleShutdown);
 process.on('SIGHUP', handleShutdown);
 process.on('uncaughtException', async (error) => {
-    logError('Необработанное исключение', error);
+    logError('Unhandled exception', error);
     await handleShutdown();
 });
 
 async function handleShutdown() {
-    logInfo('\nПолучен сигнал завершения. Закрываем браузер...');
+    logInfo('\nShutdown signal received. Closing browser...');
     await shutdownBrowser();
-    logInfo('Завершение работы.');
+    logInfo('Shutting down.');
     process.exit(0);
 }
 
@@ -110,36 +111,36 @@ async function startServer() {
 ██      ██   ██ ██      ██      ██ ▄▄ ██ ██ ███ ██ ██      ██  ██ ██ ██   ██ ██      ██ 
 ██      ██   ██ ███████ ███████  ██████   ███ ███  ███████ ██   ████ ██   ██ ██      ██ 
                                     ▀▀                                                    
-   API-прокси для Qwen
+   Qwen API Proxy
    ${FORGETMEAI_WATERMARK}
 `);
 
-    logInfo('Запуск сервера...');
+    logInfo('Starting server...');
 
     if (!skipAccountMenu) {
         while (true) {
             const tokens = loadTokens();
-            console.log('\nСписок аккаунтов:');
+            console.log('\nAccount list:');
             if (!tokens.length) {
-                console.log('  (пусто)');
+                console.log('  (empty)');
             } else {
                 tokens.forEach((token, i) => {
                     const now = Date.now();
                     const isInvalid = token.invalid === true;
                     const isWaiting = Boolean(token.resetAt && new Date(token.resetAt).getTime() > now);
-                    const statusLabel = isInvalid ? '❌ Недействителен' : isWaiting ? '⏳ Ожидание сброса' : '✅ OK';
+                    const statusLabel = isInvalid ? '❌ Invalid' : isWaiting ? '⏳ Waiting to reset' : '✅ OK';
                     const statusCode = isInvalid ? 0 : isWaiting ? 1 : 2;
                     console.log(`${String(i + 1).padStart(2, ' ')} | ${token.id} | ${statusLabel} (${statusCode})`);
                 });
             }
-            console.log('\n=== Меню ===');
+            console.log('\n=== Menu ===');
             console.log(`ForgetMeAI: ${FORGETMEAI_WATERMARK}`);
-            console.log('1 - Добавить новый аккаунт');
-            console.log('2 - Перелогинить аккаунт с истекшим токеном');
-            console.log('3 - Запустить прокси (по умолчанию)');
-            console.log('4 - Удалить аккаунт');
+            console.log('1 - Add new account');
+            console.log('2 - Relogin account with expired token');
+            console.log('3 - Start proxy (default)');
+            console.log('4 - Remove account');
 
-            let choice = await prompt('Ваш выбор (Enter = 3): ');
+            let choice = await prompt('Your choice (Enter = 3): ');
             if (!choice) choice = '3';
 
             if (choice === '1') {
@@ -154,7 +155,7 @@ async function startServer() {
                     return new Date(t.resetAt).getTime() <= Date.now();
                 });
                 if (!tokens.length || !hasValidToken) {
-                    console.log('Нужен хотя бы один валидный аккаунт для запуска.');
+                    console.log('At least one valid account is needed to start.');
                     continue;
                 }
                 break;
@@ -173,37 +174,37 @@ async function startServer() {
     const visibleMode = ['1', 'true', 'yes', 'on'].includes(String(process.env.QWEN_VISIBLE || '').toLowerCase());
     const browserInitialized = await initBrowser(visibleMode);
     if (!browserInitialized) {
-        logError('Не удалось инициализировать браузер. Завершение работы.');
+        logError('Failed to initialize browser. Shutting down.');
         process.exit(1);
     }
 
     try {
         app.listen(port, host, () => {
             const displayHost = host === '0.0.0.0' ? 'localhost' : host;
-            logInfo(`Сервер запущен на ${host}:${port}`);
-            logInfo(`API доступен по адресу: http://${displayHost}:${port}/api`);
-            logInfo('Для проверки статуса авторизации: GET /api/status');
-            logInfo('Для отправки сообщения: POST /api/chat');
-            logInfo('Для получения списка моделей: GET /api/models');
+            logInfo(`Server started on ${host}:${port}`);
+            logInfo(`API available at: http://${displayHost}:${port}/api`);
+            logInfo('To check auth status: GET /api/status');
+            logInfo('To send message: POST /api/chat');
+            logInfo('To get model list: GET /api/models');
             logInfo('======================================================');
-            logInfo('API v2 - История чатов хранится на серверах Qwen');
-            logInfo('Создать новый чат: POST /api/chats');
-            logInfo('Отправить сообщение: POST /api/chat (с chatId и parentId)');
+            logInfo('API v2 - Chat history is stored on Qwen servers');
+            logInfo('Create new chat: POST /api/chats');
+            logInfo('Send message: POST /api/chat (with chatId and parentId)');
             logInfo('======================================================');
-            logInfo('Доступно 25 моделей Qwen (через систему маппинга):');
-            logInfo('- Стандартные: qwen-max, qwen-plus, qwen-turbo и их latest-версии');
+            logInfo('Available Qwen models: 25 (via mapping system):');
+            logInfo('- Standard: qwen-max, qwen-plus, qwen-turbo and their latest versions');
             logInfo('- Coder: qwen3-coder-plus, qwen2.5-coder-*b-instruct (0.5b - 32b)');
-            logInfo('- Визуальные: qwen-vl-max, qwen-vl-plus и их latest-версии');
+            logInfo('- Visual: qwen-vl-max, qwen-vl-plus and their latest versions');
             logInfo('- Qwen 3: qwen3, qwen3-max, qwen3-plus, qwen3-omni-flash');
             logInfo('- Qwen 3.5: qwen3.5-plus, qwen3.5-flash, qwen3.5-397b-a17b, qwen3.5-122b-a10b, qwen3.5-27b, qwen3.5-35b-a3b');
             logInfo('======================================================');
-            logInfo('Формат JSON запроса на чат:');
-            logInfo('{ "message": "текст сообщения", "model": "название модели (опционально)", "chatId": "ID чата (опционально)", "parentId": "ID родительского сообщения (опционально)" }');
-            logInfo('Пример первого запроса: { "message": "Привет, как дела?" }');
-            logInfo('Пример второго запроса: { "message": "А что ты умеешь?", "chatId": "полученный_id_чата", "parentId": "полученный_parentId" }');
+            logInfo('Chat request JSON format:');
+            logInfo('{ "message": "message text", "model": "model name (optional)", "chatId": "chat ID (optional)", "parentId": "parent message ID (optional)" }');
+            logInfo('First request example: { "message": "Hello, how are you?" }');
+            logInfo('Second request example: { "message": "What do you know?", "chatId": "received_chat_id", "parentId": "received_parentId" }');
             logInfo('======================================================');
-            logInfo('Поддержка OpenAI совместимого API: POST /api/chat/completions');
-            logInfo('В ответе возвращаются chatId и parentId для продолжения диалога');
+            logInfo('OpenAI-compatible API support: POST /api/chat/completions');
+            logInfo('The response returns chatId and parentId to continue the dialogue');
             logInfo('======================================================');
 
             getApiKeys();
@@ -211,7 +212,7 @@ async function startServer() {
         });
     } catch (err) {
         if (err.code === 'EADDRINUSE') {
-            logError(`Порт ${port} уже используется. Возможно, сервер уже запущен.`);
+            logError(`Port ${port} is already in use. The server may already be running.`);
             await shutdownBrowser();
             process.exit(1);
         }
@@ -220,7 +221,7 @@ async function startServer() {
 }
 
 startServer().catch(async error => {
-    logError('Ошибка при запуске сервера', error);
+    logError('Error starting server', error);
     await shutdownBrowser();
     process.exit(1);
 });
