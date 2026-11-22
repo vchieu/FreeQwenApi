@@ -7,6 +7,10 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { logInfo, logError, logWarn, logDebug, logRaw } from '../logger/index.js';
+import {
+    applyFeatureConfigMode, modeForReasoningEffort, createThinkingAccumulator,
+    consumeThinkingDelta, reasoningFromCompletion
+} from './reasoning.js';
 import crypto from 'crypto';
 import {
     CHAT_API_URL, CREATE_CHAT_URL, CHAT_PAGE_URL, TASK_STATUS_URL,
@@ -430,7 +434,7 @@ async function resolveAuthToken(browserContext) {
     return authToken ? { id: 'browser', token: authToken } : null;
 }
 
-function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType = 't2t', size = null) {
+function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType = 't2t', size = null, reasoningMode = null) {
     const userMessageId = crypto.randomUUID();
     const assistantChildId = crypto.randomUUID();
 
@@ -451,6 +455,9 @@ function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMe
     if (isVideo) {
         featureConfig.auto_search = true;
     }
+    // reasoning_effort selects one of Qwen's real UI modes. No mode => the
+    // default Auto config above stays byte-for-byte unchanged.
+    applyFeatureConfigMode(featureConfig, reasoningMode);
 
     const newMessage = {
         id: null,
@@ -529,7 +536,7 @@ function parseNonSseCompletionBody(body) {
     return { success: false, error: 'Unexpected non-SSE 200 response', errorBody: body };
 }
 
-async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk) {
+async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk, onReasoning = null) {
     try {
         if (!token) return { success: false, error: 'Auth token not found' };
         if (typeof fetch !== 'function') return { success: false, error: 'Fetch API is unavailable' };
@@ -570,8 +577,10 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
         }
 
         const decoder = new TextDecoder();
+        const thinkingState = createThinkingAccumulator();
         let buffer = '';
         let fullContent = '';
+        let fullReasoning = '';
         let responseId = null;
         let usage = null;
         let finished = false;
@@ -615,15 +624,22 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
                     if (chunk.response_id) responseId = chunk.response_id;
 
                     if (chunk.choices && chunk.choices[0]) {
-                        const delta = chunk.choices[0].delta;
-                        if (delta && delta.content) {
-                            fullContent += delta.content;
+                        const delta = chunk.choices[0].delta || chunk.choices[0].message;
+                        const { reasoning, content } = consumeThinkingDelta(thinkingState, delta);
+                        if (content) {
+                            fullContent += content;
                             if (typeof onChunk === 'function') {
-                                onChunk(delta.content);
+                                onChunk(content);
                                 hasStreamedChunks = true;
                             }
                         }
-                        if (delta && delta.status === 'finished') finished = true;
+                        if (reasoning) {
+                            fullReasoning += reasoning;
+                            if (typeof onReasoning === 'function') onReasoning(reasoning);
+                        }
+                        // Qwen ends thinking_summary with status:"finished" before
+                        // it sends answer chunks; only a finished answer ends the stream.
+                        if (delta && delta.status === 'finished' && (!delta.phase || delta.phase === 'answer')) finished = true;
                         if (chunk.choices[0].finish_reason) finished = true;
                     }
 
@@ -647,7 +663,15 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
                 object: 'chat.completion',
                 created: Math.floor(Date.now() / 1000),
                 model: payload.model,
-                choices: [{ index: 0, message: { role: 'assistant', content: fullContent }, finish_reason: 'stop' }],
+                choices: [{
+                    index: 0,
+                    message: {
+                        role: 'assistant',
+                        content: fullContent,
+                        ...(fullReasoning ? { reasoning_content: fullReasoning } : {})
+                    },
+                    finish_reason: 'stop'
+                }],
                 usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
                 response_id: responseId
             }
@@ -752,13 +776,13 @@ export async function deleteChatV2(chatId) {
     }
 }
 
-async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
+async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, onReasoning = null) {
     const baxiaHeaders = loadBaxiaHeaders();
     if (baxiaHeaders && payload?.stream !== false && typeof onChunk === 'function') {
         logInfo('Baxia headers found: request will go through browser (node-streaming skipped)');
     }
     if (!baxiaHeaders && payload?.stream !== false && typeof onChunk === 'function') {
-        const streamedResponse = await executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk);
+        const streamedResponse = await executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk, onReasoning);
 
         // Qwen's Aliyun WAF blocks the browserless node-streaming fetch and returns a
         // non-SSE captcha page (errorBody = WAF html). Do NOT return that - fall through
@@ -789,6 +813,75 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
 
     return page.evaluate(async (data) => {
         try {
+            // Mirrors src/api/reasoning.js: page.evaluate cannot import ES modules.
+            const partsText = (v) => {
+                if (typeof v === 'string') return v;
+                if (Array.isArray(v)) return v.map(partsText).join('');
+                if (v && typeof v === 'object') {
+                    if (typeof v.text === 'string') return v.text;
+                    if (v.content !== undefined) return partsText(v.content);
+                }
+                return '';
+            };
+            const joinParts = (v, sep) => {
+                const raw = (v && typeof v === 'object' && !Array.isArray(v) && v.content !== undefined) ? v.content : v;
+                const list = Array.isArray(raw) ? raw : (raw == null ? [] : [raw]);
+                return list.map(p => partsText(p).trim()).filter(Boolean).join(sep);
+            };
+            const thinkState = { thought: '', seenTitles: [], blockFinished: false };
+            const consumeThinking = (delta) => {
+                const out = { reasoning: '', content: '' };
+                if (!delta || typeof delta !== 'object') return out;
+                const phase = String(delta.phase || '').toLowerCase();
+                const status = String(delta.status || '').toLowerCase();
+                const isSummary = phase.includes('summary');
+                const isThinking = !isSummary && (phase === 'thinking' || phase === 'think' || phase === 'reasoning');
+                const body = delta.content ?? delta.text ?? delta.output_text;
+                const directReasoning = partsText(delta.reasoning_content);
+                if (directReasoning) out.reasoning += directReasoning;
+                else if (isThinking) out.reasoning += partsText(body);
+                if (isSummary) {
+                    if (status === 'finished') { thinkState.blockFinished = true; return out; }
+                    const extra = delta.extra || {};
+                    const rawTitles = extra.summary_title && typeof extra.summary_title === 'object'
+                        && Object.prototype.hasOwnProperty.call(extra.summary_title, 'content')
+                        ? extra.summary_title.content : extra.summary_title;
+                    const titleList = Array.isArray(rawTitles) ? rawTitles : (rawTitles ? [rawTitles] : []);
+                    for (const item of titleList) {
+                        const title = partsText(item).trim();
+                        if (title && !thinkState.seenTitles.includes(title)) {
+                            thinkState.seenTitles.push(title);
+                            out.reasoning += `**${title}**\n\n`;
+                        }
+                    }
+                    const thoughtText = joinParts(extra.summary_thought, '\n\n');
+                    if (thoughtText && thoughtText !== thinkState.thought) {
+                        let added = '';
+                        if (thinkState.thought && thoughtText.startsWith(thinkState.thought)) {
+                            added = thoughtText.slice(thinkState.thought.length);
+                            thinkState.thought = thoughtText;
+                        } else if (thinkState.blockFinished && !thoughtText.startsWith(thinkState.thought)) {
+                            added = '\n\n' + thoughtText;
+                            thinkState.thought = (thinkState.thought ? thinkState.thought + '\n\n' : '') + thoughtText;
+                        } else if (!thinkState.thought) {
+                            added = thoughtText;
+                            thinkState.thought = thoughtText;
+                        } else {
+                            let p = 0;
+                            while (p < thinkState.thought.length && p < thoughtText.length && thinkState.thought[p] === thoughtText[p]) p++;
+                            added = thoughtText.slice(p);
+                            thinkState.thought = thoughtText;
+                        }
+                        thinkState.blockFinished = false;
+                        if (added) out.reasoning += added;
+                    }
+                    return out;
+                }
+                if (isThinking) return out;
+                out.content += partsText(body);
+                return out;
+            };
+
             const t = data.token;
             if (!t) return { success: false, error: 'Auth token not found' };
 
@@ -858,6 +951,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
                 const decoder = new TextDecoder();
                 let buffer = '';
                 let fullContent = '';
+                let fullReasoning = '';
                 let responseId = null;
                 let usage = null;
                 let finished = false;
@@ -892,21 +986,12 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
                             if (chunk.choices && chunk.choices[0]) {
                                 const choice = chunk.choices[0];
                                 const delta = choice.delta || choice.message;
-                                // Qwen finishes the "thinking_summary" phase with
-                                // status:"finished" before it sends any "answer"
-                                // chunks. Stopping there yields an empty content.
-                                const phase = delta?.phase;
-                                const isThinking = phase === 'thinking_summary' || phase === 'thinking';
-                                const content = delta && (delta.content ?? delta.text ?? delta.output_text);
-                                if (!isThinking) {
-                                    if (typeof content === 'string') {
-                                        fullContent += content;
-                                    } else if (Array.isArray(content)) {
-                                        fullContent += content.map(part => typeof part === 'string' ? part : (part?.text ?? part?.content ?? '')).join('');
-                                    } else if (content && typeof content === 'object') {
-                                        fullContent += String(content.text ?? content.content ?? '');
-                                    }
-                                }
+                                // Thinking text goes to reasoning_content only;
+                                // answer phases go to content. Handles both
+                                // thinking_summary and full thinking phases.
+                                const { reasoning, content } = consumeThinking(delta);
+                                fullReasoning += reasoning;
+                                fullContent += content;
                                 if (choice.finish_reason) finished = true;
                             }
                             if (chunk.usage) usage = chunk.usage;
@@ -926,7 +1011,15 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
                         object: 'chat.completion',
                         created: Math.floor(Date.now() / 1000),
                         model: data.payload.model,
-                        choices: [{ index: 0, message: { role: 'assistant', content: fullContent }, finish_reason: 'stop' }],
+                        choices: [{
+                            index: 0,
+                            message: {
+                                role: 'assistant',
+                                content: fullContent,
+                                ...(fullReasoning ? { reasoning_content: fullReasoning } : {})
+                            },
+                            finish_reason: 'stop'
+                        }],
                         usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
                         response_id: responseId
                     }
@@ -941,7 +1034,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null) {
     }, requestBody);
 }
 
-async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null) {
+async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null, options = {}) {
     logRaw(JSON.stringify(response));
     logError(`Error getting response: ${response.error || response.statusText}`);
     if (response.errorBody) logDebug(`Error response body: ${response.errorBody}`);
@@ -977,7 +1070,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
                 saveAuthToken(fresh);
                 markValidForToken(fresh);
                 logInfo('Retrying with freshly rotated browser token');
-                return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
+                return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
             }
         }
 
@@ -985,7 +1078,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
             // chatId/parentId are reset: when switching accounts the old chat
             // belongs to the previous token and under the new one "does not exist".
-            return sendMessage(message, model, null, null, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
+            return sendMessage(message, model, null, null, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
         }
         logError('No valid tokens left or retries exhausted.');
         return { error: 'All tokens are invalid (401). Re-authentication required.', chatId };
@@ -1011,7 +1104,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
             // chatId/parentId are reset: when switching accounts the old chat
             // belongs to the previous token and under the new one "does not exist".
-            return sendMessage(message, model, null, null, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
+            return sendMessage(message, model, null, null, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
         }
         return { error: `All tokens are rate limited (${hours}h)`, chatId };
     }
@@ -1030,7 +1123,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
 
 // --- Main public API -------------------------------------------------------
 
-export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null) {
+export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null, options = {}) {
     if (!availableModels) availableModels = getAvailableModelsFromFile();
 
     const browserContext = getBrowserContext();
@@ -1041,6 +1134,14 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     // accounts and Qwen returns "chat is not exist".
     const tokenObj = await resolveAuthToken(browserContext);
     if (!tokenObj) return { error: 'Auth error: failed to get token', chatId };
+
+    const reasoningEffort = options.reasoningEffort ?? null;
+    const reasoningMode = options.reasoningMode ?? modeForReasoningEffort(reasoningEffort);
+    if (reasoningMode) {
+        logInfo(`Reasoning mode: ${reasoningMode} (reasoning_effort: ${reasoningEffort || 'n/a'})`);
+    } else if (reasoningEffort) {
+        logWarn(`Unknown reasoning_effort "${reasoningEffort}"; keeping current feature_config`);
+    }
 
     if (!chatId) {
         const newChatResult = await createChatV2(model, 'New chat', 0, chatType, tokenObj);
@@ -1087,12 +1188,12 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
 
         logInfo('Sending request to API v2...');
 
-        const payload = buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType, size);
+        const payload = buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType, size, reasoningMode);
         logDebug('=== PAYLOAD V2 ===\n' + JSON.stringify(payload, null, 2));
         logDebug(`Sending message to chat ${chatId} with parent_id: ${parentId || 'null'}`);
 
         const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
-        const response = await executeApiRequest(page, apiUrl, payload, authToken, onChunk);
+        const response = await executeApiRequest(page, apiUrl, payload, authToken, onChunk, options.onReasoning || null);
 
         if (response.success && response.isTask) {
             logInfo('Response with task detected (video generation)');
@@ -1181,6 +1282,12 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             response.data.parentId = response.data.response_id;
             response.data.id = response.data.id || 'chatcmpl-' + Date.now();
 
+            // Non-stream upstream responses may carry thinking in extra choices.
+            if (response.data.choices?.[0]?.message && !response.data.choices[0].message.reasoning_content) {
+                const upstreamReasoning = reasoningFromCompletion(response.data);
+                if (upstreamReasoning) response.data.choices[0].message.reasoning_content = upstreamReasoning;
+            }
+
             // Fallback: if streaming callback was not invoked, send content as single chunk.
             if (typeof onChunk === 'function' && response.data.choices?.[0]?.message?.content && !response.hasStreamedChunks) {
                 onChunk(response.data.choices[0].message.content);
@@ -1189,7 +1296,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             return response.data;
         }
 
-        return handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk);
+        return handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk, options);
     } catch (error) {
         logError('Error sending message', error);
         return { error: error.toString(), chatId };

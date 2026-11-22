@@ -30,6 +30,7 @@ Other commands:
 | `npm run models:sync` | Refresh `src/AvailableModels.txt` from Qwen |
 | `npm run smoke` | API smoke test |
 | `node scripts/core/verify-parser.mjs` | Offline check of the SSE answer parser |
+| `node scripts/core/verify-reasoning.mjs` | Offline check of reasoning_effort mapping and thinking stream |
 
 ## Layout
 
@@ -74,18 +75,16 @@ Never commit `session/`, `.env`, `logs/`, or `.opencode/`.
    `scripts/core/capture-ui-full.mjs` followed by
    `scripts/core/sync-session-from-ui.mjs`. The CDP observer is automatic: no browser
    extension or user action is required.
-5. **SSE parsing:** skip `thinking_summary` phases; only the final answer text becomes
-   `choices[0].message.content`. Never hide an upstream error as empty `content` —
-   surface it. A one-shot chat without explicit `chat_id` is deleted by
-   `deleteChatV2()`, so its absence in the Qwen UI is expected.
+5. **SSE parsing / reasoning:** thinking phases go to `reasoning_content`, answer phases go to `content`; never leak thinking into `content`. The reasoning accumulator is mirrored inline in the `page.evaluate()` parser and as `src/api/reasoning.js` for node-streaming/routes. `reasoning_effort` maps to Qwen `feature_config` (low/none/minimal→Fast, medium→Auto, high/xhigh/max→Thinking); absent/unknown leaves default Auto unchanged. Never hide an upstream error as empty `content`. A one-shot chat without explicit `chat_id` is deleted by `deleteChatV2()`, so its absence in the Qwen UI is expected.
 6. **Captcha:** if a slider captcha (`nc_1_nocaptcha` / `_____tmd_____/report`) appears,
    stop all diagnostics immediately and ask the user; do not brute-force it.
 
 ## Verification checklist
 
 ```text
-node --check index.js && node --check src/api/chat.js
+node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/reasoning.js
 node scripts/core/verify-parser.mjs            # -> PASS
+node scripts/core/verify-reasoning.mjs         # -> PASS
 npm run start:cdp                              # -> port 3264 starts listening
 GET /api/session/sync                          # -> capturedAt + chatId + tokenExp
 POST /api/chat/completions (no chat_id needed) # -> HTTP 200, non-empty content

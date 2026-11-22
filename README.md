@@ -139,7 +139,7 @@ Detailed report: [docs/QWEN_CHAT_MODELS.md](docs/QWEN_CHAT_MODELS.md)
 curl http://localhost:3264/api/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "qwen3.7-max",
+    "model": "qwen3.7-plus",
     "messages": [
       {"role": "user", "content": "Answer briefly: what is FreeQwenApi?"}
     ],
@@ -158,11 +158,38 @@ const openai = new OpenAI({
 });
 
 const response = await openai.chat.completions.create({
-  model: 'qwen3.7-max',
+  model: 'qwen3.7-plus',
   messages: [{ role: 'user', content: 'Hello!' }]
 });
 
 console.log(response.choices[0].message.content);
+```
+
+### Reasoning effort / thinking stream
+
+The proxy maps OpenAI `reasoning_effort` to Qwen Chat's real `feature_config` mode:
+
+| `reasoning_effort` | Qwen mode | `feature_config` |
+| --- | --- | --- |
+| `none`, `minimal`, `low` | Fast | `thinking_enabled:false, auto_thinking:false, thinking_mode:'Fast'` (no `thinking_format`) |
+| `medium` | Auto | `thinking_enabled:true, auto_thinking:true, thinking_mode:'Auto', thinking_format:'summary'` |
+| `high`, `xhigh`, `max` | Thinking | `thinking_enabled:true, auto_thinking:false, thinking_mode:'Thinking', thinking_format:'summary'` |
+
+If `reasoning_effort` is absent or unknown, the proxy leaves the existing default Auto config unchanged.
+
+Streaming responses emit thinking as `choices[0].delta.reasoning_content` and keep answer text in `choices[0].delta.content`. Non-streaming responses include `choices[0].message.reasoning_content` when reasoning is available.
+
+```bash
+curl -N http://localhost:3264/api/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"qwen3.7-plus","stream":true,"reasoning_effort":"high","messages":[{"role":"user","content":"Say OK briefly"}]}'
+```
+
+OpenCode template: [`examples/opencode.json`](examples/opencode.json). Copy it to `.opencode/opencode.json` (gitignored) in this repo, start the proxy on port 3264, then run:
+
+```bash
+opencode run --model freeqwen/qwen3.7-plus#high --thinking --auto "Say OK briefly"
+opencode run --model freeqwen/qwen3.7-plus#fast --thinking --auto "Say OK briefly"
 ```
 
 ## Image generation via Qwen Chat

@@ -15,6 +15,7 @@ import crypto from 'crypto';
 import { listTokens, markInvalid, markRateLimited, markValid, addTokenFromString, deleteAccount, decodeTokenInfo, updateAccountToken, setLabel } from './tokenManager.js';
 import { FORGETMEAI_WATERMARK } from '../utils/branding.js';
 import { applySessionSync, getSessionSyncStatus } from './sessionSync.js';
+import { reasoningOptionsFromEffort } from './reasoning.js';
 
 // Function for generating a deterministic chatId based on history
 function generateChatIdFromHistory(messages) {
@@ -665,7 +666,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls) {
     res.write('data: ' + JSON.stringify({
         ...base,
         choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
-    }) + '\n');
+    }) + '\n\n');
     for (const call of toolCalls) {
         res.write('data: ' + JSON.stringify({
             ...base,
@@ -681,13 +682,13 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls) {
                 },
                 finish_reason: null
             }]
-        }) + '\n');
+        }) + '\n\n');
     }
     res.write('data: ' + JSON.stringify({
         ...base,
         choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]
-    }) + '\n');
-    res.write('data: [DONE]\n');
+    }) + '\n\n');
+    res.write('data: [DONE]\n\n');
     res.end();
 }
 
@@ -698,7 +699,7 @@ async function handleStreamingResponse(res, mappedModel, messageContent, chatId,
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
 
-    const writeSse = (payload) => res.write('data: ' + JSON.stringify(payload) + '\n');
+    const writeSse = (payload) => res.write('data: ' + JSON.stringify(payload) + '\n\n');
 
     writeSse({
         id: 'chatcmpl-stream', object: 'chat.completion.chunk',
@@ -734,7 +735,7 @@ async function handleStreamingResponse(res, mappedModel, messageContent, chatId,
             created: Math.floor(Date.now() / 1000), model: mappedModel,
             choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
         });
-        res.write('data: [DONE]\n');
+        res.write('data: [DONE]\n\n');
         res.end();
     } catch (error) {
         logError('Error handling streaming request', error);
@@ -743,7 +744,7 @@ async function handleStreamingResponse(res, mappedModel, messageContent, chatId,
             created: Math.floor(Date.now() / 1000), model: mappedModel,
             choices: [{ index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }]
         });
-        res.write('data: [DONE]\n');
+        res.write('data: [DONE]\n\n');
         res.end();
     }
 }
@@ -819,7 +820,7 @@ router.post('/chat', async (req, res) => {
             res.setHeader('X-Accel-Buffering', 'no');
 
             const writeSse = (payload) => {
-                res.write('data: ' + JSON.stringify(payload) + '\n');
+                res.write('data: ' + JSON.stringify(payload) + '\n\n');
             };
 
             try {
@@ -854,7 +855,8 @@ router.post('/chat', async (req, res) => {
                     null,
                     true,
                     0,
-                    streamingCallback
+                    streamingCallback,
+                    { ...reasoningOptions, onReasoning: reasoningCallback }
                 );
 
                 if (result.error) {
@@ -899,7 +901,7 @@ router.post('/chat', async (req, res) => {
                         { index: 0, delta: {}, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n');
+                res.write('data: [DONE]\n\n');
                 res.end();
                 return;
             } catch (error) {
@@ -913,7 +915,7 @@ router.post('/chat', async (req, res) => {
                         { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n');
+                res.write('data: [DONE]\n\n');
                 res.end();
                 return;
             }
@@ -1251,6 +1253,10 @@ router.get('/chat/completions', (req, res) => {
 router.post('/chat/completions', async (req, res) => {
     try {
         const { messages, model, stream, tools, functions, tool_choice, chatId } = req.body;
+        const reasoningOptions = reasoningOptionsFromEffort(req.body?.reasoning_effort);
+        if (reasoningOptions.reasoningMode) {
+            logInfo(`Reasoning effort '${reasoningOptions.reasoningEffort}' -> Qwen mode '${reasoningOptions.reasoningMode}'`);
+        }
         const snakeCaseChatId = normalizeIdValue(req.body?.chat_id);
         const explicitChatId = normalizeIdValue(chatId) || snakeCaseChatId;
         const explicitParentId = extractParentHint(req);
@@ -1381,11 +1387,26 @@ router.post('/chat/completions', async (req, res) => {
             res.setHeader('Transfer-Encoding', 'chunked');
 
             const writeSse = (payload) => {
-                res.write('data: ' + JSON.stringify(payload) + '\n');
+                res.write('data: ' + JSON.stringify(payload) + '\n\n');
             };
+            const writeReasoningChunk = (text) => writeSse({
+                id: 'chatcmpl-stream',
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: mappedModel || DEFAULT_MODEL,
+                choices: [
+                    { index: 0, delta: { reasoning_content: text }, finish_reason: null }
+                ]
+            });
 
             try {
                 const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
+
+                let hasStreamedReasoning = false;
+                const reasoningCallback = (text) => {
+                    hasStreamedReasoning = true;
+                    writeReasoningChunk(text);
+                };
 
                 // Setup streaming callback if stream=true
                 let streamingCallback = null;
@@ -1419,7 +1440,8 @@ router.post('/chat/completions', async (req, res) => {
                     null,
                     true,
                     0,
-                    streamingCallback
+                    streamingCallback,
+                    { ...reasoningOptions, onReasoning: reasoningCallback }
                 );
 
                 // One-shot chat: delete failed immediately, successful - by policy.
@@ -1431,6 +1453,10 @@ router.post('/chat/completions', async (req, res) => {
                         writeToolCallsSse(res, mappedModel, result, toolCalls);
                         return;
                     }
+                }
+                if (!hasStreamedReasoning && result?.choices?.[0]?.message?.reasoning_content) {
+                    writeReasoningChunk(result.choices[0].message.reasoning_content);
+                    hasStreamedReasoning = true;
                 }
 
                 // Save chatId to session for subsequent requests
@@ -1486,7 +1512,7 @@ router.post('/chat/completions', async (req, res) => {
                         { index: 0, delta: {}, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n');
+                res.write('data: [DONE]\n\n');
                 res.end();
 
             } catch (error) {
@@ -1500,12 +1526,12 @@ router.post('/chat/completions', async (req, res) => {
                         { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n');
+                res.write('data: [DONE]\n\n');
                 res.end();
             }
         } else {
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, qwenTools, tool_choice, toolAwareSystemMessage);
+            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, reasoningOptions);
 
             // One-shot chat: delete failed immediately, successful - by policy.
             cleanupEphemeralChat(result, effectiveChatId, isMeta);
@@ -1541,7 +1567,8 @@ router.post('/chat/completions', async (req, res) => {
                     index: 0,
                     message: {
                         role: "assistant",
-                        content: result.choices?.[0]?.message?.content || ""
+                        content: result.choices?.[0]?.message?.content || "",
+                        ...(result.choices?.[0]?.message?.reasoning_content ? { reasoning_content: result.choices[0].message.reasoning_content } : {})
                     },
                     finish_reason: "stop"
                 }],
@@ -1581,6 +1608,10 @@ router.post('/chat/completions', async (req, res) => {
 router.post('/v1/chat/completions', async (req, res) => {
     try {
         const { messages, model, stream, tools, functions, tool_choice, chatId } = req.body;
+        const reasoningOptions = reasoningOptionsFromEffort(req.body?.reasoning_effort);
+        if (reasoningOptions.reasoningMode) {
+            logInfo(`Reasoning effort '${reasoningOptions.reasoningEffort}' -> Qwen mode '${reasoningOptions.reasoningMode}'`);
+        }
         const snakeCaseChatId = normalizeIdValue(req.body?.chat_id);
         const explicitChatId = normalizeIdValue(chatId) || snakeCaseChatId;
         const explicitParentId = extractParentHint(req);
@@ -1714,11 +1745,26 @@ router.post('/v1/chat/completions', async (req, res) => {
             res.setHeader('Transfer-Encoding', 'chunked');
 
             const writeSse = (payload) => {
-                res.write('data: ' + JSON.stringify(payload) + '\n');
+                res.write('data: ' + JSON.stringify(payload) + '\n\n');
             };
+            const writeReasoningChunk = (text) => writeSse({
+                id: 'chatcmpl-stream',
+                object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000),
+                model: mappedModel || DEFAULT_MODEL,
+                choices: [
+                    { index: 0, delta: { reasoning_content: text }, finish_reason: null }
+                ]
+            });
 
             try {
                 const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
+
+                let hasStreamedReasoning = false;
+                const reasoningCallback = (text) => {
+                    hasStreamedReasoning = true;
+                    writeReasoningChunk(text);
+                };
 
                 // Setup streaming callback if stream=true
                 let streamingCallback = null;
@@ -1753,7 +1799,8 @@ router.post('/v1/chat/completions', async (req, res) => {
                     null,
                     true,
                     0,
-                    streamingCallback
+                    streamingCallback,
+                    { ...reasoningOptions, onReasoning: reasoningCallback }
                 );
 
                 if (captureToolCalls) {
@@ -1762,6 +1809,10 @@ router.post('/v1/chat/completions', async (req, res) => {
                         writeToolCallsSse(res, mappedModel, result, toolCalls);
                         return;
                     }
+                }
+                if (!hasStreamedReasoning && result?.choices?.[0]?.message?.reasoning_content) {
+                    writeReasoningChunk(result.choices[0].message.reasoning_content);
+                    hasStreamedReasoning = true;
                 }
 
                 // Save chatId to session for subsequent requests
@@ -1812,7 +1863,7 @@ router.post('/v1/chat/completions', async (req, res) => {
                         { index: 0, delta: {}, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n');
+                res.write('data: [DONE]\n\n');
                 res.end();
 
             } catch (error) {
@@ -1826,13 +1877,13 @@ router.post('/v1/chat/completions', async (req, res) => {
                         { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
                     ]
                 });
-                res.write('data: [DONE]\n');
+                res.write('data: [DONE]\n\n');
                 res.end();
             }
         } else {
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
 
-            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage);
+            const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, reasoningOptions);
 
             // Save chatId to session for subsequent requests
             if (!isMeta && result.chatId) {
@@ -1874,7 +1925,8 @@ router.post('/v1/chat/completions', async (req, res) => {
                     index: 0,
                     message: {
                         role: "assistant",
-                        content: messageText
+                        content: messageText,
+                        ...(result.choices?.[0]?.message?.reasoning_content ? { reasoning_content: result.choices[0].message.reasoning_content } : {})
                     },
                     finish_reason: "stop"
                 }],
