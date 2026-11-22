@@ -28,7 +28,9 @@ This is **not a local model running on your GPU** and **not the official Alibaba
 - **File uploads**: upload endpoint for Qwen files and attachments.
 - **Open WebUI**: can connect as OpenAI-compatible backend.
 - **Hermes Agent / LiteLLM / Claude Code**: ready configs for local AI agents.
-- **Health/smoke tooling**: `/api/health`, `/api/status`, `/api/models`, `npm run smoke`, `npm run models:sync`.
+- **Automatic session refresh**: a CDP observer captures fresh tokens and Baxia headers from real Qwen UI traffic; no manual re-login needed.
+- **Startup model sync**: the model list is refreshed once on every server start from the logged-in Qwen tab.
+- **Health/smoke tooling**: `/api/health`, `/api/status`, `/api/models`, `/api/session/sync`, `npm run smoke`, `npm run models:sync`.
 - **ForgetMeAI branding**: watermark `t.me/forgetmeai` in README, CLI, and health/media metadata.
 
 ## Quick start
@@ -40,7 +42,9 @@ npm install
 npm run start:cdp
 ```
 
-`start:cdp` opens (or reuses) a dedicated Chrome window with a persistent Qwen login and starts the proxy non-interactively. On the first run, log in to Qwen Chat in that window, then retry the request.
+`start:cdp` opens (or reuses) a dedicated Chrome window with a persistent Qwen login and starts the proxy non-interactively — there is no account menu in this mode. On the first run, log in to Qwen Chat in that window, then retry the request. Plain `npm start` still shows the interactive account menu.
+
+While the proxy runs, a CDP observer watches the logged-in Qwen tab and pushes each fresh token/Baxia capture to `session/`. Sending any message in the Qwen UI keeps the session current; `GET /api/session/sync` reports the last capture. An optional MV3 extension under [`extension/`](extension/) does the same push and can be installed manually via `chrome://extensions` → **Load unpacked** — branded Chrome does not allow command-line extension loading, so the CDP observer is the automatic path.
 
 In another terminal:
 
@@ -121,7 +125,7 @@ Returns service, count of models, accounts, and watermark:
 curl http://localhost:3264/api/models
 ```
 
-Update model list from Qwen Chat metadata:
+The model list is refreshed automatically once at server startup from the logged-in Qwen tab (the public model API exposes fewer models). To refresh it manually:
 
 ```bash
 npm run models:sync
@@ -355,6 +359,7 @@ Health checks:
 curl http://localhost:3264/api/health
 curl http://localhost:3264/api/status
 curl http://localhost:3264/api/models
+curl http://localhost:3264/api/session/sync
 curl http://localhost:3264/api/images/status
 curl http://localhost:3264/api/videos/status
 ```
@@ -373,7 +378,7 @@ curl http://localhost:3264/api/videos/status
 
 - This is unofficial browser-based proxy, Qwen may change external API.
 - Qwen Chat accounts may hit rate limits; use multiple accounts for round-robin.
-- Tokens expire — use `npm run auth -- --relogin`.
+- Tokens rotate about every 15 minutes; the CDP observer refreshes them automatically. If no Qwen tab is logged in, use `npm run auth -- --relogin`.
 - Image/video generation depends on availability and Qwen Chat limits on specific account.
 - Generated media URLs may be temporary.
 - For production use carefully: this is a tool for experimenters, demos, and local workflows.
