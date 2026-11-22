@@ -101,6 +101,18 @@ function parseLenientJson(raw) {
     let repaired = candidate.replace(/^\s*\{\s*(["']?)([a-zA-Z0-9_.:-]+)\1\s*,\s*/, '{"name":"$2",');
     repaired = repaired.replace(/,\s*([}\]])/g, '$1');
     try { return JSON.parse(repaired); } catch { /* fall through */ }
+
+    // Handle {"name":"foo",{"key":"val"}} where the bare object IS the arguments value.
+    // Qwen sometimes omits the "arguments": key: {"name":"read",{"path":"x"}}
+    // instead of the correct {"name":"read","arguments":{"path":"x"}}.
+    const argObjMatch = candidate.match(/^\s*\{[^{]*"name"\s*:\s*"([^"]+)"\s*,\s*(\{[\s\S]*\})\s*\}\s*$/);
+    if (argObjMatch) {
+        try {
+            const args = JSON.parse(argObjMatch[2]);
+            return { name: argObjMatch[1], arguments: args };
+        } catch { /* fall through */ }
+    }
+
     return NOTHING;
 }
 
@@ -173,10 +185,12 @@ function parseXmlFunctionBlock(blockText) {
 }
 
 function collectJsonObjects(text) {
-    const dec = { rawDecode: (s, i) => {
-        // Simple raw decode using JSON.parse by scanning; fallback below handles.
-        throw new Error('unused');
-    } };
+    const dec = {
+        rawDecode: (s, i) => {
+            // Simple raw decode using JSON.parse by scanning; fallback below handles.
+            throw new Error('unused');
+        }
+    };
     const objs = [];
     let i = 0;
     while (i < text.length) {
@@ -279,11 +293,22 @@ function* iterBlocks(text) {
 
         // Parse multiple JSON objects in fence
         const objs = collectJsonObjects(rawBlock);
-        if (objs.length > 0) {
+        // Check whether any collected objects look like tool calls (have a name/tool key).
+        // If not, also try parseLenientJson which can recover malformed patterns like
+        // {"name":"foo",{"key":"val"}} where the arguments object is bare (no "arguments" key).
+        const TOOL_KEYS = ['name', 'tool', 'tool_name', 'action', 'function_call', 'tool_call', 'tool_calls'];
+        const hasToolShape = objs.some(o => o.value && typeof o.value === 'object' &&
+            TOOL_KEYS.some(k => Object.prototype.hasOwnProperty.call(o.value, k)));
+        if (objs.length > 0 && hasToolShape) {
             for (const obj of objs) yield { start: cand.start, end: blockEnd, data: obj.value, kind: cand.kind };
         } else {
             const lenient = parseLenientJson(rawBlock);
-            if (lenient !== NOTHING) yield { start: cand.start, end: blockEnd, data: lenient, kind: cand.kind };
+            if (lenient !== NOTHING) {
+                yield { start: cand.start, end: blockEnd, data: lenient, kind: cand.kind };
+            } else if (objs.length > 0) {
+                // parseLenientJson found nothing better; fall back to collected objects
+                for (const obj of objs) yield { start: cand.start, end: blockEnd, data: obj.value, kind: cand.kind };
+            }
         }
         consumedUpTo = blockEnd;
     }
@@ -309,13 +334,27 @@ export function parseToolCalls(text, allowedNames = null, requiredByName = null)
 
     // 1) Structured blocks (fenced/XML)
     const blocks = [...iterBlocks(text)];
+
+    // Filter out "mid-sentence" blocks: if there is non-whitespace prose on the
+    // same line immediately before the block opening, the model is explaining the
+    // call rather than making it (mirrors Python tools.py lines 732-737).
+    const validBlocks = blocks.filter(block => {
+        if (block.kind === 'json') return true; // bare JSON: allow through
+        const lineStart = text.lastIndexOf('\n', block.start) + 1;
+        // Strip XML tags from prefix before checking (use fresh regex to avoid lastIndex issues)
+        const prefix = text.slice(lineStart, block.start).replace(/<\/?[\w][\w:.-]*(?:\s[^>]*)?>|<\/tool_call>/gi, '').trim();
+        return prefix.length === 0; // skip block when prose precedes it on the same line
+    });
+
     if (blocks.length > 0) {
-        // Remove blocks from text in reverse order
-        const sorted = [...blocks].sort((a, b) => b.start - a.start);
+        // Fence/XML blocks existed — do NOT fall through to bare JSON fallback
+        // (the raw fence text would spuriously match the JSON extractor).
+        // Remove valid blocks from cleanText in reverse order (preserve positions).
+        const sorted = [...validBlocks].sort((a, b) => b.start - a.start);
         for (const b of sorted) {
             cleanText = cleanText.slice(0, b.start) + cleanText.slice(b.end);
         }
-        for (const block of blocks) {
+        for (const block of validBlocks) {
             const rawCalls = extractCallsFromData(block.data);
             for (const raw of rawCalls) {
                 const normalized = normalizeRawCall(raw, calls.length);
@@ -328,10 +367,8 @@ export function parseToolCalls(text, allowedNames = null, requiredByName = null)
                 calls.push(normalized);
             }
         }
-    }
-
-    // 2) Bare JSON fallback when no block calls found
-    if (calls.length === 0) {
+    } else {
+        // 2) Bare JSON fallback — only when no fence/XML blocks found at all
         const trimmed = text.trim();
         const lenient = parseLenientJson(trimmed);
         if (lenient !== NOTHING) {
@@ -350,12 +387,10 @@ export function parseToolCalls(text, allowedNames = null, requiredByName = null)
         }
     }
 
-    // Final required param validation: keep calls but caller can nudge; here we report as dropped? 
-    // Plan says "validate names/required params; reject broken arguments". Required missing should cause nudge/reject.
+    // Final required param validation
     const missing = missingRequiredParams(calls, required);
     if (missing.length > 0) {
         for (const m of missing) dropped.push(`missing required parameter: ${m}`);
-        // remove calls with missing required params? simpler: mark unusable by returning no calls and dropped.
         return { calls: [], dropped, text: cleanText.trim() };
     }
 
@@ -503,6 +538,10 @@ function _toolUseBlock(toolDefs, constraint) {
         'Call format (use this exact format):\n' +
         '```tool_call\n' +
         '{"name": "<tool_name>", "arguments": {<parameters>}}\n' +
+        '```\n\n' +
+        'Example (ALWAYS include the \"arguments\" key, even for simple calls):\n' +
+        '```tool_call\n' +
+        '{"name": "read_file", "arguments": {"path": "index.js"}}\n' +
         '```\n\n' +
         'Rules:\n' +
         '- Each turn do exactly ONE of: (A) you need to read or change ' +

@@ -239,7 +239,49 @@ check('round-trip: qwen fence response -> parseToolCalls succeeds', () => {
     assert.equal(result.dropped.length, 0);
 });
 
-const TOTAL = 10 + 16;
+console.log('\nparseToolCalls – prose + tool_call splitting:');
+check('fence on its own line -> call extracted, cleanText is empty', () => {
+    const fence = '```tool_call\n{"name":"read_file","arguments":{"path":"foo.txt"}}\n```';
+    const r = parseToolCalls(fence, toolNames([READ_TOOL]));
+    assert.equal(r.calls.length, 1);
+    assert.equal(r.text.length, 0); // no prose
+});
+
+check('prose before fence on separate line -> call extracted, prose preserved in cleanText', () => {
+    const text = 'Sure, let me read that file for you.\n```tool_call\n{"name":"read_file","arguments":{"path":"a.txt"}}\n```';
+    const r = parseToolCalls(text, toolNames([READ_TOOL]));
+    assert.equal(r.calls.length, 1, 'should extract call');
+    assert.ok(r.text.includes('Sure, let me read that file for you.'), 'prose preserved in cleanText');
+    assert.ok(!r.text.includes('```tool_call'), 'fence stripped from cleanText');
+});
+
+check('fence mid-sentence (prose on same line before it) -> block skipped (not a real call)', () => {
+    // Model wrote: "I will call ```tool_call..." - this is a description, not a call
+    const text = 'I will call ```tool_call\n{"name":"read_file","arguments":{"path":"b.txt"}}\n```';
+    const r = parseToolCalls(text, toolNames([READ_TOOL]));
+    assert.equal(r.calls.length, 0, 'mid-sentence fence should not be treated as a call');
+});
+
+check('cleanText has prose but no fence when tool call present', () => {
+    const text = 'Here is the answer.\n```tool_call\n{"name":"read_file","arguments":{"path":"c.txt"}}\n```\nEnd.';
+    const r = parseToolCalls(text, toolNames([READ_TOOL]));
+    assert.equal(r.calls.length, 1);
+    assert.ok(!r.text.includes('```tool_call'), 'fence stripped');
+    assert.ok(r.text.includes('Here is the answer.') || r.text.includes('End.'), 'prose kept');
+});
+
+
+console.log('\nparseLenientJson – Qwen malformed tool call recovery:');
+check('{"name":"foo",{...}} missing arguments key recovered', () => {
+    // Qwen sometimes omits "arguments": key: {"name":"read_file",{"path":"x.js"}}
+    const text = '```tool_call\n{"name":"read_file",{"path":"x.js"}}\n```';
+    const r = parseToolCalls(text, toolNames([READ_TOOL]));
+    assert.equal(r.calls.length, 1, 'should recover call despite missing arguments key');
+    assert.equal(r.calls[0].function.name, 'read_file');
+    assert.deepEqual(JSON.parse(r.calls[0].function.arguments), { path: 'x.js' });
+});
+
+const TOTAL = 10 + 16 + 4 + 1;
 console.log(`\nchecks: ${checks}`);
 console.log(checks === TOTAL ? 'PASS' : `FAIL (expected ${TOTAL} checks, got ${checks})`);
 process.exit(checks === TOTAL ? 0 : 1);

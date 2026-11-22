@@ -671,22 +671,33 @@ function normalizeOpenAIToolCalls(toolCalls = []) {
 }
 
 function resolveToolCalls(result, combinedTools) {
-    if (!Array.isArray(combinedTools) || combinedTools.length === 0) return { calls: [], dropped: [] };
+    if (!Array.isArray(combinedTools) || combinedTools.length === 0) return { calls: [], dropped: [], cleanText: '' };
     const allowed = toolNames(combinedTools);
     const required = toolRequiredParams(combinedTools);
     const nativeCalls = Array.isArray(result?.native_tool_calls) ? result.native_tool_calls : [];
     const normalized = Array.isArray(result?.tool_calls_normalized) ? result.tool_calls_normalized : null;
     if (normalized) {
-        return { calls: normalizeOpenAIToolCalls(normalized), dropped: result?.tool_calls_dropped || result?.native_tool_dropped || [] };
+        return { calls: normalizeOpenAIToolCalls(normalized), dropped: result?.tool_calls_dropped || result?.native_tool_dropped || [], cleanText: '' };
     }
     const content = result?.choices?.[0]?.message?.content || '';
     const parsed = parseToolCalls(content, allowed, required);
     const calls = normalizeOpenAIToolCalls(mergeToolCalls(nativeCalls, parsed.calls));
     const dropped = [...(result?.native_tool_dropped || []), ...parsed.dropped];
-    return { calls, dropped };
+    // parsed.text is the prose with fence blocks stripped out
+    const cleanText = typeof parsed.text === 'string' ? parsed.text.trim() : '';
+    return { calls, dropped, cleanText };
 }
 
-function buildOpenAIToolResponse(result, mappedModel, toolCalls) {
+function buildOpenAIToolResponse(result, mappedModel, toolCalls, cleanText = '', reasoning = '') {
+    const msg = {
+        role: 'assistant',
+        // prose before the tool_call fence (if any) goes in content; null otherwise
+        content: cleanText || null,
+        tool_calls: toolCalls.map(({ index, ...call }) => call)
+    };
+    // Always surface thinking/reasoning alongside tool_calls (mirrors Python server.py)
+    const reasoningContent = reasoning || result?.choices?.[0]?.message?.reasoning_content || '';
+    if (reasoningContent) msg.reasoning_content = reasoningContent;
     return {
         id: result.id || 'chatcmpl-' + Date.now(),
         object: 'chat.completion',
@@ -699,6 +710,7 @@ function buildOpenAIToolResponse(result, mappedModel, toolCalls) {
                 content: null,
                 tool_calls: toolCalls.map(({ index, ...call }) => call)
             },
+            message: msg,
             finish_reason: 'tool_calls'
         }],
         usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
@@ -709,17 +721,34 @@ function buildOpenAIToolResponse(result, mappedModel, toolCalls) {
     };
 }
 
-function writeToolCallsSse(res, mappedModel, result, toolCalls) {
+function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', reasoning = '') {
     const base = {
         id: result.id || 'chatcmpl-stream',
         object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000),
         model: result.model || mappedModel || DEFAULT_MODEL
     };
+    // 1) role chunk
     res.write('data: ' + JSON.stringify({
         ...base,
         choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
     }) + '\n\n');
+    // 2) reasoning_content chunk (thinking) — mirrors Python server.py _sse_chunk reasoning
+    const reasoningContent = reasoning || result?.choices?.[0]?.message?.reasoning_content || '';
+    if (reasoningContent) {
+        res.write('data: ' + JSON.stringify({
+            ...base,
+            choices: [{ index: 0, delta: { reasoning_content: reasoningContent }, finish_reason: null }]
+        }) + '\n\n');
+    }
+    // 3) prose text before tool_call fences (if any)
+    if (cleanText) {
+        res.write('data: ' + JSON.stringify({
+            ...base,
+            choices: [{ index: 0, delta: { content: cleanText }, finish_reason: null }]
+        }) + '\n\n');
+    }
+    // 4) tool_call chunks
     for (const call of toolCalls) {
         res.write('data: ' + JSON.stringify({
             ...base,
@@ -737,6 +766,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls) {
             }]
         }) + '\n\n');
     }
+    // 5) finish chunk
     res.write('data: ' + JSON.stringify({
         ...base,
         choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]
@@ -747,1256 +777,810 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls) {
 
 // --- Helpers: streaming -----------------------------------------------------
 
-async function handleStreamingResponse(res, mappedModel, messageContent, chatId, parentId, combinedTools, toolChoice, systemMessage) {
-    res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
-    res.setHeader('Connection', 'keep-alive');
+    async function handleStreamingResponse(res, mappedModel, messageContent, chatId, parentId, combinedTools, toolChoice, systemMessage) {
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
 
-    const writeSse = (payload) => res.write('data: ' + JSON.stringify(payload) + '\n\n');
+        const writeSse = (payload) => res.write('data: ' + JSON.stringify(payload) + '\n\n');
 
-    writeSse({
-        id: 'chatcmpl-stream', object: 'chat.completion.chunk',
-        created: Math.floor(Date.now() / 1000), model: mappedModel,
-        choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
-    });
+        writeSse({
+            id: 'chatcmpl-stream', object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000), model: mappedModel,
+            choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
+        });
 
-    try {
-        const result = await sendMessage(messageContent, mappedModel, chatId, parentId, null, combinedTools, toolChoice, systemMessage);
+        try {
+            const result = await sendMessage(messageContent, mappedModel, chatId, parentId, null, combinedTools, toolChoice, systemMessage);
 
-        if (result.error) {
-            writeSse({
-                id: 'chatcmpl-stream', object: 'chat.completion.chunk',
-                created: Math.floor(Date.now() / 1000), model: mappedModel,
-                choices: [{ index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: null }]
-            });
-        } else if (result.choices?.[0]?.message) {
-            const content = String(result.choices[0].message.content || '');
-            const codePoints = Array.from(content);
-            const chunkSize = 16;
-            for (let i = 0; i < codePoints.length; i += chunkSize) {
+            if (result.error) {
                 writeSse({
                     id: 'chatcmpl-stream', object: 'chat.completion.chunk',
                     created: Math.floor(Date.now() / 1000), model: mappedModel,
-                    choices: [{ index: 0, delta: { content: codePoints.slice(i, i + chunkSize).join('') }, finish_reason: null }]
+                    choices: [{ index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: null }]
                 });
-                await new Promise(r => setTimeout(r, STREAMING_CHUNK_DELAY));
+            } else if (result.choices?.[0]?.message) {
+                const content = String(result.choices[0].message.content || '');
+                const codePoints = Array.from(content);
+                const chunkSize = 16;
+                for (let i = 0; i < codePoints.length; i += chunkSize) {
+                    writeSse({
+                        id: 'chatcmpl-stream', object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000), model: mappedModel,
+                        choices: [{ index: 0, delta: { content: codePoints.slice(i, i + chunkSize).join('') }, finish_reason: null }]
+                    });
+                    await new Promise(r => setTimeout(r, STREAMING_CHUNK_DELAY));
+                }
             }
+
+            writeSse({
+                id: 'chatcmpl-stream', object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000), model: mappedModel,
+                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+            });
+            res.write('data: [DONE]\n\n');
+            res.end();
+        } catch (error) {
+            logError('Error handling streaming request', error);
+            writeSse({
+                id: 'chatcmpl-stream', object: 'chat.completion.chunk',
+                created: Math.floor(Date.now() / 1000), model: mappedModel,
+                choices: [{ index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }]
+            });
+            res.write('data: [DONE]\n\n');
+            res.end();
         }
-
-        writeSse({
-            id: 'chatcmpl-stream', object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000), model: mappedModel,
-            choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
-        });
-        res.write('data: [DONE]\n\n');
-        res.end();
-    } catch (error) {
-        logError('Error handling streaming request', error);
-        writeSse({
-            id: 'chatcmpl-stream', object: 'chat.completion.chunk',
-            created: Math.floor(Date.now() / 1000), model: mappedModel,
-            choices: [{ index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }]
-        });
-        res.write('data: [DONE]\n\n');
-        res.end();
-    }
-}
-
-function handleNonStreamingResponse(res, result, mappedModel) {
-    if (result.error) {
-        return res.status(500).json({ error: { message: result.error, type: 'server_error' } });
     }
 
-    res.json({
-        id: result.id || 'chatcmpl-' + Date.now(),
-        object: 'chat.completion',
-        created: Math.floor(Date.now() / 1000),
-        model: result.model || mappedModel,
-        choices: result.choices || [{ index: 0, message: { role: 'assistant', content: '' }, finish_reason: 'stop' }],
-        usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-        chatId: result.chatId,
-        parentId: result.parentId
-    });
-}
-
-// --- Routes -----------------------------------------------------------------
-
-router.post('/chat', async (req, res) => {
-    try {
-        const { message, messages, model, chatId, parentId, stream, chatType, size, waitForCompletion } = req.body;
-
-        // Support both message and messages for compatibility
-        let messageContent = message;
-        let systemMessage = null;
-        let allMessages = messages; // Preserve full history
-        const isMeta = isOpenWebUiMetaRequest(messages);
-
-        if (messages && Array.isArray(messages)) {
-            const parsed = parseOpenAIMessages(messages);
-            systemMessage = parsed.systemMessage;
-            if (parsed.messageContent) messageContent = parsed.messageContent;
+    function handleNonStreamingResponse(res, result, mappedModel) {
+        if (result.error) {
+            return res.status(500).json({ error: { message: result.error, type: 'server_error' } });
         }
 
-        if (!messageContent) {
-            logError('Request without message');
-            return res.status(400).json({ error: 'Message not specified' });
-        }
+        res.json({
+            id: result.id || 'chatcmpl-' + Date.now(),
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model: result.model || mappedModel,
+            choices: result.choices || [{ index: 0, message: { role: 'assistant', content: '' }, finish_reason: 'stop' }],
+            usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            chatId: result.chatId,
+            parentId: result.parentId
+        });
+    }
 
-        logInfo(`Received request: ${typeof messageContent === 'string' ? messageContent.substring(0, 50) + (messageContent.length > 50 ? '...' : '') : 'Composite message'}`);
-        if (systemMessage) {
-            logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
-        }
-        if (chatId && !isMeta) {
-            logInfo(`Using chatId: ${chatId}, parentId: ${parentId || 'null'}`);
-        } else if (isMeta) {
-            logDebug('OpenWebUI meta-request: using separate chat (no history link)');
-        }
-        if (allMessages && allMessages.length > 1) {
-            logInfo(`History contains ${allMessages.length} messages`);
-        }
+    // --- Routes -----------------------------------------------------------------
 
-        const resolvedModel = resolveRequestedModel(model, DEFAULT_MODEL);
-        if (!resolvedModel.model) {
-            logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model, reason: resolvedModel.reason, endpoint: '/api/chat' })}`);
-            return res.status(400).json({ error: { message: `Model "${model}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
-        }
-        const mappedModel = resolvedModel.model;
-        if (resolvedModel.requested && resolvedModel.requested !== mappedModel) {
-            logInfo(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/chat' })}`);
-        } else {
-            logDebug(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/chat' })}`);
-        }
-        logInfo(`Using model: ${mappedModel}`);
+    router.post('/chat', async (req, res) => {
+        try {
+            const { message, messages, model, chatId, parentId, stream, chatType, size, waitForCompletion } = req.body;
 
-        // Streaming support for OpenWebUI
-        if (stream) {
-            res.setHeader('Content-Type', 'text/event-stream');
-            res.setHeader('Cache-Control', 'no-cache');
-            res.setHeader('Connection', 'keep-alive');
-            // Important for OpenWebUI - do not buffer
-            res.setHeader('X-Accel-Buffering', 'no');
+            // Support both message and messages for compatibility
+            let messageContent = message;
+            let systemMessage = null;
+            let allMessages = messages; // Preserve full history
+            const isMeta = isOpenWebUiMetaRequest(messages);
 
-            const writeSse = (payload) => {
-                res.write('data: ' + JSON.stringify(payload) + '\n\n');
-            };
+            if (messages && Array.isArray(messages)) {
+                const parsed = parseOpenAIMessages(messages);
+                systemMessage = parsed.systemMessage;
+                if (parsed.messageContent) messageContent = parsed.messageContent;
+            }
 
-            try {
-                // Setup streaming callback
-                let streamingCallback = null;
-                let hasStreamedChunks = false;
-                if (stream) {
-                    streamingCallback = (chunk) => {
-                        hasStreamedChunks = true;
+            if (!messageContent) {
+                logError('Request without message');
+                return res.status(400).json({ error: 'Message not specified' });
+            }
+
+            logInfo(`Received request: ${typeof messageContent === 'string' ? messageContent.substring(0, 50) + (messageContent.length > 50 ? '...' : '') : 'Composite message'}`);
+            if (systemMessage) {
+                logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
+            }
+            if (chatId && !isMeta) {
+                logInfo(`Using chatId: ${chatId}, parentId: ${parentId || 'null'}`);
+            } else if (isMeta) {
+                logDebug('OpenWebUI meta-request: using separate chat (no history link)');
+            }
+            if (allMessages && allMessages.length > 1) {
+                logInfo(`History contains ${allMessages.length} messages`);
+            }
+
+            const resolvedModel = resolveRequestedModel(model, DEFAULT_MODEL);
+            if (!resolvedModel.model) {
+                logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model, reason: resolvedModel.reason, endpoint: '/api/chat' })}`);
+                return res.status(400).json({ error: { message: `Model "${model}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
+            }
+            const mappedModel = resolvedModel.model;
+            if (resolvedModel.requested && resolvedModel.requested !== mappedModel) {
+                logInfo(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/chat' })}`);
+            } else {
+                logDebug(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/chat' })}`);
+            }
+            logInfo(`Using model: ${mappedModel}`);
+
+            // Streaming support for OpenWebUI
+            if (stream) {
+                res.setHeader('Content-Type', 'text/event-stream');
+                res.setHeader('Cache-Control', 'no-cache');
+                res.setHeader('Connection', 'keep-alive');
+                // Important for OpenWebUI - do not buffer
+                res.setHeader('X-Accel-Buffering', 'no');
+
+                const writeSse = (payload) => {
+                    res.write('data: ' + JSON.stringify(payload) + '\n\n');
+                };
+
+                try {
+                    // Setup streaming callback
+                    let streamingCallback = null;
+                    let hasStreamedChunks = false;
+                    if (stream) {
+                        streamingCallback = (chunk) => {
+                            hasStreamedChunks = true;
+                            writeSse({
+                                id: 'chatcmpl-' + Date.now(),
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: mappedModel || DEFAULT_MODEL,
+                                choices: [
+                                    { index: 0, delta: { content: chunk }, finish_reason: null }
+                                ]
+                            });
+                        };
+                    }
+
+                    const result = await sendMessage(
+                        messageContent,
+                        mappedModel,
+                        isMeta ? null : chatId,
+                        isMeta ? null : parentId,
+                        null,
+                        null,
+                        null,
+                        systemMessage,
+                        't2t',
+                        null,
+                        true,
+                        0,
+                        streamingCallback,
+                        { ...reasoningOptions, onReasoning: reasoningCallback }
+                    );
+
+                    if (result.error) {
                         writeSse({
                             id: 'chatcmpl-' + Date.now(),
                             object: 'chat.completion.chunk',
                             created: Math.floor(Date.now() / 1000),
                             model: mappedModel || DEFAULT_MODEL,
                             choices: [
-                                { index: 0, delta: { content: chunk }, finish_reason: null }
+                                { index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: 'stop' }
                             ]
                         });
-                    };
-                }
+                    } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
+                        // Qwen returned JSON/normal response instead of SSE - send final as single chunk
+                        // When captureToolCalls is active, use cleanText (fence blocks stripped)
+                        // rather than raw content which includes the visible fence block.
+                        const content = captureToolCalls && _captureCleanText
+                            ? _captureCleanText
+                            : result.choices[0].message.content;
+                        logDebug(`JSON response content length: ${content.length}`);
+                        if (typeof streamingCallback === 'function') {
+                            streamingCallback(content);
+                        } else {
+                            writeSse({
+                                id: 'chatcmpl-stream',
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: mappedModel || DEFAULT_MODEL,
+                                choices: [
+                                    { index: 0, delta: { content }, finish_reason: null }
+                                ]
+                            });
+                        }
+                    } else {
+                        logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
+                    }
+                    // Chunks were already sent via streamingCallback, don't duplicate!
 
-                const result = await sendMessage(
-                    messageContent,
-                    mappedModel,
-                    isMeta ? null : chatId,
-                    isMeta ? null : parentId,
-                    null,
-                    null,
-                    null,
-                    systemMessage,
-                    't2t',
-                    null,
-                    true,
-                    0,
-                    streamingCallback,
-                    { ...reasoningOptions, onReasoning: reasoningCallback }
-                );
-
-                if (result.error) {
+                    // Final chunk
                     writeSse({
                         id: 'chatcmpl-' + Date.now(),
                         object: 'chat.completion.chunk',
                         created: Math.floor(Date.now() / 1000),
                         model: mappedModel || DEFAULT_MODEL,
                         choices: [
-                            { index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: 'stop' }
+                            { index: 0, delta: {}, finish_reason: 'stop' }
                         ]
                     });
-                } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
-                    // Qwen returned JSON/normal response instead of SSE - send final as single chunk
-                    const content = result.choices[0].message.content;
-                    logDebug(`JSON response content length: ${content.length}`);
-                    if (typeof streamingCallback === 'function') {
-                        streamingCallback(content);
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+                    return;
+                } catch (error) {
+                    logError('Error handling streaming request', error);
+                    writeSse({
+                        id: 'chatcmpl-stream',
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: mappedModel || DEFAULT_MODEL,
+                        choices: [
+                            { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
+                        ]
+                    });
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+                    return;
+                }
+            }
+
+            const result = await sendMessage(messageContent, mappedModel, isMeta ? null : chatId, isMeta ? null : parentId, null, null, null, systemMessage, chatType || 't2t', size || null, waitForCompletion ?? true);
+
+            if (result.choices && result.choices[0] && result.choices[0].message) {
+                const responseLength = result.choices[0].message.content ? result.choices[0].message.content.length : 0;
+                logInfo(`Response successfully formatted for request, response length: ${responseLength}`);
+
+                // Save chat history
+                if (result.chatId) {
+                    try {
+                        const currentChat = loadHistory(result.chatId);
+                        const updatedMessages = allMessages || [
+                            { role: 'user', content: messageContent },
+                            { role: 'assistant', content: result.choices[0].message.content }
+                        ];
+                        saveHistory(result.chatId, { ...currentChat, messages: updatedMessages });
+                    } catch (e) {
+                        logDebug(`Failed to save history: ${e.message}`);
+                    }
+                }
+            } else if (result.error) {
+                logInfo(`Received error in response: ${result.error}`);
+            }
+
+            res.json(result);
+        } catch (error) {
+            logError('Error processing request', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    router.get('/health', async (req, res) => {
+        try {
+            const modelData = getAllModels();
+            const tokens = listTokens();
+            const now = Date.now();
+            const availableAccounts = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid).length;
+
+            res.json({
+                ok: availableAccounts > 0,
+                service: 'FreeQwenApi',
+                watermark: FORGETMEAI_WATERMARK,
+                baseUrl: '/api',
+                models: modelData.models.length,
+                accounts: {
+                    total: tokens.length,
+                    available: availableAccounts,
+                    invalid: tokens.filter(t => t.invalid).length,
+                    waiting: tokens.filter(t => t.resetAt && new Date(t.resetAt).getTime() > now).length
+                },
+                timestamp: new Date().toISOString()
+            });
+        } catch (error) {
+            logError('Health check error', error);
+            res.status(500).json({ ok: false, error: 'Health check failed' });
+        }
+    });
+
+    router.get('/models', async (req, res) => {
+        try {
+            logInfo('Request for model list');
+            const modelsRaw = getAllModels();
+            const openAiModels = {
+                object: 'list',
+                data: modelsRaw.models.map(m => ({
+                    id: m.id || m.name || m,
+                    object: 'model',
+                    created: 0,
+                    owned_by: 'qwen',
+                    permission: []
+                }))
+            };
+            logInfo(`Returned ${openAiModels.data.length} models (OpenAI format)`);
+            res.json(openAiModels);
+        } catch (error) {
+            logError('Error getting model list', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    // Proxy for external media (images/videos/files from Qwen CDN).
+    // Required because fetch-blob from CDN side is blocked by CORS. Strict whitelist + SSRF-guard.
+    const DOWNLOAD_HOSTS = ['qwenlm.ai', 'aliyuncs.com', 'alicdn.com', 'aliyun.com'];
+    // URL validation for proxy: only https, no IP literals/localhost, hostname in whitelist
+    // of trusted Qwen/Aliyun CDN (domains are not controllable by arbitrary IPs - DNS-rebinding inapplicable).
+    function validateDownloadUrl(raw) {
+        let u;
+        try { u = new URL(String(raw)); } catch { return null; }
+        if (u.protocol !== 'https:') return null;
+        const host = u.hostname.toLowerCase();
+        if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':') || host === 'localhost') return null;
+        if (!DOWNLOAD_HOSTS.some(d => host === d || host.endsWith('.' + d))) return null;
+        return u;
+    }
+    router.get('/download', async (req, res) => {
+        const ctrl = new AbortController();
+        const timer = setTimeout(() => ctrl.abort(), 60_000);
+        try {
+            if (!req.query.url) { clearTimeout(timer); return res.status(400).json({ error: 'Parameter url is required' }); }
+            let u = validateDownloadUrl(req.query.url);
+            if (!u) { clearTimeout(timer); return res.status(403).json({ error: 'URL not allowed (only https and Qwen/Aliyun CDN domains)' }); }
+
+            // Redirects are not followed automatically - each hop is validated anew (protection against SSRF via redirect).
+            let upstream, hops = 0;
+            for (; ;) {
+                upstream = await fetch(u.toString(), { redirect: 'manual', signal: ctrl.signal });
+                if (upstream.status >= 300 && upstream.status < 400) {
+                    const loc = upstream.headers.get('location');
+                    let next = null;
+                    if (loc) { try { next = validateDownloadUrl(new URL(loc, u).toString()); } catch { next = null; } }
+                    if (!loc || ++hops > 3) { clearTimeout(timer); return res.status(502).json({ error: 'Too many redirects' }); }
+                    if (!next) { clearTimeout(timer); return res.status(403).json({ error: 'Redirect to disallowed address' }); }
+                    u = next; continue;
+                }
+                break;
+            }
+            if (!upstream.ok || !upstream.body) { clearTimeout(timer); return res.status(502).json({ error: `Upstream returned ${upstream.status}` }); }
+
+            const name = String(req.query.name || u.pathname.split('/').pop() || 'download')
+                .replace(/[^\w.\-]+/g, '_').slice(0, 120) || 'download';
+            res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
+            const ct = upstream.headers.get('content-type'); if (ct) res.setHeader('Content-Type', ct);
+            const len = upstream.headers.get('content-length'); if (len) res.setHeader('Content-Length', len);
+
+            const reader = upstream.body.getReader();
+            res.on('close', () => { reader.cancel().catch(() => { }); });
+            for (; ;) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                if (!res.write(Buffer.from(value))) await new Promise(r => res.once('drain', r));
+            }
+            clearTimeout(timer);
+            res.end();
+        } catch (error) {
+            clearTimeout(timer);
+            logError('Proxy streaming error', error);
+            if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
+            else try { res.end(); } catch { /* noop */ }
+        }
+    });
+
+    router.get('/status', async (req, res) => {
+        try {
+            logInfo('Auth status request');
+            const tokens = listTokens();
+            const accounts = await Promise.all(tokens.map(async t => {
+                const accInfo = { id: t.id, status: 'UNKNOWN', resetAt: t.resetAt || null };
+
+                if (t.resetAt) {
+                    const resetTime = new Date(t.resetAt).getTime();
+                    if (resetTime > Date.now()) { accInfo.status = 'WAIT'; return accInfo; }
+                }
+
+                const testResult = await testToken(t.token);
+                if (testResult === 'OK') { accInfo.status = 'OK'; if (t.invalid || t.resetAt) markValid(t.id); }
+                else if (testResult === 'RATELIMIT') { accInfo.status = 'WAIT'; markRateLimited(t.id, 24); }
+                else if (testResult === 'UNAUTHORIZED') { accInfo.status = 'INVALID'; if (!t.invalid) markInvalid(t.id); }
+                else { accInfo.status = 'ERROR'; }
+                return accInfo;
+            }));
+
+            const browserContext = getBrowserContext();
+            if (!browserContext) {
+                logError('Browser is not initialized');
+                return res.json({ authenticated: false, message: 'Browser is not initialized', accounts });
+            }
+
+            if (getAuthenticationStatus()) return res.json({ accounts });
+
+            await checkAuthentication(browserContext);
+            const isAuthenticated = getAuthenticationStatus();
+            logInfo(`Auth status: ${isAuthenticated ? 'active' : 'authentication required'}`);
+            res.json({ authenticated: isAuthenticated, message: isAuthenticated ? 'Authentication is active' : 'Authentication required', accounts });
+        } catch (error) {
+            logError('Error checking auth status', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    // --- Account management (for dashboard) -------------------------------------
+    // Account management is explicit (tokens), so it is available only from
+    // localhost - protection against LAN access (HOST=0.0.0.0 exposes to entire network).
+    function localOnly(req, res, next) {
+        const ip = req.socket?.remoteAddress || '';
+        if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return next();
+        logWarn(`Blocked non-local access to /accounts from ${ip}`);
+        return res.status(403).json({ error: 'Account management is available only from localhost' });
+    }
+
+    // CSRF protection for mutating requests: ACAO:* allows cross-origin calls,
+    // so we reject requests whose Origin does not match the server origin.
+    function sameOriginOnly(req, res, next) {
+        const origin = req.get('origin');
+        if (origin) {
+            // Browser extensions (the account-import popup) are user-installed and
+            // declare an explicit host permission for this server. A web page cannot
+            // forge a *-extension:// Origin, so these are trusted, not a CSRF vector.
+            if (/^(chrome-extension|moz-extension|safari-web-extension):\/\//i.test(origin)) return next();
+            try {
+                if (new URL(origin).host !== req.get('host')) {
+                    return res.status(403).json({ error: 'Cross-origin request denied' });
+                }
+            } catch {
+                return res.status(403).json({ error: 'Invalid Origin' });
+            }
+        }
+        return next();
+    }
+
+    router.get('/accounts', localOnly, sameOriginOnly, (req, res) => {
+        try {
+            const now = Date.now();
+            const accounts = listTokens().map(t => {
+                const info = decodeTokenInfo(t.token);
+                let status = 'OK';
+                if (t.invalid) status = 'INVALID';
+                else if (t.resetAt && new Date(t.resetAt).getTime() > now) status = 'WAIT';
+                else if (info.exp && info.exp < now) status = 'EXPIRED';
+                return {
+                    id: t.id,
+                    label: t.label || '',
+                    status,
+                    exp: info.exp,
+                    resetAt: t.resetAt || null,
+                    preview: String(t.token).slice(0, 10) + '…' + String(t.token).slice(-4)
+                };
+            });
+            res.json({ accounts });
+        } catch (error) {
+            logError('Error getting account list', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    router.post('/accounts', localOnly, sameOriginOnly, (req, res) => {
+        try {
+            const token = req.body?.token;
+            if (!token) return res.status(400).json({ error: 'Token not provided' });
+            const result = addTokenFromString(token, req.body?.label);
+            if (result.error) return res.status(400).json(result);
+            logInfo(`Added account via dashboard: ${result.id}`);
+            res.json({ ok: true, id: result.id });
+        } catch (error) {
+            logError('Error adding account', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    router.delete('/accounts/:id', localOnly, sameOriginOnly, (req, res) => {
+        try {
+            const result = deleteAccount(req.params.id);
+            if (result.error) return res.status(400).json(result);
+            logInfo(`Deleted account via dashboard: ${req.params.id}`);
+            res.json({ ok: true });
+        } catch (error) {
+            logError('Error deleting account', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    // Check validity of a single account (real request to Qwen).
+    // POST, because it mutates state (mark*); sameOriginOnly - CSRF protection.
+    router.post('/accounts/:id/check', localOnly, sameOriginOnly, async (req, res) => {
+        try {
+            const id = req.params.id;
+            if (!/^acc_[a-zA-Z0-9]+$/.test(id)) return res.status(400).json({ error: 'Invalid account id' });
+            const t = listTokens().find(x => x.id === id);
+            if (!t) return res.status(404).json({ error: 'Account not found' });
+            const info = decodeTokenInfo(t.token);
+            const r = await testToken(t.token);
+            let status = 'ERROR';
+            if (r === 'OK') { status = 'OK'; if (t.invalid || t.resetAt) markValid(t.id); }
+            else if (r === 'RATELIMIT') { status = 'WAIT'; markRateLimited(t.id, 24); }
+            else if (r === 'UNAUTHORIZED') { status = 'INVALID'; if (!t.invalid) markInvalid(t.id); }
+            const resetAt = status === 'WAIT' ? new Date(Date.now() + 24 * 3600 * 1000).toISOString() : (t.resetAt || null);
+            res.json({ id, status, exp: info.exp, resetAt });
+        } catch (error) {
+            logError('Error checking account', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    // Update account token (relogin manually from dashboard).
+    router.post('/accounts/:id/update', localOnly, sameOriginOnly, (req, res) => {
+        try {
+            const result = updateAccountToken(req.params.id, req.body?.token);
+            if (result.error) return res.status(400).json(result);
+            logInfo(`Updated account token via dashboard: ${req.params.id}`);
+            res.json(result);
+        } catch (error) {
+            logError('Error updating account token', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    // Set/change human-readable account label (for distinction in pool).
+    router.post('/accounts/:id/label', localOnly, sameOriginOnly, (req, res) => {
+        try {
+            const result = setLabel(req.params.id, req.body?.label);
+            if (result.error) return res.status(400).json(result);
+            logInfo(`Changed account label via dashboard: ${req.params.id}`);
+            res.json(result);
+        } catch (error) {
+            logError('Error changing account label', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    router.post('/chats', async (req, res) => {
+        try {
+            const { name, model } = req.body;
+            const resolvedModel = resolveRequestedModel(model, DEFAULT_MODEL);
+            if (!resolvedModel.model) {
+                logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model, reason: resolvedModel.reason, endpoint: '/api/chats' })}`);
+                return res.status(400).json({ error: { message: `Model "${model}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
+            }
+            const chatModel = resolvedModel.model;
+            logInfo(`Creating new chat${name ? ` with name: ${name}` : ''}, model: ${chatModel}`);
+            const result = await createChatV2(chatModel, name || 'New chat');
+            if (result.error) { logError(`Error creating chat: ${result.error}`); return res.status(500).json({ error: result.error }); }
+            logInfo(`Created new chat v2 with ID: ${result.chatId}`);
+            res.json({ chatId: result.chatId, success: true });
+        } catch (error) {
+            logError('Error creating chat', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    router.get('/chat/completions', (req, res) => {
+        res.status(405).json({
+            error: 'Method not supported',
+            message: 'Use POST /api/chat/completions'
+        });
+    });
+
+    router.post('/chat/completions', async (req, res) => {
+        try {
+            const { messages, model, stream, tools, functions, tool_choice, chatId } = req.body;
+            const reasoningOptions = reasoningOptionsFromEffort(req.body?.reasoning_effort);
+            if (reasoningOptions.reasoningMode) {
+                logInfo(`Reasoning effort '${reasoningOptions.reasoningEffort}' -> Qwen mode '${reasoningOptions.reasoningMode}'`);
+            }
+            const snakeCaseChatId = normalizeIdValue(req.body?.chat_id);
+            const explicitChatId = normalizeIdValue(chatId) || snakeCaseChatId;
+            const explicitParentId = extractParentHint(req);
+            const conversationHint = extractConversationHint(req);
+            const conversationScope = conversationHint ? `conversation:${conversationHint}` : null;
+            const forceNewChat = shouldForceNewChat(req);
+            logInfo(`Received OpenAI-compatible request ${stream ? ' (stream)' : ''}`);
+
+            if (!messages || !Array.isArray(messages) || messages.length === 0) {
+                logError('Request without messages');
+                return res.status(400).json({ error: 'Messages not specified' });
+            }
+
+            const isMeta = isOpenWebUiMetaRequest(messages);
+
+            // Use provided chatId OR restore from session
+            let effectiveChatId = explicitChatId;
+            let effectiveParentId = explicitParentId;
+
+            if (forceNewChat && !explicitChatId && !isMeta) {
+                effectiveChatId = `chat_${crypto.randomBytes(8).toString('hex')}`;
+                effectiveParentId = null;
+                logInfo(`Explicitly requested new chat (newChat/resetChat): ${effectiveChatId}`);
+            }
+
+            if (!effectiveChatId && !isMeta) {
+                if (conversationHint) {
+                    const scopedSession = forceNewChat ? null : getSavedChatId(req, conversationScope);
+                    if (scopedSession?.chatId) {
+                        effectiveChatId = scopedSession.chatId;
+                        if (!effectiveParentId && scopedSession.parentId) {
+                            effectiveParentId = scopedSession.parentId;
+                        }
+                        logInfo(`Restored scoped chatId from session: ${effectiveChatId}`);
                     } else {
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: { content }, finish_reason: null }
-                            ]
-                        });
+                        effectiveChatId = buildInternalChatIdFromHint(conversationHint);
+                        logInfo(`Using client conversation-id key: ${effectiveChatId}`);
+                    }
+                } else if (ALLOW_UNSCOPED_SESSION_CHAT_RESTORE) {
+                    const savedSession = forceNewChat ? null : getSavedChatId(req);
+                    if (savedSession?.chatId) {
+                        effectiveChatId = savedSession.chatId;
+                        if (!effectiveParentId && savedSession.parentId) {
+                            effectiveParentId = savedSession.parentId;
+                        }
+                        logInfo(`Restored chatId from session: ${effectiveChatId}`);
+                    }
+
+                    if (!effectiveChatId) {
+                        const generatedId = generateChatIdFromHistory(messages);
+                        if (generatedId) {
+                            effectiveChatId = generatedId;
+                            logInfo(`Created new chatId for session: ${effectiveChatId}`);
+                        }
                     }
                 } else {
-                    logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
+                    logDebug('chatId/conversation_id not provided, unscoped session fallback disabled');
                 }
-                // Chunks were already sent via streamingCallback, don't duplicate!
+            }
 
-                // Final chunk
-                writeSse({
-                    id: 'chatcmpl-' + Date.now(),
-                    object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000),
-                    model: mappedModel || DEFAULT_MODEL,
-                    choices: [
-                        { index: 0, delta: {}, finish_reason: 'stop' }
-                    ]
-                });
-                res.write('data: [DONE]\n\n');
-                res.end();
-                return;
-            } catch (error) {
-                logError('Error handling streaming request', error);
-                writeSse({
+            // Extract system message if present
+            const systemMsg = messages.find(msg => msg.role === 'system');
+            const systemMessage = systemMsg ? systemMsg.content : null;
+            const { combinedTools } = buildCombinedTools(tools, functions, tool_choice);
+
+            const hasTools = Array.isArray(combinedTools) && combinedTools.length > 0;
+
+            // When tools are present, fold the entire messages array (including system,
+            // history, tool calls/results) into one Qwen-readable prompt using the
+            // tool_call fence format that Qwen Web understands.  Qwen's web API does not
+            // natively parse OpenAI tool schemas, so we never send payload.tools to it.
+            let messageContent;
+            let files = [];
+            let promptSystemMessage = null; // system sent separately only when NO tools
+            if (hasTools) {
+                messageContent = messagesToQwenPrompt(messages, combinedTools, tool_choice);
+                logInfo('Tool-aware prompt built via messagesToQwenPrompt (tool_call fence format)');
+            } else {
+                const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
+                if (preparedInput.missingUser) {
+                    logError('No user messages in request');
+                    return res.status(400).json({ error: 'No user messages in request' });
+                }
+                messageContent = preparedInput.messageContent;
+                files = preparedInput.files || [];
+                if (preparedInput.folded) {
+                    logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
+                }
+                promptSystemMessage = systemMessage;
+
+                // Convert OpenAI format content array to internal format
+                if (Array.isArray(messageContent)) {
+                    messageContent = messageContent.map(item => {
+                        if (item.type === 'text') {
+                            return { type: 'text', text: item.text };
+                        } else if (item.type === 'image_url' && item.image_url) {
+                            return { type: 'image', image: item.image_url.url };
+                        } else if (item.type === 'image') {
+                            return { type: 'image', image: item.image };
+                        }
+                        return item;
+                    });
+                }
+            }
+
+            // qwenTools: only used for native-call collection when NOT using prompt-based tools
+            // When hasTools, tools are encoded in the prompt; Qwen Web cannot parse payload.tools
+            const qwenTools = null;
+
+            // When tools are present, the full system+tools+history is already in messageContent
+            // (built by messagesToQwenPrompt). Do not send a separate system message in that case.
+            const toolAwareSystemMessage = hasTools ? null : applyToolPrompt(promptSystemMessage, combinedTools);
+            if (toolAwareSystemMessage) {
+                logInfo(`System message (non-tool): ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
+            }
+
+            if (isMeta) {
+                effectiveChatId = null;
+                effectiveParentId = null;
+                logDebug('OpenWebUI meta-request: using separate chat (no history link)');
+            }
+
+            const resolvedModel = resolveRequestedModel(model, DEFAULT_MODEL);
+            if (!resolvedModel.model) {
+                logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model, reason: resolvedModel.reason, endpoint: '/api/chat/completions' })}`);
+                return res.status(400).json({ error: { message: `Model "${model}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
+            }
+            const mappedModel = resolvedModel.model;
+            if (resolvedModel.requested && resolvedModel.requested !== mappedModel) {
+                logInfo(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/chat/completions' })}`);
+            } else {
+                logDebug(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/chat/completions' })}`);
+            }
+            logInfo(`Using model: ${mappedModel}`);
+            if (systemMessage) logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
+
+            // Log full message history
+            logInfo(`History contains ${messages.length} messages: ${messages.map(m => m.role).join(', ')}`);
+            if (effectiveChatId) {
+                logInfo(`Using chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
+            }
+
+            if (stream) {
+                res.setHeader('Content-Type', 'text/event-stream');
+                res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+                res.setHeader('Pragma', 'no-cache');
+                res.setHeader('Expires', '0');
+                res.setHeader('Connection', 'keep-alive');
+                res.setHeader('X-Accel-Buffering', 'no');
+                res.setHeader('Transfer-Encoding', 'chunked');
+
+                const writeSse = (payload) => {
+                    res.write('data: ' + JSON.stringify(payload) + '\n\n');
+                };
+                const writeReasoningChunk = (text) => writeSse({
                     id: 'chatcmpl-stream',
                     object: 'chat.completion.chunk',
                     created: Math.floor(Date.now() / 1000),
                     model: mappedModel || DEFAULT_MODEL,
                     choices: [
-                        { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
+                        { index: 0, delta: { reasoning_content: text }, finish_reason: null }
                     ]
                 });
-                res.write('data: [DONE]\n\n');
-                res.end();
-                return;
-            }
-        }
 
-        const result = await sendMessage(messageContent, mappedModel, isMeta ? null : chatId, isMeta ? null : parentId, null, null, null, systemMessage, chatType || 't2t', size || null, waitForCompletion ?? true);
-
-        if (result.choices && result.choices[0] && result.choices[0].message) {
-            const responseLength = result.choices[0].message.content ? result.choices[0].message.content.length : 0;
-            logInfo(`Response successfully formatted for request, response length: ${responseLength}`);
-
-            // Save chat history
-            if (result.chatId) {
                 try {
-                    const currentChat = loadHistory(result.chatId);
-                    const updatedMessages = allMessages || [
-                        { role: 'user', content: messageContent },
-                        { role: 'assistant', content: result.choices[0].message.content }
-                    ];
-                    saveHistory(result.chatId, { ...currentChat, messages: updatedMessages });
-                } catch (e) {
-                    logDebug(`Failed to save history: ${e.message}`);
-                }
-            }
-        } else if (result.error) {
-            logInfo(`Received error in response: ${result.error}`);
-        }
+                    const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
 
-        res.json(result);
-    } catch (error) {
-        logError('Error processing request', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-router.get('/health', async (req, res) => {
-    try {
-        const modelData = getAllModels();
-        const tokens = listTokens();
-        const now = Date.now();
-        const availableAccounts = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid).length;
-
-        res.json({
-            ok: availableAccounts > 0,
-            service: 'FreeQwenApi',
-            watermark: FORGETMEAI_WATERMARK,
-            baseUrl: '/api',
-            models: modelData.models.length,
-            accounts: {
-                total: tokens.length,
-                available: availableAccounts,
-                invalid: tokens.filter(t => t.invalid).length,
-                waiting: tokens.filter(t => t.resetAt && new Date(t.resetAt).getTime() > now).length
-            },
-            timestamp: new Date().toISOString()
-        });
-    } catch (error) {
-        logError('Health check error', error);
-        res.status(500).json({ ok: false, error: 'Health check failed' });
-    }
-});
-
-router.get('/models', async (req, res) => {
-    try {
-        logInfo('Request for model list');
-        const modelsRaw = getAllModels();
-        const openAiModels = {
-            object: 'list',
-            data: modelsRaw.models.map(m => ({
-                id: m.id || m.name || m,
-                object: 'model',
-                created: 0,
-                owned_by: 'qwen',
-                permission: []
-            }))
-        };
-        logInfo(`Returned ${openAiModels.data.length} models (OpenAI format)`);
-        res.json(openAiModels);
-    } catch (error) {
-        logError('Error getting model list', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-// Proxy for external media (images/videos/files from Qwen CDN).
-// Required because fetch-blob from CDN side is blocked by CORS. Strict whitelist + SSRF-guard.
-const DOWNLOAD_HOSTS = ['qwenlm.ai', 'aliyuncs.com', 'alicdn.com', 'aliyun.com'];
-// URL validation for proxy: only https, no IP literals/localhost, hostname in whitelist
-// of trusted Qwen/Aliyun CDN (domains are not controllable by arbitrary IPs - DNS-rebinding inapplicable).
-function validateDownloadUrl(raw) {
-    let u;
-    try { u = new URL(String(raw)); } catch { return null; }
-    if (u.protocol !== 'https:') return null;
-    const host = u.hostname.toLowerCase();
-    if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(':') || host === 'localhost') return null;
-    if (!DOWNLOAD_HOSTS.some(d => host === d || host.endsWith('.' + d))) return null;
-    return u;
-}
-router.get('/download', async (req, res) => {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 60_000);
-    try {
-        if (!req.query.url) { clearTimeout(timer); return res.status(400).json({ error: 'Parameter url is required' }); }
-        let u = validateDownloadUrl(req.query.url);
-        if (!u) { clearTimeout(timer); return res.status(403).json({ error: 'URL not allowed (only https and Qwen/Aliyun CDN domains)' }); }
-
-        // Redirects are not followed automatically - each hop is validated anew (protection against SSRF via redirect).
-        let upstream, hops = 0;
-        for (; ;) {
-            upstream = await fetch(u.toString(), { redirect: 'manual', signal: ctrl.signal });
-            if (upstream.status >= 300 && upstream.status < 400) {
-                const loc = upstream.headers.get('location');
-                let next = null;
-                if (loc) { try { next = validateDownloadUrl(new URL(loc, u).toString()); } catch { next = null; } }
-                if (!loc || ++hops > 3) { clearTimeout(timer); return res.status(502).json({ error: 'Too many redirects' }); }
-                if (!next) { clearTimeout(timer); return res.status(403).json({ error: 'Redirect to disallowed address' }); }
-                u = next; continue;
-            }
-            break;
-        }
-        if (!upstream.ok || !upstream.body) { clearTimeout(timer); return res.status(502).json({ error: `Upstream returned ${upstream.status}` }); }
-
-        const name = String(req.query.name || u.pathname.split('/').pop() || 'download')
-            .replace(/[^\w.\-]+/g, '_').slice(0, 120) || 'download';
-        res.setHeader('Content-Disposition', `attachment; filename="${name}"`);
-        const ct = upstream.headers.get('content-type'); if (ct) res.setHeader('Content-Type', ct);
-        const len = upstream.headers.get('content-length'); if (len) res.setHeader('Content-Length', len);
-
-        const reader = upstream.body.getReader();
-        res.on('close', () => { reader.cancel().catch(() => { }); });
-        for (; ;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            if (!res.write(Buffer.from(value))) await new Promise(r => res.once('drain', r));
-        }
-        clearTimeout(timer);
-        res.end();
-    } catch (error) {
-        clearTimeout(timer);
-        logError('Proxy streaming error', error);
-        if (!res.headersSent) res.status(500).json({ error: 'Internal server error' });
-        else try { res.end(); } catch { /* noop */ }
-    }
-});
-
-router.get('/status', async (req, res) => {
-    try {
-        logInfo('Auth status request');
-        const tokens = listTokens();
-        const accounts = await Promise.all(tokens.map(async t => {
-            const accInfo = { id: t.id, status: 'UNKNOWN', resetAt: t.resetAt || null };
-
-            if (t.resetAt) {
-                const resetTime = new Date(t.resetAt).getTime();
-                if (resetTime > Date.now()) { accInfo.status = 'WAIT'; return accInfo; }
-            }
-
-            const testResult = await testToken(t.token);
-            if (testResult === 'OK') { accInfo.status = 'OK'; if (t.invalid || t.resetAt) markValid(t.id); }
-            else if (testResult === 'RATELIMIT') { accInfo.status = 'WAIT'; markRateLimited(t.id, 24); }
-            else if (testResult === 'UNAUTHORIZED') { accInfo.status = 'INVALID'; if (!t.invalid) markInvalid(t.id); }
-            else { accInfo.status = 'ERROR'; }
-            return accInfo;
-        }));
-
-        const browserContext = getBrowserContext();
-        if (!browserContext) {
-            logError('Browser is not initialized');
-            return res.json({ authenticated: false, message: 'Browser is not initialized', accounts });
-        }
-
-        if (getAuthenticationStatus()) return res.json({ accounts });
-
-        await checkAuthentication(browserContext);
-        const isAuthenticated = getAuthenticationStatus();
-        logInfo(`Auth status: ${isAuthenticated ? 'active' : 'authentication required'}`);
-        res.json({ authenticated: isAuthenticated, message: isAuthenticated ? 'Authentication is active' : 'Authentication required', accounts });
-    } catch (error) {
-        logError('Error checking auth status', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-// --- Account management (for dashboard) -------------------------------------
-// Account management is explicit (tokens), so it is available only from
-// localhost - protection against LAN access (HOST=0.0.0.0 exposes to entire network).
-function localOnly(req, res, next) {
-    const ip = req.socket?.remoteAddress || '';
-    if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return next();
-    logWarn(`Blocked non-local access to /accounts from ${ip}`);
-    return res.status(403).json({ error: 'Account management is available only from localhost' });
-}
-
-// CSRF protection for mutating requests: ACAO:* allows cross-origin calls,
-// so we reject requests whose Origin does not match the server origin.
-function sameOriginOnly(req, res, next) {
-    const origin = req.get('origin');
-    if (origin) {
-        // Browser extensions (the account-import popup) are user-installed and
-        // declare an explicit host permission for this server. A web page cannot
-        // forge a *-extension:// Origin, so these are trusted, not a CSRF vector.
-        if (/^(chrome-extension|moz-extension|safari-web-extension):\/\//i.test(origin)) return next();
-        try {
-            if (new URL(origin).host !== req.get('host')) {
-                return res.status(403).json({ error: 'Cross-origin request denied' });
-            }
-        } catch {
-            return res.status(403).json({ error: 'Invalid Origin' });
-        }
-    }
-    return next();
-}
-
-router.get('/accounts', localOnly, sameOriginOnly, (req, res) => {
-    try {
-        const now = Date.now();
-        const accounts = listTokens().map(t => {
-            const info = decodeTokenInfo(t.token);
-            let status = 'OK';
-            if (t.invalid) status = 'INVALID';
-            else if (t.resetAt && new Date(t.resetAt).getTime() > now) status = 'WAIT';
-            else if (info.exp && info.exp < now) status = 'EXPIRED';
-            return {
-                id: t.id,
-                label: t.label || '',
-                status,
-                exp: info.exp,
-                resetAt: t.resetAt || null,
-                preview: String(t.token).slice(0, 10) + '…' + String(t.token).slice(-4)
-            };
-        });
-        res.json({ accounts });
-    } catch (error) {
-        logError('Error getting account list', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-router.post('/accounts', localOnly, sameOriginOnly, (req, res) => {
-    try {
-        const token = req.body?.token;
-        if (!token) return res.status(400).json({ error: 'Token not provided' });
-        const result = addTokenFromString(token, req.body?.label);
-        if (result.error) return res.status(400).json(result);
-        logInfo(`Added account via dashboard: ${result.id}`);
-        res.json({ ok: true, id: result.id });
-    } catch (error) {
-        logError('Error adding account', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-router.delete('/accounts/:id', localOnly, sameOriginOnly, (req, res) => {
-    try {
-        const result = deleteAccount(req.params.id);
-        if (result.error) return res.status(400).json(result);
-        logInfo(`Deleted account via dashboard: ${req.params.id}`);
-        res.json({ ok: true });
-    } catch (error) {
-        logError('Error deleting account', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-// Check validity of a single account (real request to Qwen).
-// POST, because it mutates state (mark*); sameOriginOnly - CSRF protection.
-router.post('/accounts/:id/check', localOnly, sameOriginOnly, async (req, res) => {
-    try {
-        const id = req.params.id;
-        if (!/^acc_[a-zA-Z0-9]+$/.test(id)) return res.status(400).json({ error: 'Invalid account id' });
-        const t = listTokens().find(x => x.id === id);
-        if (!t) return res.status(404).json({ error: 'Account not found' });
-        const info = decodeTokenInfo(t.token);
-        const r = await testToken(t.token);
-        let status = 'ERROR';
-        if (r === 'OK') { status = 'OK'; if (t.invalid || t.resetAt) markValid(t.id); }
-        else if (r === 'RATELIMIT') { status = 'WAIT'; markRateLimited(t.id, 24); }
-        else if (r === 'UNAUTHORIZED') { status = 'INVALID'; if (!t.invalid) markInvalid(t.id); }
-        const resetAt = status === 'WAIT' ? new Date(Date.now() + 24 * 3600 * 1000).toISOString() : (t.resetAt || null);
-        res.json({ id, status, exp: info.exp, resetAt });
-    } catch (error) {
-        logError('Error checking account', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-// Update account token (relogin manually from dashboard).
-router.post('/accounts/:id/update', localOnly, sameOriginOnly, (req, res) => {
-    try {
-        const result = updateAccountToken(req.params.id, req.body?.token);
-        if (result.error) return res.status(400).json(result);
-        logInfo(`Updated account token via dashboard: ${req.params.id}`);
-        res.json(result);
-    } catch (error) {
-        logError('Error updating account token', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-// Set/change human-readable account label (for distinction in pool).
-router.post('/accounts/:id/label', localOnly, sameOriginOnly, (req, res) => {
-    try {
-        const result = setLabel(req.params.id, req.body?.label);
-        if (result.error) return res.status(400).json(result);
-        logInfo(`Changed account label via dashboard: ${req.params.id}`);
-        res.json(result);
-    } catch (error) {
-        logError('Error changing account label', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-router.post('/chats', async (req, res) => {
-    try {
-        const { name, model } = req.body;
-        const resolvedModel = resolveRequestedModel(model, DEFAULT_MODEL);
-        if (!resolvedModel.model) {
-            logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model, reason: resolvedModel.reason, endpoint: '/api/chats' })}`);
-            return res.status(400).json({ error: { message: `Model "${model}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
-        }
-        const chatModel = resolvedModel.model;
-        logInfo(`Creating new chat${name ? ` with name: ${name}` : ''}, model: ${chatModel}`);
-        const result = await createChatV2(chatModel, name || 'New chat');
-        if (result.error) { logError(`Error creating chat: ${result.error}`); return res.status(500).json({ error: result.error }); }
-        logInfo(`Created new chat v2 with ID: ${result.chatId}`);
-        res.json({ chatId: result.chatId, success: true });
-    } catch (error) {
-        logError('Error creating chat', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-router.get('/chat/completions', (req, res) => {
-    res.status(405).json({
-        error: 'Method not supported',
-        message: 'Use POST /api/chat/completions'
-    });
-});
-
-router.post('/chat/completions', async (req, res) => {
-    try {
-        const { messages, model, stream, tools, functions, tool_choice, chatId } = req.body;
-        const reasoningOptions = reasoningOptionsFromEffort(req.body?.reasoning_effort);
-        if (reasoningOptions.reasoningMode) {
-            logInfo(`Reasoning effort '${reasoningOptions.reasoningEffort}' -> Qwen mode '${reasoningOptions.reasoningMode}'`);
-        }
-        const snakeCaseChatId = normalizeIdValue(req.body?.chat_id);
-        const explicitChatId = normalizeIdValue(chatId) || snakeCaseChatId;
-        const explicitParentId = extractParentHint(req);
-        const conversationHint = extractConversationHint(req);
-        const conversationScope = conversationHint ? `conversation:${conversationHint}` : null;
-        const forceNewChat = shouldForceNewChat(req);
-        logInfo(`Received OpenAI-compatible request ${stream ? ' (stream)' : ''}`);
-
-        if (!messages || !Array.isArray(messages) || messages.length === 0) {
-            logError('Request without messages');
-            return res.status(400).json({ error: 'Messages not specified' });
-        }
-
-        const isMeta = isOpenWebUiMetaRequest(messages);
-
-        // Use provided chatId OR restore from session
-        let effectiveChatId = explicitChatId;
-        let effectiveParentId = explicitParentId;
-
-        if (forceNewChat && !explicitChatId && !isMeta) {
-            effectiveChatId = `chat_${crypto.randomBytes(8).toString('hex')}`;
-            effectiveParentId = null;
-            logInfo(`Explicitly requested new chat (newChat/resetChat): ${effectiveChatId}`);
-        }
-
-        if (!effectiveChatId && !isMeta) {
-            if (conversationHint) {
-                const scopedSession = forceNewChat ? null : getSavedChatId(req, conversationScope);
-                if (scopedSession?.chatId) {
-                    effectiveChatId = scopedSession.chatId;
-                    if (!effectiveParentId && scopedSession.parentId) {
-                        effectiveParentId = scopedSession.parentId;
-                    }
-                    logInfo(`Restored scoped chatId from session: ${effectiveChatId}`);
-                } else {
-                    effectiveChatId = buildInternalChatIdFromHint(conversationHint);
-                    logInfo(`Using client conversation-id key: ${effectiveChatId}`);
-                }
-            } else if (ALLOW_UNSCOPED_SESSION_CHAT_RESTORE) {
-                const savedSession = forceNewChat ? null : getSavedChatId(req);
-                if (savedSession?.chatId) {
-                    effectiveChatId = savedSession.chatId;
-                    if (!effectiveParentId && savedSession.parentId) {
-                        effectiveParentId = savedSession.parentId;
-                    }
-                    logInfo(`Restored chatId from session: ${effectiveChatId}`);
-                }
-
-                if (!effectiveChatId) {
-                    const generatedId = generateChatIdFromHistory(messages);
-                    if (generatedId) {
-                        effectiveChatId = generatedId;
-                        logInfo(`Created new chatId for session: ${effectiveChatId}`);
-                    }
-                }
-            } else {
-                logDebug('chatId/conversation_id not provided, unscoped session fallback disabled');
-            }
-        }
-
-        // Extract system message if present
-        const systemMsg = messages.find(msg => msg.role === 'system');
-        const systemMessage = systemMsg ? systemMsg.content : null;
-        const { combinedTools } = buildCombinedTools(tools, functions, tool_choice);
-
-        const hasTools = Array.isArray(combinedTools) && combinedTools.length > 0;
-
-        // When tools are present, fold the entire messages array (including system,
-        // history, tool calls/results) into one Qwen-readable prompt using the
-        // tool_call fence format that Qwen Web understands.  Qwen's web API does not
-        // natively parse OpenAI tool schemas, so we never send payload.tools to it.
-        let messageContent;
-        let files = [];
-        let promptSystemMessage = null; // system sent separately only when NO tools
-        if (hasTools) {
-            messageContent = messagesToQwenPrompt(messages, combinedTools, tool_choice);
-            logInfo('Tool-aware prompt built via messagesToQwenPrompt (tool_call fence format)');
-        } else {
-            const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
-            if (preparedInput.missingUser) {
-                logError('No user messages in request');
-                return res.status(400).json({ error: 'No user messages in request' });
-            }
-            messageContent = preparedInput.messageContent;
-            files = preparedInput.files || [];
-            if (preparedInput.folded) {
-                logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
-            }
-            promptSystemMessage = systemMessage;
-
-                // Convert OpenAI format content array to internal format
-                if (Array.isArray(messageContent)) {
-                    messageContent = messageContent.map(item => {
-                        if (item.type === 'text') {
-                            return { type: 'text', text: item.text };
-                        } else if (item.type === 'image_url' && item.image_url) {
-                            return { type: 'image', image: item.image_url.url };
-                        } else if (item.type === 'image') {
-                            return { type: 'image', image: item.image };
-                        }
-                        return item;
-                    });
-                }
-            }
-
-                // qwenTools: only used for native-call collection when NOT using prompt-based tools
-                // When hasTools, tools are encoded in the prompt; Qwen Web cannot parse payload.tools
-                const qwenTools = null;
-
-                // When tools are present, the full system+tools+history is already in messageContent
-                // (built by messagesToQwenPrompt). Do not send a separate system message in that case.
-                const toolAwareSystemMessage = hasTools ? null : applyToolPrompt(promptSystemMessage, combinedTools);
-                if (toolAwareSystemMessage) {
-                    logInfo(`System message (non-tool): ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
-                }
-
-                if (isMeta) {
-                    effectiveChatId = null;
-                    effectiveParentId = null;
-                    logDebug('OpenWebUI meta-request: using separate chat (no history link)');
-                }
-
-                const resolvedModel = resolveRequestedModel(model, DEFAULT_MODEL);
-                if (!resolvedModel.model) {
-                    logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model, reason: resolvedModel.reason, endpoint: '/api/chat/completions' })}`);
-                    return res.status(400).json({ error: { message: `Model "${model}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
-                }
-                const mappedModel = resolvedModel.model;
-                if (resolvedModel.requested && resolvedModel.requested !== mappedModel) {
-                    logInfo(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/chat/completions' })}`);
-                } else {
-                    logDebug(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/chat/completions' })}`);
-                }
-                logInfo(`Using model: ${mappedModel}`);
-                if (systemMessage) logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
-
-                // Log full message history
-                logInfo(`History contains ${messages.length} messages: ${messages.map(m => m.role).join(', ')}`);
-                if (effectiveChatId) {
-                    logInfo(`Using chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
-                }
-
-                if (stream) {
-                    res.setHeader('Content-Type', 'text/event-stream');
-                    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-                    res.setHeader('Pragma', 'no-cache');
-                    res.setHeader('Expires', '0');
-                    res.setHeader('Connection', 'keep-alive');
-                    res.setHeader('X-Accel-Buffering', 'no');
-                    res.setHeader('Transfer-Encoding', 'chunked');
-
-                    const writeSse = (payload) => {
-                        res.write('data: ' + JSON.stringify(payload) + '\n\n');
+                    let hasStreamedReasoning = false;
+                    const reasoningCallback = (text) => {
+                        hasStreamedReasoning = true;
+                        writeReasoningChunk(text);
                     };
-                    const writeReasoningChunk = (text) => writeSse({
-                        id: 'chatcmpl-stream',
-                        object: 'chat.completion.chunk',
-                        created: Math.floor(Date.now() / 1000),
-                        model: mappedModel || DEFAULT_MODEL,
-                        choices: [
-                            { index: 0, delta: { reasoning_content: text }, finish_reason: null }
-                        ]
-                    });
 
-                    try {
-                        const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-
-                        let hasStreamedReasoning = false;
-                        const reasoningCallback = (text) => {
-                            hasStreamedReasoning = true;
-                            writeReasoningChunk(text);
-                        };
-
-                        // Setup streaming callback if stream=true
-                        let streamingCallback = null;
-                        let hasStreamedChunks = false;
-                        const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0;
-                        if (stream && !captureToolCalls) {
-                            streamingCallback = (chunk) => {
-                                hasStreamedChunks = true;
-                                writeSse({
-                                    id: 'chatcmpl-stream',
-                                    object: 'chat.completion.chunk',
-                                    created: Math.floor(Date.now() / 1000),
-                                    model: mappedModel || DEFAULT_MODEL,
-                                    choices: [
-                                        { index: 0, delta: { content: chunk }, finish_reason: null }
-                                    ]
-                                });
-                            };
-                        }
-
-                        const result = await sendMessage(
-                            messageContent,
-                            mappedModel,
-                            qwenChatId,
-                            effectiveParentId,
-                            files, // SUPPORT FILES
-                            qwenTools,
-                            tool_choice,
-                            toolAwareSystemMessage,
-                            't2t',
-                            null,
-                            true,
-                            0,
-                            streamingCallback,
-                            { ...reasoningOptions, onReasoning: reasoningCallback }
-                        );
-
-                        // Cleanup chat by configured policy (default all).
-                        cleanupEphemeralChat(result, { explicitChatId, effectiveChatId, isMeta, model: mappedModel });
-
-                        if (captureToolCalls) {
-                            const { calls: toolCalls, dropped } = resolveToolCalls(result, combinedTools);
-                            if (toolCalls.length > 0) {
-                                if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
-                                writeToolCallsSse(res, mappedModel, result, toolCalls);
-                                return;
-                            }
-                            if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
-                        }
-                        if (!hasStreamedReasoning && result?.choices?.[0]?.message?.reasoning_content) {
-                            writeReasoningChunk(result.choices[0].message.reasoning_content);
-                            hasStreamedReasoning = true;
-                        }
-
-                        // Save chatId to session for subsequent requests
-                        if (!isMeta && result.chatId) {
-                            // If we used a generated effectiveChatId - save the mapping
-                            if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
-                                mapChatId(effectiveChatId, result.chatId);
-                                logDebug(`Mapping saved: ${effectiveChatId} -> ${result.chatId}`);
-                            }
-                            if (shouldPersistSessionContext(conversationScope)) {
-                                saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
-                            }
-                        }
-
-                        if (result.error) {
+                    // Setup streaming callback if stream=true
+                    let streamingCallback = null;
+                    let hasStreamedChunks = false;
+                    const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0;
+                    if (stream && !captureToolCalls) {
+                        streamingCallback = (chunk) => {
+                            hasStreamedChunks = true;
                             writeSse({
                                 id: 'chatcmpl-stream',
                                 object: 'chat.completion.chunk',
                                 created: Math.floor(Date.now() / 1000),
                                 model: mappedModel || DEFAULT_MODEL,
                                 choices: [
-                                    { index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: null }
+                                    { index: 0, delta: { content: chunk }, finish_reason: null }
                                 ]
                             });
-                        } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
-                            // Qwen returned JSON/normal response instead of SSE - send final as single chunk
-                            const content = result.choices[0].message.content;
-                            logDebug(`JSON response content length: ${content.length}`);
-                            if (typeof streamingCallback === 'function') {
-                                streamingCallback(content);
-                            } else {
-                                writeSse({
-                                    id: 'chatcmpl-stream',
-                                    object: 'chat.completion.chunk',
-                                    created: Math.floor(Date.now() / 1000),
-                                    model: mappedModel || DEFAULT_MODEL,
-                                    choices: [
-                                        { index: 0, delta: { content }, finish_reason: null }
-                                    ]
-                                });
-                            }
-                        } else {
-                            logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
-                        }
-                        // Chunks were already sent via streamingCallback, don't duplicate!
-
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: {}, finish_reason: 'stop' }
-                            ]
-                        });
-                        res.write('data: [DONE]\n\n');
-                        res.end();
-
-                    } catch (error) {
-                        logError('Error handling streaming request', error);
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
-                            ]
-                        });
-                        res.write('data: [DONE]\n\n');
-                        res.end();
+                        };
                     }
-                } else {
-                    const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-                    const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, reasoningOptions);
+
+                    const result = await sendMessage(
+                        messageContent,
+                        mappedModel,
+                        qwenChatId,
+                        effectiveParentId,
+                        files, // SUPPORT FILES
+                        qwenTools,
+                        tool_choice,
+                        toolAwareSystemMessage,
+                        't2t',
+                        null,
+                        true,
+                        0,
+                        streamingCallback,
+                        { ...reasoningOptions, onReasoning: reasoningCallback }
+                    );
 
                     // Cleanup chat by configured policy (default all).
                     cleanupEphemeralChat(result, { explicitChatId, effectiveChatId, isMeta, model: mappedModel });
 
-                    // Save chatId to session for subsequent requests
-                    if (!isMeta && result.chatId) {
-                        if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
-                            mapChatId(effectiveChatId, result.chatId);
-                            logDebug(`Mapping saved: ${effectiveChatId} -> ${result.chatId}`);
+                    let _captureCleanText = '';
+                    if (captureToolCalls) {
+                        const { calls: toolCalls, dropped, cleanText } = resolveToolCalls(result, combinedTools);
+                        _captureCleanText = cleanText;
+                        if (toolCalls.length > 0) {
+                            if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
+                            const reasoning = result?.choices?.[0]?.message?.reasoning_content || '';
+                            writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText, reasoning);
+                            return;
                         }
-                        if (shouldPersistSessionContext(conversationScope)) {
-                            saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
-                        }
+                        if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
                     }
-
-                    if (result.error) {
-                        return res.status(500).json({
-                            error: { message: result.error, type: "server_error" }
-                        });
+                    if (!hasStreamedReasoning && result?.choices?.[0]?.message?.reasoning_content) {
+                        writeReasoningChunk(result.choices[0].message.reasoning_content);
+                        hasStreamedReasoning = true;
                     }
-
-                    const { calls: toolCalls, dropped } = resolveToolCalls(result, combinedTools);
-                    if (toolCalls.length > 0) {
-                        if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
-                        return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
-                    }
-                    if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
-
-                    const openaiResponse = {
-                        id: result.id || "chatcmpl-" + Date.now(),
-                        object: "chat.completion",
-                        created: Math.floor(Date.now() / 1000),
-                        model: result.model || mappedModel || DEFAULT_MODEL,
-                        choices: result.choices || [{
-                            index: 0,
-                            message: {
-                                role: "assistant",
-                                content: result.choices?.[0]?.message?.content || "",
-                                ...(result.choices?.[0]?.message?.reasoning_content ? { reasoning_content: result.choices[0].message.reasoning_content } : {})
-                            },
-                            finish_reason: "stop"
-                        }],
-                        usage: result.usage || {
-                            prompt_tokens: 0,
-                            completion_tokens: 0,
-                            total_tokens: 0
-                        },
-                        chatId: result.chatId,
-                        parentId: result.parentId
-                    };
-
-                    // Save chat history
-                    if (result.chatId) {
-                        try {
-                            const currentChat = loadHistory(result.chatId);
-                            const responseMessage = {
-                                role: 'assistant',
-                                content: openaiResponse.choices[0].message.content
-                            };
-                            const updatedMessages = messages.concat([responseMessage]);
-                            saveHistory(result.chatId, { ...currentChat, messages: updatedMessages });
-                        } catch (e) {
-                            logDebug(`Failed to save history: ${e.message}`);
-                        }
-                    }
-
-                    res.json(openaiResponse);
-                }
-            } catch (error) {
-                logError('Error processing request', error);
-                res.status(500).json({ error: { message: 'Internal server error', type: "server_error" } });
-            }
-        });
-
-// OpenAI-compatible v1 endpoint (for Open WebUI and other clients)
-router.post('/v1/chat/completions', async (req, res) => {
-    try {
-        const { messages, model, stream, tools, functions, tool_choice, chatId } = req.body;
-        const reasoningOptions = reasoningOptionsFromEffort(req.body?.reasoning_effort);
-        if (reasoningOptions.reasoningMode) {
-            logInfo(`Reasoning effort '${reasoningOptions.reasoningEffort}' -> Qwen mode '${reasoningOptions.reasoningMode}'`);
-        }
-        const snakeCaseChatId = normalizeIdValue(req.body?.chat_id);
-        const explicitChatId = normalizeIdValue(chatId) || snakeCaseChatId;
-        const explicitParentId = extractParentHint(req);
-        const conversationHint = extractConversationHint(req);
-        const conversationScope = conversationHint ? `conversation:${conversationHint}` : null;
-        const forceNewChat = shouldForceNewChat(req);
-
-        logInfo(`Received OpenAI v1 request ${stream ? ' (stream)' : ''}`);
-
-        if (!messages || !Array.isArray(messages) || messages.length === 0) {
-            logError('Request without messages');
-            return res.status(400).json({ error: 'Messages not specified' });
-        }
-
-        const isMeta = isOpenWebUiMetaRequest(messages);
-
-        // Use provided chatId OR restore from session
-        let effectiveChatId = explicitChatId;
-        let effectiveParentId = explicitParentId;
-
-        if (forceNewChat && !explicitChatId && !isMeta) {
-            effectiveChatId = `chat_${crypto.randomBytes(8).toString('hex')}`;
-            effectiveParentId = null;
-            logInfo(`Explicitly requested new chat (newChat/resetChat): ${effectiveChatId}`);
-        }
-
-        if (!effectiveChatId && !isMeta) {
-            if (conversationHint) {
-                const scopedSession = forceNewChat ? null : getSavedChatId(req, conversationScope);
-                if (scopedSession?.chatId) {
-                    effectiveChatId = scopedSession.chatId;
-                    if (!effectiveParentId && scopedSession.parentId) {
-                        effectiveParentId = scopedSession.parentId;
-                    }
-                    logInfo(`Restored scoped chatId from session: ${effectiveChatId}`);
-                } else {
-                    effectiveChatId = buildInternalChatIdFromHint(conversationHint);
-                    logInfo(`Using client conversation-id key: ${effectiveChatId}`);
-                }
-            } else if (ALLOW_UNSCOPED_SESSION_CHAT_RESTORE) {
-                const savedSession = forceNewChat ? null : getSavedChatId(req);
-                if (savedSession?.chatId) {
-                    effectiveChatId = savedSession.chatId;
-                    if (!effectiveParentId && savedSession.parentId) {
-                        effectiveParentId = savedSession.parentId;
-                    }
-                    logInfo(`Restored chatId from session: ${effectiveChatId}`);
-                }
-
-                if (!effectiveChatId) {
-                    const generatedId = generateChatIdFromHistory(messages);
-                    if (generatedId) {
-                        effectiveChatId = generatedId;
-                        logInfo(`Created new chatId for session: ${effectiveChatId}`);
-                    }
-                }
-            } else {
-                logDebug('chatId/conversation_id not provided, unscoped session fallback disabled');
-            }
-        }
-
-        // Extract system message if present
-        const systemMsg = messages.find(msg => msg.role === 'system');
-        const systemMessage = systemMsg ? systemMsg.content : null;
-        const { combinedTools } = buildCombinedTools(tools, functions, tool_choice);
-
-        const hasTools = Array.isArray(combinedTools) && combinedTools.length > 0;
-
-        // When tools are present, fold the entire messages array (including system,
-        // history, tool calls/results) into one Qwen-readable prompt using the
-        // tool_call fence format that Qwen Web understands.  Qwen's web API does not
-        // natively parse OpenAI tool schemas, so we never send payload.tools to it.
-        let messageContent;
-        let files = [];
-        let promptSystemMessage = null; // system sent separately only when NO tools
-        if (hasTools) {
-            messageContent = messagesToQwenPrompt(messages, combinedTools, tool_choice);
-            logInfo('Tool-aware prompt built via messagesToQwenPrompt (tool_call fence format)');
-        } else {
-            const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
-            if (preparedInput.missingUser) {
-                logError('No user messages in request');
-                return res.status(400).json({ error: 'No user messages in request' });
-            }
-            messageContent = preparedInput.messageContent;
-            files = preparedInput.files || [];
-            if (preparedInput.folded) {
-                logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
-            }
-            promptSystemMessage = systemMessage;
-
-                // Convert OpenAI format content array to internal format
-                if (Array.isArray(messageContent)) {
-                    messageContent = messageContent.map(item => {
-                        if (item.type === 'text') {
-                            return { type: 'text', text: item.text };
-                        } else if (item.type === 'image_url' && item.image_url) {
-                            return { type: 'image', image: item.image_url.url };
-                        } else if (item.type === 'image') {
-                            return { type: 'image', image: item.image };
-                        }
-                        return item;
-                    });
-                }
-            }
-
-                // qwenTools: only used for native-call collection when NOT using prompt-based tools
-                // When hasTools, tools are encoded in the prompt; Qwen Web cannot parse payload.tools
-                const qwenTools = null;
-
-                // When tools are present, the full system+tools+history is already in messageContent
-                // (built by messagesToQwenPrompt). Do not send a separate system message in that case.
-                const toolAwareSystemMessage = hasTools ? null : applyToolPrompt(promptSystemMessage, combinedTools);
-                if (toolAwareSystemMessage) {
-                    logInfo(`System message (non-tool): ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
-                }
-
-                if (isMeta) {
-                    effectiveChatId = null;
-                    effectiveParentId = null;
-                    logDebug('OpenWebUI meta-request: using separate chat (no history link)');
-                }
-
-                const resolvedModel = resolveRequestedModel(model, DEFAULT_MODEL);
-                if (!resolvedModel.model) {
-                    logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model, reason: resolvedModel.reason, endpoint: '/api/v1/chat/completions' })}`);
-                    return res.status(400).json({ error: { message: `Model "${model}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
-                }
-                const mappedModel = resolvedModel.model;
-                if (resolvedModel.requested && resolvedModel.requested !== mappedModel) {
-                    logInfo(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/v1/chat/completions' })}`);
-                } else {
-                    logDebug(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/v1/chat/completions' })}`);
-                }
-                logInfo(`Using model: ${mappedModel}`);
-
-                if (systemMessage) {
-                    logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
-                }
-
-                // Log full message history
-                logInfo(`History contains ${messages.length} messages: ${messages.map(m => m.role).join(', ')}`);
-                if (effectiveChatId) {
-                    logInfo(`Using chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
-                }
-
-                if (stream) {
-                    res.setHeader('Content-Type', 'text/event-stream');
-                    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-                    res.setHeader('Pragma', 'no-cache');
-                    res.setHeader('Expires', '0');
-                    res.setHeader('Connection', 'keep-alive');
-                    res.setHeader('X-Accel-Buffering', 'no');
-                    res.setHeader('Transfer-Encoding', 'chunked');
-
-                    const writeSse = (payload) => {
-                        res.write('data: ' + JSON.stringify(payload) + '\n\n');
-                    };
-                    const writeReasoningChunk = (text) => writeSse({
-                        id: 'chatcmpl-stream',
-                        object: 'chat.completion.chunk',
-                        created: Math.floor(Date.now() / 1000),
-                        model: mappedModel || DEFAULT_MODEL,
-                        choices: [
-                            { index: 0, delta: { reasoning_content: text }, finish_reason: null }
-                        ]
-                    });
-
-                    try {
-                        const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-
-                        let hasStreamedReasoning = false;
-                        const reasoningCallback = (text) => {
-                            hasStreamedReasoning = true;
-                            writeReasoningChunk(text);
-                        };
-
-                        // Setup streaming callback if stream=true
-                        let streamingCallback = null;
-                        let hasStreamedChunks = false;
-                        const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0;
-                        if (stream && !captureToolCalls) {
-                            streamingCallback = (chunk) => {
-                                hasStreamedChunks = true;
-                                // OpenWebUI does not expect role in chunks - only content
-                                writeSse({
-                                    id: 'chatcmpl-' + Date.now(),
-                                    object: 'chat.completion.chunk',
-                                    created: Math.floor(Date.now() / 1000),
-                                    model: mappedModel || DEFAULT_MODEL,
-                                    choices: [
-                                        { index: 0, delta: { content: chunk }, finish_reason: null }
-                                    ]
-                                });
-                            };
-                        }
-
-                        const result = await sendMessage(
-                            messageContent,
-                            mappedModel,
-                            qwenChatId,
-                            effectiveParentId,
-                            files, // SUPPORT FILES
-                            qwenTools,
-                            tool_choice,
-                            toolAwareSystemMessage,
-                            't2t',
-                            null,
-                            true,
-                            0,
-                            streamingCallback,
-                            { ...reasoningOptions, onReasoning: reasoningCallback }
-                        );
-
-                        if (captureToolCalls) {
-                            const { calls: toolCalls, dropped } = resolveToolCalls(result, combinedTools);
-                            if (toolCalls.length > 0) {
-                                if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
-                                writeToolCallsSse(res, mappedModel, result, toolCalls);
-                                return;
-                            }
-                            if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
-                        }
-                        if (!hasStreamedReasoning && result?.choices?.[0]?.message?.reasoning_content) {
-                            writeReasoningChunk(result.choices[0].message.reasoning_content);
-                            hasStreamedReasoning = true;
-                        }
-
-                        // Save chatId to session for subsequent requests
-                        if (!isMeta && result.chatId) {
-                            if (shouldPersistSessionContext(conversationScope)) {
-                                saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
-                            }
-                        }
-
-                        if (result.error) {
-                            writeSse({
-                                id: 'chatcmpl-stream',
-                                object: 'chat.completion.chunk',
-                                created: Math.floor(Date.now() / 1000),
-                                model: mappedModel || DEFAULT_MODEL,
-                                choices: [
-                                    { index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: 'stop' }
-                                ]
-                            });
-                        } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
-                            // Qwen returned JSON/normal response instead of SSE - send final as single chunk
-                            const content = result.choices[0].message.content;
-                            logDebug(`JSON response content length: ${content.length}`);
-                            if (typeof streamingCallback === 'function') {
-                                streamingCallback(content);
-                            } else {
-                                writeSse({
-                                    id: 'chatcmpl-stream',
-                                    object: 'chat.completion.chunk',
-                                    created: Math.floor(Date.now() / 1000),
-                                    model: mappedModel || DEFAULT_MODEL,
-                                    choices: [
-                                        { index: 0, delta: { content }, finish_reason: null }
-                                    ]
-                                });
-                            }
-                        } else {
-                            logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
-                        }
-                        // Chunks were already sent via streamingCallback, don't duplicate!
-
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: {}, finish_reason: 'stop' }
-                            ]
-                        });
-                        res.write('data: [DONE]\n\n');
-                        res.end();
-
-                    } catch (error) {
-                        logError('Error handling streaming request', error);
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
-                            ]
-                        });
-                        res.write('data: [DONE]\n\n');
-                        res.end();
-                    }
-                } else {
-                    const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-
-                    const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, reasoningOptions);
 
                     // Save chatId to session for subsequent requests
                     if (!isMeta && result.chatId) {
@@ -2011,497 +1595,963 @@ router.post('/v1/chat/completions', async (req, res) => {
                     }
 
                     if (result.error) {
-                        return res.status(500).json({
-                            error: { message: result.error, type: "server_error" }
+                        writeSse({
+                            id: 'chatcmpl-stream',
+                            object: 'chat.completion.chunk',
+                            created: Math.floor(Date.now() / 1000),
+                            model: mappedModel || DEFAULT_MODEL,
+                            choices: [
+                                { index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: null }
+                            ]
                         });
+                    } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
+                        // Qwen returned JSON/normal response instead of SSE - send final as single chunk
+                        // When captureToolCalls is active, use cleanText (fence blocks stripped)
+                        // rather than raw content which includes the visible fence block.
+                        const content = captureToolCalls && _captureCleanText
+                            ? _captureCleanText
+                            : result.choices[0].message.content;
+                        logDebug(`JSON response content length: ${content.length}`);
+                        if (typeof streamingCallback === 'function') {
+                            streamingCallback(content);
+                        } else {
+                            writeSse({
+                                id: 'chatcmpl-stream',
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: mappedModel || DEFAULT_MODEL,
+                                choices: [
+                                    { index: 0, delta: { content }, finish_reason: null }
+                                ]
+                            });
+                        }
+                    } else {
+                        logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
                     }
+                    // Chunks were already sent via streamingCallback, don't duplicate!
 
-                    // Extract final message content
-                    let messageText = '';
-                    if (result.choices && result.choices[0] && result.choices[0].message) {
-                        messageText = result.choices[0].message.content || '';
-                    } else if (result.response && result.response.text) {
-                        messageText = result.response.text;
-                    }
-
-                    const { calls: toolCalls, dropped } = resolveToolCalls({ ...result, choices: [{ index: 0, message: { role: 'assistant', content: messageText, ...(result?.choices?.[0]?.message?.reasoning_content ? { reasoning_content: result.choices[0].message.reasoning_content } : {}) }, finish_reason: 'stop' }] }, combinedTools);
-                    if (toolCalls.length > 0) {
-                        if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
-                        return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
-                    }
-                    if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
-
-                    const openaiResponse = {
-                        id: result.id || "chatcmpl-" + Date.now(),
-                        object: "chat.completion",
+                    writeSse({
+                        id: 'chatcmpl-stream',
+                        object: 'chat.completion.chunk',
                         created: Math.floor(Date.now() / 1000),
-                        model: result.model || mappedModel || DEFAULT_MODEL,
-                        choices: [{
-                            index: 0,
-                            message: {
-                                role: "assistant",
-                                content: messageText,
-                                ...(result.choices?.[0]?.message?.reasoning_content ? { reasoning_content: result.choices[0].message.reasoning_content } : {})
-                            },
-                            finish_reason: "stop"
-                        }],
-                        usage: result.usage || {
-                            prompt_tokens: 0,
-                            completion_tokens: 0,
-                            total_tokens: 0
+                        model: mappedModel || DEFAULT_MODEL,
+                        choices: [
+                            { index: 0, delta: {}, finish_reason: 'stop' }
+                        ]
+                    });
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+
+                } catch (error) {
+                    logError('Error handling streaming request', error);
+                    writeSse({
+                        id: 'chatcmpl-stream',
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: mappedModel || DEFAULT_MODEL,
+                        choices: [
+                            { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
+                        ]
+                    });
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+                }
+            } else {
+                const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
+                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, reasoningOptions);
+
+                // Cleanup chat by configured policy (default all).
+                cleanupEphemeralChat(result, { explicitChatId, effectiveChatId, isMeta, model: mappedModel });
+
+                // Save chatId to session for subsequent requests
+                if (!isMeta && result.chatId) {
+                    if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
+                        mapChatId(effectiveChatId, result.chatId);
+                        logDebug(`Mapping saved: ${effectiveChatId} -> ${result.chatId}`);
+                    }
+                    if (shouldPersistSessionContext(conversationScope)) {
+                        saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
+                    }
+                }
+
+                if (result.error) {
+                    return res.status(500).json({
+                        error: { message: result.error, type: "server_error" }
+                    });
+                }
+
+                const { calls: toolCalls, dropped, cleanText: toolCleanText } = resolveToolCalls(result, combinedTools);
+                if (toolCalls.length > 0) {
+                    if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
+                    const reasoning = result?.choices?.[0]?.message?.reasoning_content || '';
+                    return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls, toolCleanText, reasoning));
+                }
+                if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
+
+                const openaiResponse = {
+                    id: result.id || "chatcmpl-" + Date.now(),
+                    object: "chat.completion",
+                    created: Math.floor(Date.now() / 1000),
+                    model: result.model || mappedModel || DEFAULT_MODEL,
+                    choices: result.choices || [{
+                        index: 0,
+                        message: {
+                            role: "assistant",
+                            content: result.choices?.[0]?.message?.content || "",
+                            ...(result.choices?.[0]?.message?.reasoning_content ? { reasoning_content: result.choices[0].message.reasoning_content } : {})
                         },
-                        // Pass through metadata for context preservation
-                        x_qwen_chat_id: result.chatId,
-                        x_qwen_parent_id: result.parentId || result.response_id
+                        finish_reason: "stop"
+                    }],
+                    usage: result.usage || {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0
+                    },
+                    chatId: result.chatId,
+                    parentId: result.parentId
+                };
+
+                // Save chat history
+                if (result.chatId) {
+                    try {
+                        const currentChat = loadHistory(result.chatId);
+                        const responseMessage = {
+                            role: 'assistant',
+                            content: openaiResponse.choices[0].message.content
+                        };
+                        const updatedMessages = messages.concat([responseMessage]);
+                        saveHistory(result.chatId, { ...currentChat, messages: updatedMessages });
+                    } catch (e) {
+                        logDebug(`Failed to save history: ${e.message}`);
+                    }
+                }
+
+                res.json(openaiResponse);
+            }
+        } catch (error) {
+            logError('Error processing request', error);
+            res.status(500).json({ error: { message: 'Internal server error', type: "server_error" } });
+        }
+    });
+
+    // OpenAI-compatible v1 endpoint (for Open WebUI and other clients)
+    router.post('/v1/chat/completions', async (req, res) => {
+        try {
+            const { messages, model, stream, tools, functions, tool_choice, chatId } = req.body;
+            const reasoningOptions = reasoningOptionsFromEffort(req.body?.reasoning_effort);
+            if (reasoningOptions.reasoningMode) {
+                logInfo(`Reasoning effort '${reasoningOptions.reasoningEffort}' -> Qwen mode '${reasoningOptions.reasoningMode}'`);
+            }
+            const snakeCaseChatId = normalizeIdValue(req.body?.chat_id);
+            const explicitChatId = normalizeIdValue(chatId) || snakeCaseChatId;
+            const explicitParentId = extractParentHint(req);
+            const conversationHint = extractConversationHint(req);
+            const conversationScope = conversationHint ? `conversation:${conversationHint}` : null;
+            const forceNewChat = shouldForceNewChat(req);
+
+            logInfo(`Received OpenAI v1 request ${stream ? ' (stream)' : ''}`);
+
+            if (!messages || !Array.isArray(messages) || messages.length === 0) {
+                logError('Request without messages');
+                return res.status(400).json({ error: 'Messages not specified' });
+            }
+
+            const isMeta = isOpenWebUiMetaRequest(messages);
+
+            // Use provided chatId OR restore from session
+            let effectiveChatId = explicitChatId;
+            let effectiveParentId = explicitParentId;
+
+            if (forceNewChat && !explicitChatId && !isMeta) {
+                effectiveChatId = `chat_${crypto.randomBytes(8).toString('hex')}`;
+                effectiveParentId = null;
+                logInfo(`Explicitly requested new chat (newChat/resetChat): ${effectiveChatId}`);
+            }
+
+            if (!effectiveChatId && !isMeta) {
+                if (conversationHint) {
+                    const scopedSession = forceNewChat ? null : getSavedChatId(req, conversationScope);
+                    if (scopedSession?.chatId) {
+                        effectiveChatId = scopedSession.chatId;
+                        if (!effectiveParentId && scopedSession.parentId) {
+                            effectiveParentId = scopedSession.parentId;
+                        }
+                        logInfo(`Restored scoped chatId from session: ${effectiveChatId}`);
+                    } else {
+                        effectiveChatId = buildInternalChatIdFromHint(conversationHint);
+                        logInfo(`Using client conversation-id key: ${effectiveChatId}`);
+                    }
+                } else if (ALLOW_UNSCOPED_SESSION_CHAT_RESTORE) {
+                    const savedSession = forceNewChat ? null : getSavedChatId(req);
+                    if (savedSession?.chatId) {
+                        effectiveChatId = savedSession.chatId;
+                        if (!effectiveParentId && savedSession.parentId) {
+                            effectiveParentId = savedSession.parentId;
+                        }
+                        logInfo(`Restored chatId from session: ${effectiveChatId}`);
+                    }
+
+                    if (!effectiveChatId) {
+                        const generatedId = generateChatIdFromHistory(messages);
+                        if (generatedId) {
+                            effectiveChatId = generatedId;
+                            logInfo(`Created new chatId for session: ${effectiveChatId}`);
+                        }
+                    }
+                } else {
+                    logDebug('chatId/conversation_id not provided, unscoped session fallback disabled');
+                }
+            }
+
+            // Extract system message if present
+            const systemMsg = messages.find(msg => msg.role === 'system');
+            const systemMessage = systemMsg ? systemMsg.content : null;
+            const { combinedTools } = buildCombinedTools(tools, functions, tool_choice);
+
+            const hasTools = Array.isArray(combinedTools) && combinedTools.length > 0;
+
+            // When tools are present, fold the entire messages array (including system,
+            // history, tool calls/results) into one Qwen-readable prompt using the
+            // tool_call fence format that Qwen Web understands.  Qwen's web API does not
+            // natively parse OpenAI tool schemas, so we never send payload.tools to it.
+            let messageContent;
+            let files = [];
+            let promptSystemMessage = null; // system sent separately only when NO tools
+            if (hasTools) {
+                messageContent = messagesToQwenPrompt(messages, combinedTools, tool_choice);
+                logInfo('Tool-aware prompt built via messagesToQwenPrompt (tool_call fence format)');
+            } else {
+                const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
+                if (preparedInput.missingUser) {
+                    logError('No user messages in request');
+                    return res.status(400).json({ error: 'No user messages in request' });
+                }
+                messageContent = preparedInput.messageContent;
+                files = preparedInput.files || [];
+                if (preparedInput.folded) {
+                    logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
+                }
+                promptSystemMessage = systemMessage;
+
+                // Convert OpenAI format content array to internal format
+                if (Array.isArray(messageContent)) {
+                    messageContent = messageContent.map(item => {
+                        if (item.type === 'text') {
+                            return { type: 'text', text: item.text };
+                        } else if (item.type === 'image_url' && item.image_url) {
+                            return { type: 'image', image: item.image_url.url };
+                        } else if (item.type === 'image') {
+                            return { type: 'image', image: item.image };
+                        }
+                        return item;
+                    });
+                }
+            }
+
+            // qwenTools: only used for native-call collection when NOT using prompt-based tools
+            // When hasTools, tools are encoded in the prompt; Qwen Web cannot parse payload.tools
+            const qwenTools = null;
+
+            // When tools are present, the full system+tools+history is already in messageContent
+            // (built by messagesToQwenPrompt). Do not send a separate system message in that case.
+            const toolAwareSystemMessage = hasTools ? null : applyToolPrompt(promptSystemMessage, combinedTools);
+            if (toolAwareSystemMessage) {
+                logInfo(`System message (non-tool): ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
+            }
+
+            if (isMeta) {
+                effectiveChatId = null;
+                effectiveParentId = null;
+                logDebug('OpenWebUI meta-request: using separate chat (no history link)');
+            }
+
+            const resolvedModel = resolveRequestedModel(model, DEFAULT_MODEL);
+            if (!resolvedModel.model) {
+                logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model, reason: resolvedModel.reason, endpoint: '/api/v1/chat/completions' })}`);
+                return res.status(400).json({ error: { message: `Model "${model}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
+            }
+            const mappedModel = resolvedModel.model;
+            if (resolvedModel.requested && resolvedModel.requested !== mappedModel) {
+                logInfo(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/v1/chat/completions' })}`);
+            } else {
+                logDebug(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/v1/chat/completions' })}`);
+            }
+            logInfo(`Using model: ${mappedModel}`);
+
+            if (systemMessage) {
+                logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
+            }
+
+            // Log full message history
+            logInfo(`History contains ${messages.length} messages: ${messages.map(m => m.role).join(', ')}`);
+            if (effectiveChatId) {
+                logInfo(`Using chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
+            }
+
+            if (stream) {
+                res.setHeader('Content-Type', 'text/event-stream');
+                res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+                res.setHeader('Pragma', 'no-cache');
+                res.setHeader('Expires', '0');
+                res.setHeader('Connection', 'keep-alive');
+                res.setHeader('X-Accel-Buffering', 'no');
+                res.setHeader('Transfer-Encoding', 'chunked');
+
+                const writeSse = (payload) => {
+                    res.write('data: ' + JSON.stringify(payload) + '\n\n');
+                };
+                const writeReasoningChunk = (text) => writeSse({
+                    id: 'chatcmpl-stream',
+                    object: 'chat.completion.chunk',
+                    created: Math.floor(Date.now() / 1000),
+                    model: mappedModel || DEFAULT_MODEL,
+                    choices: [
+                        { index: 0, delta: { reasoning_content: text }, finish_reason: null }
+                    ]
+                });
+
+                try {
+                    const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
+
+                    let hasStreamedReasoning = false;
+                    const reasoningCallback = (text) => {
+                        hasStreamedReasoning = true;
+                        writeReasoningChunk(text);
                     };
 
-                    // Save chat history for v1 endpoint
-                    if (result.chatId) {
-                        // Save chatId to session for subsequent requests from the same client
-                        if (!isMeta) {
-                            try {
-                                if (shouldPersistSessionContext(conversationScope)) {
-                                    saveChatIdForSession(req, result.chatId, result.parentId || result.response_id, conversationScope);
-                                }
-                            } catch (e) {
-                                logDebug(`Failed to save chatId to session: ${e.message}`);
-                            }
-                        }
+                    // Setup streaming callback if stream=true
+                    let streamingCallback = null;
+                    let hasStreamedChunks = false;
+                    const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0;
+                    if (stream && !captureToolCalls) {
+                        streamingCallback = (chunk) => {
+                            hasStreamedChunks = true;
+                            // OpenWebUI does not expect role in chunks - only content
+                            writeSse({
+                                id: 'chatcmpl-' + Date.now(),
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: mappedModel || DEFAULT_MODEL,
+                                choices: [
+                                    { index: 0, delta: { content: chunk }, finish_reason: null }
+                                ]
+                            });
+                        };
+                    }
 
-                        try {
-                            const currentChat = loadHistory(result.chatId);
-                            const responseMessage = {
-                                role: 'assistant',
-                                content: messageText
-                            };
-                            const updatedMessages = messages.concat([responseMessage]);
-                            saveHistory(result.chatId, { ...currentChat, messages: updatedMessages });
-                        } catch (e) {
-                            logDebug(`Failed to save history: ${e.message}`);
+                    const result = await sendMessage(
+                        messageContent,
+                        mappedModel,
+                        qwenChatId,
+                        effectiveParentId,
+                        files, // SUPPORT FILES
+                        qwenTools,
+                        tool_choice,
+                        toolAwareSystemMessage,
+                        't2t',
+                        null,
+                        true,
+                        0,
+                        streamingCallback,
+                        { ...reasoningOptions, onReasoning: reasoningCallback }
+                    );
+
+                    let _captureCleanText = '';
+                    if (captureToolCalls) {
+                        const { calls: toolCalls, dropped, cleanText } = resolveToolCalls(result, combinedTools);
+                        _captureCleanText = cleanText;
+                        if (toolCalls.length > 0) {
+                            if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
+                            const reasoning = result?.choices?.[0]?.message?.reasoning_content || '';
+                            writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText, reasoning);
+                            return;
+                        }
+                        if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
+                    }
+                    if (!hasStreamedReasoning && result?.choices?.[0]?.message?.reasoning_content) {
+                        writeReasoningChunk(result.choices[0].message.reasoning_content);
+                        hasStreamedReasoning = true;
+                    }
+
+                    // Save chatId to session for subsequent requests
+                    if (!isMeta && result.chatId) {
+                        if (shouldPersistSessionContext(conversationScope)) {
+                            saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
                         }
                     }
 
-                    res.json(openaiResponse);
+                    if (result.error) {
+                        writeSse({
+                            id: 'chatcmpl-stream',
+                            object: 'chat.completion.chunk',
+                            created: Math.floor(Date.now() / 1000),
+                            model: mappedModel || DEFAULT_MODEL,
+                            choices: [
+                                { index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: 'stop' }
+                            ]
+                        });
+                    } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
+                        // Qwen returned JSON/normal response instead of SSE - send final as single chunk
+                        // When captureToolCalls is active, use cleanText (fence blocks stripped)
+                        // rather than raw content which includes the visible fence block.
+                        const content = captureToolCalls && _captureCleanText
+                            ? _captureCleanText
+                            : result.choices[0].message.content;
+                        logDebug(`JSON response content length: ${content.length}`);
+                        if (typeof streamingCallback === 'function') {
+                            streamingCallback(content);
+                        } else {
+                            writeSse({
+                                id: 'chatcmpl-stream',
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: mappedModel || DEFAULT_MODEL,
+                                choices: [
+                                    { index: 0, delta: { content }, finish_reason: null }
+                                ]
+                            });
+                        }
+                    } else {
+                        logDebug(`Result structure: ${JSON.stringify(Object.keys(result))}`);
+                    }
+                    // Chunks were already sent via streamingCallback, don't duplicate!
+
+                    writeSse({
+                        id: 'chatcmpl-stream',
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: mappedModel || DEFAULT_MODEL,
+                        choices: [
+                            { index: 0, delta: {}, finish_reason: 'stop' }
+                        ]
+                    });
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+
+                } catch (error) {
+                    logError('Error handling streaming request', error);
+                    writeSse({
+                        id: 'chatcmpl-stream',
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: mappedModel || DEFAULT_MODEL,
+                        choices: [
+                            { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
+                        ]
+                    });
+                    res.write('data: [DONE]\n\n');
+                    res.end();
                 }
-            } catch (error) {
-                logError('Error processing v1 request', error);
-                res.status(500).json({ error: { message: 'Internal server error', type: "server_error" } });
+            } else {
+                const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
+
+                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, reasoningOptions);
+
+                // Save chatId to session for subsequent requests
+                if (!isMeta && result.chatId) {
+                    // If we used a generated effectiveChatId - save the mapping
+                    if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
+                        mapChatId(effectiveChatId, result.chatId);
+                        logDebug(`Mapping saved: ${effectiveChatId} -> ${result.chatId}`);
+                    }
+                    if (shouldPersistSessionContext(conversationScope)) {
+                        saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
+                    }
+                }
+
+                if (result.error) {
+                    return res.status(500).json({
+                        error: { message: result.error, type: "server_error" }
+                    });
+                }
+
+                // Extract final message content
+                let messageText = '';
+                if (result.choices && result.choices[0] && result.choices[0].message) {
+                    messageText = result.choices[0].message.content || '';
+                } else if (result.response && result.response.text) {
+                    messageText = result.response.text;
+                }
+
+                const { calls: toolCalls, dropped, cleanText: toolCleanText } = resolveToolCalls({ ...result, choices: [{ index: 0, message: { role: 'assistant', content: messageText, ...(result?.choices?.[0]?.message?.reasoning_content ? { reasoning_content: result.choices[0].message.reasoning_content } : {}) }, finish_reason: 'stop' }] }, combinedTools);
+                if (toolCalls.length > 0) {
+                    if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
+                    const reasoning = result?.choices?.[0]?.message?.reasoning_content || '';
+                    return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls, toolCleanText, reasoning));
+                }
+                if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
+
+                const openaiResponse = {
+                    id: result.id || "chatcmpl-" + Date.now(),
+                    object: "chat.completion",
+                    created: Math.floor(Date.now() / 1000),
+                    model: result.model || mappedModel || DEFAULT_MODEL,
+                    choices: [{
+                        index: 0,
+                        message: {
+                            role: "assistant",
+                            content: messageText,
+                            ...(result.choices?.[0]?.message?.reasoning_content ? { reasoning_content: result.choices[0].message.reasoning_content } : {})
+                        },
+                        finish_reason: "stop"
+                    }],
+                    usage: result.usage || {
+                        prompt_tokens: 0,
+                        completion_tokens: 0,
+                        total_tokens: 0
+                    },
+                    // Pass through metadata for context preservation
+                    x_qwen_chat_id: result.chatId,
+                    x_qwen_parent_id: result.parentId || result.response_id
+                };
+
+                // Save chat history for v1 endpoint
+                if (result.chatId) {
+                    // Save chatId to session for subsequent requests from the same client
+                    if (!isMeta) {
+                        try {
+                            if (shouldPersistSessionContext(conversationScope)) {
+                                saveChatIdForSession(req, result.chatId, result.parentId || result.response_id, conversationScope);
+                            }
+                        } catch (e) {
+                            logDebug(`Failed to save chatId to session: ${e.message}`);
+                        }
+                    }
+
+                    try {
+                        const currentChat = loadHistory(result.chatId);
+                        const responseMessage = {
+                            role: 'assistant',
+                            content: messageText
+                        };
+                        const updatedMessages = messages.concat([responseMessage]);
+                        saveHistory(result.chatId, { ...currentChat, messages: updatedMessages });
+                    } catch (e) {
+                        logDebug(`Failed to save history: ${e.message}`);
+                    }
+                }
+
+                res.json(openaiResponse);
             }
-        });
-
-router.post('/files/getstsToken', async (req, res) => {
-    try {
-        logInfo(`Request for STS token: ${JSON.stringify(req.body)}`);
-        const fileInfo = req.body;
-        if (!fileInfo?.filename || !fileInfo?.filesize || !fileInfo?.filetype) {
-            logError('Invalid file data');
-            return res.status(400).json({ error: 'Invalid file data' });
+        } catch (error) {
+            logError('Error processing v1 request', error);
+            res.status(500).json({ error: { message: 'Internal server error', type: "server_error" } });
         }
-        res.json(await getStsToken(fileInfo));
-    } catch (error) {
-        logError('Error getting STS token', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+    });
 
-router.post('/files/upload', upload.single('file'), async (req, res) => {
-    try {
-        if (!req.file) { logError('File was not uploaded'); return res.status(400).json({ error: 'File was not uploaded' }); }
-        logInfo(`File uploaded to server: ${req.file.originalname} (${req.file.size} bytes)`);
-
-        const result = await uploadFileToQwen(req.file.path);
-
-        try { fs.unlinkSync(req.file.path); } catch { /* file already removed or inaccessible */ }
-
-        if (result.success) {
-            logInfo(`File successfully uploaded to OSS: ${result.fileName}`);
-            res.json({ success: true, file: { name: result.fileName, url: result.url, size: req.file.size, type: req.file.mimetype } });
-        } else {
-            logError(`Error uploading file to OSS: ${result.error}`);
-            res.status(500).json({ error: 'Error uploading file' });
+    router.post('/files/getstsToken', async (req, res) => {
+        try {
+            logInfo(`Request for STS token: ${JSON.stringify(req.body)}`);
+            const fileInfo = req.body;
+            if (!fileInfo?.filename || !fileInfo?.filesize || !fileInfo?.filetype) {
+                logError('Invalid file data');
+                return res.status(400).json({ error: 'Invalid file data' });
+            }
+            res.json(await getStsToken(fileInfo));
+        } catch (error) {
+            logError('Error getting STS token', error);
+            res.status(500).json({ error: 'Internal server error' });
         }
-    } catch (error) {
-        logError('Error uploading file', error);
-        if (req.file?.path) { try { fs.unlinkSync(req.file.path); } catch { /* ignore */ } }
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+    });
 
-// Endpoint for saving chat history (for Open WebUI)
-router.post('/chats/:chatId/history', async (req, res) => {
-    try {
-        const { chatId } = req.params;
-        const { messages } = req.body;
+    router.post('/files/upload', upload.single('file'), async (req, res) => {
+        try {
+            if (!req.file) { logError('File was not uploaded'); return res.status(400).json({ error: 'File was not uploaded' }); }
+            logInfo(`File uploaded to server: ${req.file.originalname} (${req.file.size} bytes)`);
 
-        logInfo(`Request to save history for chat: ${chatId}`);
+            const result = await uploadFileToQwen(req.file.path);
 
-        if (!messages || !Array.isArray(messages)) {
-            logError('Message history not specified or invalid');
-            return res.status(400).json({ error: 'Message history must be an array' });
+            try { fs.unlinkSync(req.file.path); } catch { /* file already removed or inaccessible */ }
+
+            if (result.success) {
+                logInfo(`File successfully uploaded to OSS: ${result.fileName}`);
+                res.json({ success: true, file: { name: result.fileName, url: result.url, size: req.file.size, type: req.file.mimetype } });
+            } else {
+                logError(`Error uploading file to OSS: ${result.error}`);
+                res.status(500).json({ error: 'Error uploading file' });
+            }
+        } catch (error) {
+            logError('Error uploading file', error);
+            if (req.file?.path) { try { fs.unlinkSync(req.file.path); } catch { /* ignore */ } }
+            res.status(500).json({ error: 'Internal server error' });
         }
+    });
 
-        // Here you can add logic for saving history
-        // For now just confirm saving
-        res.json({
-            success: true,
-            chatId: chatId,
-            messagesCount: messages.length
-        });
-    } catch (error) {
-        logError('Error saving chat history', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
+    // Endpoint for saving chat history (for Open WebUI)
+    router.post('/chats/:chatId/history', async (req, res) => {
+        try {
+            const { chatId } = req.params;
+            const { messages } = req.body;
 
-// Endpoint for getting chat history (for Open WebUI)
-router.get('/chats/:chatId/history', async (req, res) => {
-    try {
-        const { chatId } = req.params;
+            logInfo(`Request to save history for chat: ${chatId}`);
 
-        logInfo(`History request for chat: ${chatId}`);
+            if (!messages || !Array.isArray(messages)) {
+                logError('Message history not specified or invalid');
+                return res.status(400).json({ error: 'Message history must be an array' });
+            }
 
-        // Here you can add logic for getting history from DB
-        // For now return empty history
-        res.json({
-            success: true,
-            chatId: chatId,
-            messages: []
-        });
-    } catch (error) {
-        logError('Error getting chat history', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-// ============================================
-// IMAGE/VIDEO GENERATION ENDPOINTS QWEN CHAT / DASHSCOPE
-// ============================================
-
-const CHAT_MEDIA_MODEL = 'qwen3-vl-plus';
-
-function normalizeQwenAspectRatio(size, fallback = '16:9') {
-    if (!size) return fallback;
-    const value = String(size).trim();
-    const ratioMap = {
-        '1024x1024': '1:1',
-        '512x512': '1:1',
-        '768x768': '1:1',
-        '960x960': '1:1',
-        '1024x1792': '9:16',
-        '1792x1024': '16:9',
-        '1536x864': '16:9',
-        '864x1536': '9:16'
-    };
-    if (ratioMap[value]) return ratioMap[value];
-    if (/^\d+:\d+$/.test(value)) return value;
-    return fallback;
-}
-
-function normalizeDashScopeSize(size) {
-    const sizeMap = {
-        '1024x1024': '1024*1024',
-        '1024x1792': '1024*1792',
-        '1792x1024': '1792*1024',
-        '512x512': '512*512',
-        '768x768': '768*768',
-        '960x960': '960*960'
-    };
-    return sizeMap[size] || '1024*1024';
-}
-
-function buildOpenAiImageResponse({ imageUrl, prompt, model, raw, provider = 'qwen-chat' }) {
-    return {
-        created: Math.floor(Date.now() / 1000),
-        watermark: FORGETMEAI_WATERMARK,
-        provider,
-        model,
-        data: [{ url: imageUrl, revised_prompt: prompt }],
-        raw
-    };
-}
-
-function buildVideoResponse({ result, prompt, model, waitForCompletion }) {
-    const videoUrl = result.video_url || extractMediaUrl(result, 'video');
-    return {
-        id: result.id || result.task_id || `video-${Date.now()}`,
-        object: videoUrl ? 'video.generation' : 'video.generation.task',
-        created: Math.floor(Date.now() / 1000),
-        watermark: FORGETMEAI_WATERMARK,
-        provider: 'qwen-chat',
-        model,
-        prompt,
-        status: videoUrl ? 'completed' : (result.status || 'processing'),
-        task_id: result.task_id || result.id || null,
-        video_url: videoUrl || null,
-        data: videoUrl ? [{ url: videoUrl }] : [],
-        waitForCompletion,
-        raw: result
-    };
-}
-
-/**
- * POST /api/images/generations
- * By default generates images via Qwen Chat (`chatType: t2i`).
- * For legacy DashScope mode pass `provider: "dashscope"`.
- */
-router.post('/images/generations', async (req, res) => {
-    try {
-        const { prompt, model, n, size, response_format, provider } = req.body;
-
-        logInfo('Received image generation request');
-        logDebug(`Prompt: ${prompt?.substring(0, 100)}${prompt?.length > 100 ? '...' : ''}`);
-
-        if (!prompt) {
-            return res.status(400).json({ error: 'Parameter "prompt" is required' });
+            // Here you can add logic for saving history
+            // For now just confirm saving
+            res.json({
+                success: true,
+                chatId: chatId,
+                messagesCount: messages.length
+            });
+        } catch (error) {
+            logError('Error saving chat history', error);
+            res.status(500).json({ error: 'Internal server error' });
         }
+    });
 
-        if (provider === 'dashscope') {
-            const apiKey = process.env.DASHSCOPE_API_KEY;
-            if (!apiKey) {
-                return res.status(503).json({
-                    error: 'DashScope image generation API is not configured',
-                    message: 'Set the DASHSCOPE_API_KEY environment variable or use provider=qwen-chat'
+    // Endpoint for getting chat history (for Open WebUI)
+    router.get('/chats/:chatId/history', async (req, res) => {
+        try {
+            const { chatId } = req.params;
+
+            logInfo(`History request for chat: ${chatId}`);
+
+            // Here you can add logic for getting history from DB
+            // For now return empty history
+            res.json({
+                success: true,
+                chatId: chatId,
+                messages: []
+            });
+        } catch (error) {
+            logError('Error getting chat history', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    // ============================================
+    // IMAGE/VIDEO GENERATION ENDPOINTS QWEN CHAT / DASHSCOPE
+    // ============================================
+
+    const CHAT_MEDIA_MODEL = 'qwen3-vl-plus';
+
+    function normalizeQwenAspectRatio(size, fallback = '16:9') {
+        if (!size) return fallback;
+        const value = String(size).trim();
+        const ratioMap = {
+            '1024x1024': '1:1',
+            '512x512': '1:1',
+            '768x768': '1:1',
+            '960x960': '1:1',
+            '1024x1792': '9:16',
+            '1792x1024': '16:9',
+            '1536x864': '16:9',
+            '864x1536': '9:16'
+        };
+        if (ratioMap[value]) return ratioMap[value];
+        if (/^\d+:\d+$/.test(value)) return value;
+        return fallback;
+    }
+
+    function normalizeDashScopeSize(size) {
+        const sizeMap = {
+            '1024x1024': '1024*1024',
+            '1024x1792': '1024*1792',
+            '1792x1024': '1792*1024',
+            '512x512': '512*512',
+            '768x768': '768*768',
+            '960x960': '960*960'
+        };
+        return sizeMap[size] || '1024*1024';
+    }
+
+    function buildOpenAiImageResponse({ imageUrl, prompt, model, raw, provider = 'qwen-chat' }) {
+        return {
+            created: Math.floor(Date.now() / 1000),
+            watermark: FORGETMEAI_WATERMARK,
+            provider,
+            model,
+            data: [{ url: imageUrl, revised_prompt: prompt }],
+            raw
+        };
+    }
+
+    function buildVideoResponse({ result, prompt, model, waitForCompletion }) {
+        const videoUrl = result.video_url || extractMediaUrl(result, 'video');
+        return {
+            id: result.id || result.task_id || `video-${Date.now()}`,
+            object: videoUrl ? 'video.generation' : 'video.generation.task',
+            created: Math.floor(Date.now() / 1000),
+            watermark: FORGETMEAI_WATERMARK,
+            provider: 'qwen-chat',
+            model,
+            prompt,
+            status: videoUrl ? 'completed' : (result.status || 'processing'),
+            task_id: result.task_id || result.id || null,
+            video_url: videoUrl || null,
+            data: videoUrl ? [{ url: videoUrl }] : [],
+            waitForCompletion,
+            raw: result
+        };
+    }
+
+    /**
+     * POST /api/images/generations
+     * By default generates images via Qwen Chat (`chatType: t2i`).
+     * For legacy DashScope mode pass `provider: "dashscope"`.
+     */
+    router.post('/images/generations', async (req, res) => {
+        try {
+            const { prompt, model, n, size, response_format, provider } = req.body;
+
+            logInfo('Received image generation request');
+            logDebug(`Prompt: ${prompt?.substring(0, 100)}${prompt?.length > 100 ? '...' : ''}`);
+
+            if (!prompt) {
+                return res.status(400).json({ error: 'Parameter "prompt" is required' });
+            }
+
+            if (provider === 'dashscope') {
+                const apiKey = process.env.DASHSCOPE_API_KEY;
+                if (!apiKey) {
+                    return res.status(503).json({
+                        error: 'DashScope image generation API is not configured',
+                        message: 'Set the DASHSCOPE_API_KEY environment variable or use provider=qwen-chat'
+                    });
+                }
+
+                let imageModel = model || 'qwen-image-plus';
+                if (imageModel === 'dall-e-3' || imageModel === 'dall-e-2') imageModel = 'qwen-image-plus';
+                const result = await generateImage(prompt, imageModel, {
+                    n: n || 1,
+                    size: normalizeDashScopeSize(size),
+                    promptExtend: true,
+                    watermark: false
+                });
+
+                if (result.error) {
+                    logError(`DashScope generation error: ${result.error}`);
+                    return res.status(500).json({ error: 'Image generation error', message: result.error });
+                }
+
+                return res.json(buildOpenAiImageResponse({
+                    imageUrl: result.imageUrl,
+                    prompt,
+                    model: imageModel,
+                    raw: result,
+                    provider: 'dashscope'
+                }));
+            }
+
+            const resolvedModel = resolveRequestedModel(model || CHAT_MEDIA_MODEL, DEFAULT_MODEL);
+            if (!resolvedModel.model) {
+                logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model || CHAT_MEDIA_MODEL, reason: resolvedModel.reason, endpoint: req.path })}`);
+                return res.status(400).json({ error: { message: `Model "${model || CHAT_MEDIA_MODEL}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
+            }
+            const chatModel = resolvedModel.model;
+            const aspectRatio = normalizeQwenAspectRatio(size, req.body.aspect_ratio || '16:9');
+            const result = await sendMessage(
+                prompt,
+                chatModel,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                't2i',
+                aspectRatio,
+                true
+            );
+
+            if (result.error) {
+                logError(`Qwen Chat image generation error: ${result.error}`);
+                return res.status(500).json({ error: 'Image generation error via Qwen Chat', message: result.error, details: result.details });
+            }
+
+            const imageUrl = extractMediaUrl(result, 'image') || result.choices?.[0]?.message?.content || null;
+            if (!imageUrl) {
+                return res.status(502).json({
+                    error: 'Qwen Chat did not return image URL',
+                    raw: result
                 });
             }
 
-            let imageModel = model || 'qwen-image-plus';
-            if (imageModel === 'dall-e-3' || imageModel === 'dall-e-2') imageModel = 'qwen-image-plus';
-            const result = await generateImage(prompt, imageModel, {
-                n: n || 1,
-                size: normalizeDashScopeSize(size),
-                promptExtend: true,
-                watermark: false
-            });
+            logInfo(`Qwen Chat image generated: ${imageUrl}`);
+            return res.json(buildOpenAiImageResponse({ imageUrl, prompt, model: chatModel, raw: result }));
+        } catch (error) {
+            logError('Error generating image', error);
+            res.status(500).json({ error: 'Internal server error', message: error.message });
+        }
+    });
 
-            if (result.error) {
-                logError(`DashScope generation error: ${result.error}`);
-                return res.status(500).json({ error: 'Image generation error', message: result.error });
+    /**
+     * POST /api/videos/generations - Video generation via Qwen Chat (`chatType: t2v`).
+     */
+    router.post('/videos/generations', async (req, res) => {
+        try {
+            const { prompt, model, size, wait, waitForCompletion } = req.body;
+            const shouldWait = waitForCompletion ?? wait ?? true;
+
+            logInfo('Received video generation request via Qwen Chat');
+            logDebug(`Video prompt: ${prompt?.substring(0, 100)}${prompt?.length > 100 ? '...' : ''}`);
+
+            if (!prompt) {
+                return res.status(400).json({ error: 'Parameter "prompt" is required' });
             }
 
-            return res.json(buildOpenAiImageResponse({
-                imageUrl: result.imageUrl,
+            const resolvedModel = resolveRequestedModel(model || CHAT_MEDIA_MODEL, DEFAULT_MODEL);
+            if (!resolvedModel.model) {
+                logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model || CHAT_MEDIA_MODEL, reason: resolvedModel.reason, endpoint: req.path })}`);
+                return res.status(400).json({ error: { message: `Model "${model || CHAT_MEDIA_MODEL}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
+            }
+            const chatModel = resolvedModel.model;
+            const aspectRatio = normalizeQwenAspectRatio(size, req.body.aspect_ratio || '16:9');
+            const result = await sendMessage(
                 prompt,
-                model: imageModel,
-                raw: result,
-                provider: 'dashscope'
-            }));
-        }
+                chatModel,
+                null,
+                null,
+                null,
+                null,
+                null,
+                null,
+                't2v',
+                aspectRatio,
+                shouldWait
+            );
 
-        const resolvedModel = resolveRequestedModel(model || CHAT_MEDIA_MODEL, DEFAULT_MODEL);
-        if (!resolvedModel.model) {
-            logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model || CHAT_MEDIA_MODEL, reason: resolvedModel.reason, endpoint: req.path })}`);
-            return res.status(400).json({ error: { message: `Model "${model || CHAT_MEDIA_MODEL}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
-        }
-        const chatModel = resolvedModel.model;
-        const aspectRatio = normalizeQwenAspectRatio(size, req.body.aspect_ratio || '16:9');
-        const result = await sendMessage(
-            prompt,
-            chatModel,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            't2i',
-            aspectRatio,
-            true
-        );
+            if (result.error) {
+                logError(`Qwen Chat video generation error: ${result.error}`);
+                return res.status(500).json({ error: 'Video generation error via Qwen Chat', message: result.error, details: result.details, task_id: result.task_id });
+            }
 
-        if (result.error) {
-            logError(`Qwen Chat image generation error: ${result.error}`);
-            return res.status(500).json({ error: 'Image generation error via Qwen Chat', message: result.error, details: result.details });
+            const response = buildVideoResponse({ result, prompt, model: chatModel, waitForCompletion: shouldWait });
+            logInfo(response.video_url ? `Qwen Chat video generated: ${response.video_url}` : `Video task created: ${response.task_id}`);
+            return res.json(response);
+        } catch (error) {
+            logError('Error generating video', error);
+            res.status(500).json({ error: 'Internal server error', message: error.message });
         }
+    });
 
-        const imageUrl = extractMediaUrl(result, 'image') || result.choices?.[0]?.message?.content || null;
-        if (!imageUrl) {
-            return res.status(502).json({
-                error: 'Qwen Chat did not return image URL',
-                raw: result
+    /**
+     * GET /api/tasks/status/:taskId - Status of a long-running Qwen Chat task (video and other async jobs).
+     */
+    router.get('/tasks/status/:taskId', async (req, res) => {
+        try {
+            const { taskId } = req.params;
+            const wait = ['1', 'true', 'yes'].includes(String(req.query.wait || '').toLowerCase());
+            if (!taskId) return res.status(400).json({ error: 'taskId is required' });
+
+            const result = await pollQwenTaskStatus(taskId, wait);
+            if (result.error && !result.data) {
+                return res.status(500).json(result);
+            }
+            return res.json({ watermark: FORGETMEAI_WATERMARK, ...result });
+        } catch (error) {
+            logError('Error checking task status', error);
+            res.status(500).json({ error: 'Internal server error', message: error.message });
+        }
+    });
+
+    /**
+     * GET /api/images/models - Models for image generation.
+     */
+    router.get('/images/models', async (req, res) => {
+        try {
+            const dashScopeModels = getAvailableImageModels();
+            res.json({
+                object: 'list',
+                watermark: FORGETMEAI_WATERMARK,
+                data: [
+                    {
+                        id: CHAT_MEDIA_MODEL,
+                        object: 'model',
+                        created: Date.now(),
+                        owned_by: 'qwen-chat',
+                        permission: [],
+                        capability: 'qwen_chat_image_generation',
+                        provider: 'qwen-chat'
+                    },
+                    ...dashScopeModels.map(model => ({
+                        id: model,
+                        object: 'model',
+                        created: Date.now(),
+                        owned_by: 'qwen',
+                        permission: [],
+                        capability: 'image_generation',
+                        provider: 'dashscope'
+                    }))
+                ]
             });
+        } catch (error) {
+            logError('Error getting image model list', error);
+            res.status(500).json({ error: 'Internal server error' });
         }
+    });
 
-        logInfo(`Qwen Chat image generated: ${imageUrl}`);
-        return res.json(buildOpenAiImageResponse({ imageUrl, prompt, model: chatModel, raw: result }));
-    } catch (error) {
-        logError('Error generating image', error);
-        res.status(500).json({ error: 'Internal server error', message: error.message });
-    }
-});
-
-/**
- * POST /api/videos/generations - Video generation via Qwen Chat (`chatType: t2v`).
- */
-router.post('/videos/generations', async (req, res) => {
-    try {
-        const { prompt, model, size, wait, waitForCompletion } = req.body;
-        const shouldWait = waitForCompletion ?? wait ?? true;
-
-        logInfo('Received video generation request via Qwen Chat');
-        logDebug(`Video prompt: ${prompt?.substring(0, 100)}${prompt?.length > 100 ? '...' : ''}`);
-
-        if (!prompt) {
-            return res.status(400).json({ error: 'Parameter "prompt" is required' });
-        }
-
-        const resolvedModel = resolveRequestedModel(model || CHAT_MEDIA_MODEL, DEFAULT_MODEL);
-        if (!resolvedModel.model) {
-            logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model || CHAT_MEDIA_MODEL, reason: resolvedModel.reason, endpoint: req.path })}`);
-            return res.status(400).json({ error: { message: `Model "${model || CHAT_MEDIA_MODEL}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
-        }
-        const chatModel = resolvedModel.model;
-        const aspectRatio = normalizeQwenAspectRatio(size, req.body.aspect_ratio || '16:9');
-        const result = await sendMessage(
-            prompt,
-            chatModel,
-            null,
-            null,
-            null,
-            null,
-            null,
-            null,
-            't2v',
-            aspectRatio,
-            shouldWait
-        );
-
-        if (result.error) {
-            logError(`Qwen Chat video generation error: ${result.error}`);
-            return res.status(500).json({ error: 'Video generation error via Qwen Chat', message: result.error, details: result.details, task_id: result.task_id });
-        }
-
-        const response = buildVideoResponse({ result, prompt, model: chatModel, waitForCompletion: shouldWait });
-        logInfo(response.video_url ? `Qwen Chat video generated: ${response.video_url}` : `Video task created: ${response.task_id}`);
-        return res.json(response);
-    } catch (error) {
-        logError('Error generating video', error);
-        res.status(500).json({ error: 'Internal server error', message: error.message });
-    }
-});
-
-/**
- * GET /api/tasks/status/:taskId - Status of a long-running Qwen Chat task (video and other async jobs).
- */
-router.get('/tasks/status/:taskId', async (req, res) => {
-    try {
-        const { taskId } = req.params;
-        const wait = ['1', 'true', 'yes'].includes(String(req.query.wait || '').toLowerCase());
-        if (!taskId) return res.status(400).json({ error: 'taskId is required' });
-
-        const result = await pollQwenTaskStatus(taskId, wait);
-        if (result.error && !result.data) {
-            return res.status(500).json(result);
-        }
-        return res.json({ watermark: FORGETMEAI_WATERMARK, ...result });
-    } catch (error) {
-        logError('Error checking task status', error);
-        res.status(500).json({ error: 'Internal server error', message: error.message });
-    }
-});
-
-/**
- * GET /api/images/models - Models for image generation.
- */
-router.get('/images/models', async (req, res) => {
-    try {
-        const dashScopeModels = getAvailableImageModels();
+    /**
+     * GET /api/videos/models - Models for video generation via Qwen Chat.
+     */
+    router.get('/videos/models', async (req, res) => {
         res.json({
             object: 'list',
             watermark: FORGETMEAI_WATERMARK,
-            data: [
-                {
-                    id: CHAT_MEDIA_MODEL,
-                    object: 'model',
-                    created: Date.now(),
-                    owned_by: 'qwen-chat',
-                    permission: [],
-                    capability: 'qwen_chat_image_generation',
-                    provider: 'qwen-chat'
-                },
-                ...dashScopeModels.map(model => ({
-                    id: model,
-                    object: 'model',
-                    created: Date.now(),
-                    owned_by: 'qwen',
-                    permission: [],
-                    capability: 'image_generation',
-                    provider: 'dashscope'
-                }))
-            ]
+            data: [{
+                id: CHAT_MEDIA_MODEL,
+                object: 'model',
+                created: Date.now(),
+                owned_by: 'qwen-chat',
+                permission: [],
+                capability: 'qwen_chat_video_generation',
+                provider: 'qwen-chat'
+            }]
         });
-    } catch (error) {
-        logError('Error getting image model list', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-/**
- * GET /api/videos/models - Models for video generation via Qwen Chat.
- */
-router.get('/videos/models', async (req, res) => {
-    res.json({
-        object: 'list',
-        watermark: FORGETMEAI_WATERMARK,
-        data: [{
-            id: CHAT_MEDIA_MODEL,
-            object: 'model',
-            created: Date.now(),
-            owned_by: 'qwen-chat',
-            permission: [],
-            capability: 'qwen_chat_video_generation',
-            provider: 'qwen-chat'
-        }]
     });
-});
 
-/**
- * GET /api/images/status - Check image generation API status.
- */
-router.get('/images/status', async (req, res) => {
-    try {
-        const apiKey = process.env.DASHSCOPE_API_KEY;
-        const dashScopeAvailable = await checkImageApiAvailability();
+    /**
+     * GET /api/images/status - Check image generation API status.
+     */
+    router.get('/images/status', async (req, res) => {
+        try {
+            const apiKey = process.env.DASHSCOPE_API_KEY;
+            const dashScopeAvailable = await checkImageApiAvailability();
+            const tokens = listTokens();
+            const now = Date.now();
+            const qwenChatAvailable = tokens.some(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid);
+
+            res.json({
+                watermark: FORGETMEAI_WATERMARK,
+                qwenChat: {
+                    available: qwenChatAvailable,
+                    model: CHAT_MEDIA_MODEL,
+                    message: qwenChatAvailable ? 'Qwen Chat image generation is available' : 'No active Qwen Chat accounts'
+                },
+                dashscope: {
+                    available: dashScopeAvailable,
+                    apiKeyConfigured: !!apiKey,
+                    message: dashScopeAvailable
+                        ? 'DashScope image generation API is available'
+                        : apiKey
+                            ? 'DashScope API unavailable or invalid credentials'
+                            : 'DASHSCOPE_API_KEY not configured'
+                }
+            });
+        } catch (error) {
+            logError('Error checking image API status', error);
+            res.status(500).json({ error: 'Internal server error' });
+        }
+    });
+
+    /**
+     * GET /api/videos/status - Check Qwen Chat video generation readiness.
+     */
+    router.get('/videos/status', async (req, res) => {
         const tokens = listTokens();
         const now = Date.now();
-        const qwenChatAvailable = tokens.some(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid);
-
+        const availableAccounts = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid).length;
         res.json({
             watermark: FORGETMEAI_WATERMARK,
-            qwenChat: {
-                available: qwenChatAvailable,
-                model: CHAT_MEDIA_MODEL,
-                message: qwenChatAvailable ? 'Qwen Chat image generation is available' : 'No active Qwen Chat accounts'
-            },
-            dashscope: {
-                available: dashScopeAvailable,
-                apiKeyConfigured: !!apiKey,
-                message: dashScopeAvailable
-                    ? 'DashScope image generation API is available'
-                    : apiKey
-                        ? 'DashScope API unavailable or invalid credentials'
-                        : 'DASHSCOPE_API_KEY not configured'
-            }
+            available: availableAccounts > 0,
+            model: CHAT_MEDIA_MODEL,
+            accounts: { total: tokens.length, available: availableAccounts },
+            message: availableAccounts > 0 ? 'Qwen Chat video generation is available' : 'No active Qwen Chat accounts'
         });
-    } catch (error) {
-        logError('Error checking image API status', error);
-        res.status(500).json({ error: 'Internal server error' });
-    }
-});
-
-/**
- * GET /api/videos/status - Check Qwen Chat video generation readiness.
- */
-router.get('/videos/status', async (req, res) => {
-    const tokens = listTokens();
-    const now = Date.now();
-    const availableAccounts = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid).length;
-    res.json({
-        watermark: FORGETMEAI_WATERMARK,
-        available: availableAccounts > 0,
-        model: CHAT_MEDIA_MODEL,
-        accounts: { total: tokens.length, available: availableAccounts },
-        message: availableAccounts > 0 ? 'Qwen Chat video generation is available' : 'No active Qwen Chat accounts'
     });
-});
 
-export default router;
+    export default router;
