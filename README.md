@@ -44,7 +44,7 @@ npm run start:cdp
 
 `start:cdp` opens (or reuses) a dedicated Chrome window with a persistent Qwen login and starts the proxy non-interactively — there is no account menu in this mode. On the first run, log in to Qwen Chat in that window, then retry the request. Plain `npm start` still shows the interactive account menu.
 
-While the proxy runs, a CDP observer watches the logged-in Qwen tab and pushes each fresh token/Baxia capture to `session/`. Sending any message in the Qwen UI keeps the session current; `GET /api/session/sync` reports the last capture. An optional MV3 extension under [`extension/`](extension/) does the same push and can be installed manually via `chrome://extensions` → **Load unpacked** — branded Chrome does not allow command-line extension loading, so the CDP observer is the automatic path.
+While the proxy runs, a CDP observer watches the logged-in Qwen tab and pushes each fresh token/Baxia capture to `session/`. Sending any message in the Qwen UI keeps the session current; `GET /api/session/sync` reports the last capture. A bundled MV3 extension under [`extension/`](extension/) does the same push; install it once via `chrome://extensions` → **Load unpacked** (the folder picker is a native Windows dialog). Branded Chrome ignores command-line `--load-extension`, so the observer is the zero-install fallback — with the extension installed, both paths push to the same loopback endpoint.
 
 In another terminal:
 

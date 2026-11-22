@@ -41,7 +41,7 @@ Other commands:
 | `src/browser/browser.js` | Puppeteer/CDP connection, fresh automation tab |
 | `src/browser/sessionHook.js` | CDP observer: pushes token/Baxia from real UI traffic |
 | `src/api/sessionSync.js` | Validates and atomically writes pushed session data |
-| `extension/` | Optional MV3 sync extension (manual install only) |
+| `extension/` | MV3 sync extension, one-time install via the `chrome://extensions` folder picker |
 | `src/browser/auth.js` | Account login and token capture |
 | `src/env.js` | `.env` autoload |
 | `src/config.js`, `src/AvailableModels.txt` | Defaults and current model list |
@@ -73,8 +73,9 @@ Never commit `session/`, `.env`, `logs/`, or `.opencode/`.
    observer refreshes the capture automatically from real UI traffic via
    `POST /api/session/sync`; the manual path is still
    `scripts/core/capture-ui-full.mjs` followed by
-   `scripts/core/sync-session-from-ui.mjs`. Branded Chrome blocks `--load-extension`,
-   so `extension/` is a manual-install option, not the automatic path.
+   `scripts/core/sync-session-from-ui.mjs`. Branded Chrome ignores `--load-extension`,
+   so `extension/` is installed once via the `chrome://extensions` folder picker; the
+   CDP observer is the zero-install fallback. Both push to the same endpoint.
 5. **SSE parsing:** skip `thinking_summary` phases; only the final answer text becomes
    `choices[0].message.content`. Never hide an upstream error as empty `content` —
    surface it. A one-shot chat without explicit `chat_id` is deleted by
