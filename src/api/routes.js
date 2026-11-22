@@ -929,6 +929,22 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         };
                     }
 
+                    // Handle reasoning / thinking stream
+                    const reasoningOptions = reasoningOptionsFromEffort(req.body?.reasoning_effort);
+                    let hasStreamedReasoning = false;
+                    const reasoningCallback = (chunk) => {
+                        hasStreamedReasoning = true;
+                        writeSse({
+                            id: 'chatcmpl-' + Date.now(),
+                            object: 'chat.completion.chunk',
+                            created: Math.floor(Date.now() / 1000),
+                            model: mappedModel || DEFAULT_MODEL,
+                            choices: [
+                                { index: 0, delta: { reasoning_content: chunk }, finish_reason: null }
+                            ]
+                        });
+                    };
+
                     const result = await sendMessage(
                         messageContent,
                         mappedModel,
@@ -946,6 +962,10 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         { ...reasoningOptions, onReasoning: reasoningCallback }
                     );
 
+                    if (!hasStreamedReasoning && result?.choices?.[0]?.message?.reasoning_content) {
+                        reasoningCallback(result.choices[0].message.reasoning_content);
+                    }
+
                     if (result.error) {
                         writeSse({
                             id: 'chatcmpl-' + Date.now(),
@@ -958,11 +978,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         });
                     } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                         // Qwen returned JSON/normal response instead of SSE - send final as single chunk
-                        // When captureToolCalls is active, use cleanText (fence blocks stripped)
-                        // rather than raw content which includes the visible fence block.
-                        const content = captureToolCalls && _captureCleanText
-                            ? _captureCleanText
-                            : result.choices[0].message.content;
+                        const content = result.choices[0].message.content;
                         logDebug(`JSON response content length: ${content.length}`);
                         if (typeof streamingCallback === 'function') {
                             streamingCallback(content);
