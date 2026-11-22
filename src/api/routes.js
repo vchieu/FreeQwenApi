@@ -16,6 +16,7 @@ import { listTokens, markInvalid, markRateLimited, markValid, addTokenFromString
 import { FORGETMEAI_WATERMARK } from '../utils/branding.js';
 import { applySessionSync, getSessionSyncStatus } from './sessionSync.js';
 import { reasoningOptionsFromEffort } from './reasoning.js';
+import { parseToolCalls, mergeToolCalls, toolNames, toolRequiredParams } from './toolCalls.js';
 
 // Function for generating a deterministic chatId based on history
 function generateChatIdFromHistory(messages) {
@@ -631,6 +632,34 @@ function parseToolCallJson(content) {
 function applyToolPrompt(systemMessage, tools) {
     const prompt = toolsToPrompt(tools);
     return prompt ? `${systemMessage || ''}${prompt}`.trim() : systemMessage;
+}
+
+function normalizeOpenAIToolCalls(toolCalls = []) {
+    return toolCalls.map((call, index) => ({
+        id: call.id || `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+        type: 'function',
+        function: {
+            name: call?.function?.name || call?.name,
+            arguments: typeof call?.function?.arguments === 'string' ? call.function.arguments : JSON.stringify(call?.function?.arguments || call?.arguments || {})
+        },
+        index
+    })).filter(c => c.function.name);
+}
+
+function resolveToolCalls(result, combinedTools) {
+    if (!Array.isArray(combinedTools) || combinedTools.length === 0) return { calls: [], dropped: [] };
+    const allowed = toolNames(combinedTools);
+    const required = toolRequiredParams(combinedTools);
+    const nativeCalls = Array.isArray(result?.native_tool_calls) ? result.native_tool_calls : [];
+    const normalized = Array.isArray(result?.tool_calls_normalized) ? result.tool_calls_normalized : null;
+    if (normalized) {
+        return { calls: normalizeOpenAIToolCalls(normalized), dropped: result?.tool_calls_dropped || result?.native_tool_dropped || [] };
+    }
+    const content = result?.choices?.[0]?.message?.content || '';
+    const parsed = parseToolCalls(content, allowed, required);
+    const calls = normalizeOpenAIToolCalls(mergeToolCalls(nativeCalls, parsed.calls));
+    const dropped = [...(result?.native_tool_dropped || []), ...parsed.dropped];
+    return { calls, dropped };
 }
 
 function buildOpenAIToolResponse(result, mappedModel, toolCalls) {
@@ -1364,7 +1393,7 @@ router.post('/chat/completions', async (req, res) => {
         logInfo(`Using model: ${mappedModel}`);
         if (systemMessage) logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
 
-        const qwenTools = null; // Qwen Chat web API has no OpenAI tool schemas; we emulate via JSON prompt below.
+        const qwenTools = Array.isArray(combinedTools) && combinedTools.length > 0 ? combinedTools : null; // pass for native tool-call collection; prompt remains primary
         const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools);
 
         if (toolAwareSystemMessage) {
@@ -1447,12 +1476,14 @@ router.post('/chat/completions', async (req, res) => {
                 // One-shot chat: delete failed immediately, successful - by policy.
                 cleanupEphemeralChat(result, effectiveChatId, isMeta);
 
-                if (captureToolCalls) {
-                    const toolCalls = parseToolCallJson(result?.choices?.[0]?.message?.content);
-                    if (toolCalls && toolCalls.length > 0) {
+                                if (captureToolCalls) {
+                    const { calls: toolCalls, dropped } = resolveToolCalls(result, combinedTools);
+                    if (toolCalls.length > 0) {
+                        if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
                         writeToolCallsSse(res, mappedModel, result, toolCalls);
                         return;
                     }
+                    if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
                 }
                 if (!hasStreamedReasoning && result?.choices?.[0]?.message?.reasoning_content) {
                     writeReasoningChunk(result.choices[0].message.reasoning_content);
@@ -1553,10 +1584,12 @@ router.post('/chat/completions', async (req, res) => {
                 });
             }
 
-            const toolCalls = parseToolCallJson(result?.choices?.[0]?.message?.content);
-            if (toolCalls && toolCalls.length > 0) {
+            const { calls: toolCalls, dropped } = resolveToolCalls(result, combinedTools);
+            if (toolCalls.length > 0) {
+                if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
                 return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
             }
+            if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
 
             const openaiResponse = {
                 id: result.id || "chatcmpl-" + Date.now(),
@@ -1723,7 +1756,7 @@ router.post('/v1/chat/completions', async (req, res) => {
             logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
         }
 
-        const qwenTools = null; // Qwen Chat web API has no OpenAI tool schemas; we emulate via JSON prompt below.
+        const qwenTools = Array.isArray(combinedTools) && combinedTools.length > 0 ? combinedTools : null; // pass for native tool-call collection; prompt remains primary
         const toolAwareSystemMessage = applyToolPrompt(systemMessage, combinedTools);
         if (toolAwareSystemMessage) {
             logInfo(`System message: ${toolAwareSystemMessage.substring(0, 50)}${toolAwareSystemMessage.length > 50 ? '...' : ''}`);
@@ -1803,12 +1836,14 @@ router.post('/v1/chat/completions', async (req, res) => {
                     { ...reasoningOptions, onReasoning: reasoningCallback }
                 );
 
-                if (captureToolCalls) {
-                    const toolCalls = parseToolCallJson(result?.choices?.[0]?.message?.content);
-                    if (toolCalls && toolCalls.length > 0) {
+                                if (captureToolCalls) {
+                    const { calls: toolCalls, dropped } = resolveToolCalls(result, combinedTools);
+                    if (toolCalls.length > 0) {
+                        if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
                         writeToolCallsSse(res, mappedModel, result, toolCalls);
                         return;
                     }
+                    if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
                 }
                 if (!hasStreamedReasoning && result?.choices?.[0]?.message?.reasoning_content) {
                     writeReasoningChunk(result.choices[0].message.reasoning_content);
@@ -1911,10 +1946,12 @@ router.post('/v1/chat/completions', async (req, res) => {
                 messageText = result.response.text;
             }
 
-            const toolCalls = parseToolCallJson(messageText);
-            if (toolCalls && toolCalls.length > 0) {
+            const { calls: toolCalls, dropped } = resolveToolCalls({ ...result, choices: [{ index: 0, message: { role: 'assistant', content: messageText, ...(result?.choices?.[0]?.message?.reasoning_content ? { reasoning_content: result.choices[0].message.reasoning_content } : {}) }, finish_reason: 'stop' }] }, combinedTools);
+            if (toolCalls.length > 0) {
+                if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
                 return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls));
             }
+            if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
 
             const openaiResponse = {
                 id: result.id || "chatcmpl-" + Date.now(),

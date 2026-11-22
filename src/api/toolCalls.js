@@ -1,0 +1,455 @@
+// Tool-call parsing/normalization for Qwen -> OpenAI-compatible responses.
+// Pure module (no I/O) so scripts/core/verify-tools.mjs can verify offline.
+// Mirrors the in-page SSE constraints by keeping logic dependency-free.
+
+import crypto from 'crypto';
+
+const FENCE_OPEN = /```(tool_call|function_call|tool_code|json)(?![A-Za-z0-9_])[ \t]*\n?/gi;
+const FENCE_CLOSE = /\s*```/g;
+const XML_TAG_OPEN = /<tool_call>[ \t]*\n?/gi;
+const XML_TAG_CLOSE = /\s*<\/tool_call>/gi;
+const XML_FUNC_OPEN = /<function[= ](?:name=)?["']?(?<name>[\w.:-]+)["']?>[ \t]*\n?/gi;
+const XML_FUNC_CLOSE = /\s*<\/function>/gi;
+const XML_PARAM = /<parameter[= ](?:name=)?["']?(?<key>[\w.-]+)["']?>(?<val>.*?)(?:<\/parameter>|(?=<parameter\b)|(?=<\/function>)|(?=<\/tool_call>)|$)/gis;
+
+const NATIVE_TOOL_NAME_PREFIXES = ['functions.', 'default_api.'];
+const ARGUMENT_KEYS = ['arguments', 'args', 'input', 'parameters', 'params', 'action_input'];
+const NOTHING = Symbol('nothing');
+
+export function normalizeToolName(name) {
+    let n = String(name || '').trim();
+    const lower = n.toLowerCase();
+    for (const p of NATIVE_TOOL_NAME_PREFIXES) {
+        if (lower.startsWith(p)) {
+            n = n.slice(p.length);
+            break;
+        }
+    }
+    return n.trim();
+}
+
+export function toolNames(tools) {
+    const names = new Set();
+    for (const t of tools || []) {
+        const fn = t?.type === 'function' ? t.function : (t?.function || t);
+        if (fn && typeof fn.name === 'string' && fn.name.trim()) names.add(fn.name.trim());
+    }
+    return names;
+}
+
+export function toolRequiredParams(tools) {
+    const required = {};
+    for (const t of tools || []) {
+        const fn = t?.type === 'function' ? t.function : (t?.function || t);
+        if (!fn || typeof fn.name !== 'string' || !fn.name.trim()) continue;
+        const params = fn.parameters && typeof fn.parameters === 'object' ? fn.parameters : {};
+        const names = Array.isArray(params.required) ? params.required.filter(v => typeof v === 'string') : [];
+        if (names.length) required[fn.name.trim()] = new Set(names);
+    }
+    return required;
+}
+
+function stringifyArgs(rawArgs) {
+    if (typeof rawArgs === 'string') return rawArgs;
+    if (rawArgs === undefined || rawArgs === null) return '{}';
+    return JSON.stringify(rawArgs);
+}
+
+function parseArgsObject(rawArgs) {
+    if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) return { ok: true, value: rawArgs };
+    const text = typeof rawArgs === 'string' ? rawArgs.trim() : '';
+    if (!text) return { ok: true, value: {} };
+    try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return { ok: true, value: parsed };
+        return { ok: false, error: 'arguments must be a JSON object' };
+    } catch (e) {
+        return { ok: false, error: e.message };
+    }
+}
+
+export function missingRequiredParams(toolCalls, requiredByName) {
+    const missing = [];
+    if (!requiredByName || typeof requiredByName !== 'object') return missing;
+    for (const call of toolCalls || []) {
+        const name = call?.function?.name;
+        const req = requiredByName[name];
+        if (!req || req.size === 0) continue;
+        const parsed = parseArgsObject(call?.function?.arguments);
+        if (!parsed.ok) continue;
+        for (const p of req) {
+            if (!Object.prototype.hasOwnProperty.call(parsed.value, p)) missing.push(`${name}.${p}`);
+        }
+    }
+    return missing;
+}
+
+function parseLenientJson(raw) {
+    const text = String(raw || '').trim();
+    if (!text) return NOTHING;
+    try { return JSON.parse(text); } catch { /* fall through */ }
+
+    const fb = text.indexOf('{');
+    const lb = text.lastIndexOf('}');
+    const candidate = fb >= 0 && lb > fb ? text.slice(fb, lb + 1) : text;
+    try { return JSON.parse(candidate); } catch { /* fall through */ }
+
+    let repaired = candidate.replace(/^\s*\{\s*(["']?)([a-zA-Z0-9_.:-]+)\1\s*,\s*/, '{"name":"$2",');
+    repaired = repaired.replace(/,\s*([}\]])/g, '$1');
+    try { return JSON.parse(repaired); } catch { /* fall through */ }
+    return NOTHING;
+}
+
+function extractArgs(raw) {
+    for (const key of ARGUMENT_KEYS) {
+        if (raw && Object.prototype.hasOwnProperty.call(raw, key)) return raw[key];
+    }
+    // Some models put args at top-level alongside name/id/type.
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+        const copy = { ...raw };
+        for (const k of ['name', 'tool', 'tool_name', 'action', 'id', 'type', 'description', 'function', 'tool_call', 'tool_calls']) delete copy[k];
+        if (Object.keys(copy).length > 0) return copy;
+    }
+    return {};
+}
+
+function normalizeRawCall(raw, index = 0) {
+    if (!raw || typeof raw !== 'object') return null;
+    let call = raw;
+    if (raw.function_call || raw.tool_call) call = raw.function_call || raw.tool_call;
+    if (Array.isArray(raw.tool_calls) && raw.tool_calls.length === 1) call = raw.tool_calls[0];
+    const fn = call.function && typeof call.function === 'object' ? call.function : null;
+    const name = normalizeToolName(call.name || call.tool || call.tool_name || call.action || fn?.name);
+    if (!name) return null;
+    const argsRaw = fn?.arguments ?? extractArgs(call);
+    const args = stringifyArgs(argsRaw);
+    return {
+        id: String(call.id || call.call_id || call.tool_call_id || `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`),
+        type: 'function',
+        function: { name, arguments: args },
+        index
+    };
+}
+
+function parseXmlFunctionBlock(blockText) {
+    const results = [];
+    let m;
+    XML_FUNC_OPEN.lastIndex = 0;
+    while ((m = XML_FUNC_OPEN.exec(blockText)) !== null) {
+        const fnName = normalizeToolName(m.groups?.name || m[1] || '');
+        if (!fnName) continue;
+        const bodyStart = m.index + m[0].length;
+        XML_FUNC_CLOSE.lastIndex = bodyStart;
+        const close = XML_FUNC_CLOSE.exec(blockText);
+        const body = blockText.slice(bodyStart, close ? close.index : blockText.length);
+        const params = {};
+        XML_PARAM.lastIndex = 0;
+        let p;
+        while ((p = XML_PARAM.exec(body)) !== null) {
+            const key = String(p.groups?.key || p[1] || '').trim();
+            let val = String(p.groups?.val || p[2] || '').trim();
+            if (!key) continue;
+            try {
+                const parsed = JSON.parse(val);
+                if (parsed !== null && typeof parsed === 'object' || typeof parsed === 'number' || typeof parsed === 'boolean') {
+                    params[key] = parsed;
+                    continue;
+                }
+            } catch { /* keep string */ }
+            if (val === 'true') params[key] = true;
+            else if (val === 'false') params[key] = false;
+            else if (val === 'null') params[key] = null;
+            else if (/^-?\d+(?:\.\d+)?$/.test(val)) params[key] = Number(val);
+            else params[key] = val;
+        }
+        results.push({ name: fnName, arguments: params });
+        if (close) XML_FUNC_OPEN.lastIndex = close.index + close[0].length;
+    }
+    return results;
+}
+
+function collectJsonObjects(text) {
+    const dec = { rawDecode: (s, i) => {
+        // Simple raw decode using JSON.parse by scanning; fallback below handles.
+        throw new Error('unused');
+    } };
+    const objs = [];
+    let i = 0;
+    while (i < text.length) {
+        const ch = text[i];
+        if (ch !== '{' && ch !== '[') { i++; continue; }
+        // Scan for balanced JSON object/array starting at i
+        let depth = 0, inStr = false, esc = false, start = i, end = -1;
+        for (let j = i; j < text.length; j++) {
+            const c = text[j];
+            if (inStr) {
+                if (esc) esc = false;
+                else if (c === '\\') esc = true;
+                else if (c === '"') inStr = false;
+                continue;
+            }
+            if (c === '"') { inStr = true; continue; }
+            if (c === '{' || c === '[') depth++;
+            else if (c === '}' || c === ']') {
+                depth--;
+                if (depth === 0) { end = j + 1; break; }
+            }
+        }
+        if (end === -1) break;
+        const slice = text.slice(start, end);
+        try {
+            objs.push({ value: JSON.parse(slice), end });
+            i = end;
+        } catch {
+            i++;
+        }
+    }
+    return objs;
+}
+
+function* iterBlocks(text) {
+    const candidates = [];
+    FENCE_OPEN.lastIndex = 0;
+    let m;
+    while ((m = FENCE_OPEN.exec(text)) !== null) {
+        candidates.push({ start: m.index, endOpen: m.index + m[0].length, kind: m[1].toLowerCase(), isXml: false });
+    }
+    XML_TAG_OPEN.lastIndex = 0;
+    while ((m = XML_TAG_OPEN.exec(text)) !== null) {
+        candidates.push({ start: m.index, endOpen: m.index + m[0].length, kind: 'tool_call', isXml: true });
+    }
+    candidates.sort((a, b) => a.start - b.start);
+
+    let consumedUpTo = 0;
+    for (const cand of candidates) {
+        if (cand.start < consumedUpTo) continue;
+
+        if (cand.isXml) {
+            XML_TAG_CLOSE.lastIndex = cand.endOpen;
+            const close = XML_TAG_CLOSE.exec(text);
+            const blockEnd = close ? close.index + close[0].length : text.length;
+            const rawBlock = text.slice(cand.endOpen, close ? close.index : text.length);
+
+            // Try JSON objects inside XML tag
+            let j = cand.endOpen;
+            while (j < text.length && /[\s\r\n\t]/.test(text[j])) j++;
+            let anyDecoded = false;
+            if (text[j] === '{' || text[j] === '[') {
+                const objs = collectJsonObjects(text.slice(j, close ? close.index : text.length));
+                if (objs.length > 0) {
+                    for (const obj of objs) {
+                        yield { start: cand.start, end: blockEnd, data: obj.value, kind: cand.kind };
+                        anyDecoded = true;
+                    }
+                }
+            }
+
+            if (!anyDecoded && XML_FUNC_OPEN.test(rawBlock)) {
+                XML_FUNC_OPEN.lastIndex = 0;
+                const xmlCalls = parseXmlFunctionBlock(rawBlock);
+                if (xmlCalls.length > 0) {
+                    for (const item of xmlCalls) yield { start: cand.start, end: blockEnd, data: item, kind: cand.kind };
+                    consumedUpTo = blockEnd;
+                    continue;
+                }
+            }
+            if (!anyDecoded) {
+                const lenient = parseLenientJson(rawBlock);
+                if (lenient !== NOTHING) yield { start: cand.start, end: blockEnd, data: lenient, kind: cand.kind };
+            }
+            consumedUpTo = blockEnd;
+            continue;
+        }
+
+        // Fence block: find closing ``` after endOpen
+        FENCE_CLOSE.lastIndex = cand.endOpen;
+        let close = null;
+        let cm;
+        while ((cm = FENCE_CLOSE.exec(text)) !== null) {
+            // ensure it's a fence close on its own line-ish; accept any ```
+            close = cm;
+            break;
+        }
+        const blockEnd = close ? close.index + close[0].length : text.length;
+        const rawBlock = text.slice(cand.endOpen, close ? close.index : text.length);
+
+        // Parse multiple JSON objects in fence
+        const objs = collectJsonObjects(rawBlock);
+        if (objs.length > 0) {
+            for (const obj of objs) yield { start: cand.start, end: blockEnd, data: obj.value, kind: cand.kind };
+        } else {
+            const lenient = parseLenientJson(rawBlock);
+            if (lenient !== NOTHING) yield { start: cand.start, end: blockEnd, data: lenient, kind: cand.kind };
+        }
+        consumedUpTo = blockEnd;
+    }
+}
+
+function extractCallsFromData(data) {
+    if (Array.isArray(data)) return data;
+    if (!data || typeof data !== 'object') return [];
+    if (Array.isArray(data.tool_calls)) return data.tool_calls;
+    if (Array.isArray(data.calls)) return data.calls;
+    if (data.function_call || data.tool_call) return [data.function_call || data.tool_call];
+    if (data.name || data.tool || data.tool_name || data.action || data.function?.name) return [data];
+    return [];
+}
+
+export function parseToolCalls(text, allowedNames = null, requiredByName = null) {
+    if (typeof text !== 'string') return { calls: [], dropped: [], text: '' };
+    const allowed = allowedNames instanceof Set ? allowedNames : (Array.isArray(allowedNames) ? new Set(allowedNames) : null);
+    const required = requiredByName || {};
+    const calls = [];
+    const dropped = [];
+    let cleanText = text;
+
+    // 1) Structured blocks (fenced/XML)
+    const blocks = [...iterBlocks(text)];
+    if (blocks.length > 0) {
+        // Remove blocks from text in reverse order
+        const sorted = [...blocks].sort((a, b) => b.start - a.start);
+        for (const b of sorted) {
+            cleanText = cleanText.slice(0, b.start) + cleanText.slice(b.end);
+        }
+        for (const block of blocks) {
+            const rawCalls = extractCallsFromData(block.data);
+            for (const raw of rawCalls) {
+                const normalized = normalizeRawCall(raw, calls.length);
+                if (!normalized) continue;
+                const name = normalized.function.name;
+                if (allowed && !allowed.has(name)) { dropped.push(`undeclared tool: ${name}`); continue; }
+                const parsedArgs = parseArgsObject(normalized.function.arguments);
+                if (!parsedArgs.ok) { dropped.push(`unusable arguments for ${name}: ${parsedArgs.error}`); continue; }
+                normalized.function.arguments = JSON.stringify(parsedArgs.value);
+                calls.push(normalized);
+            }
+        }
+    }
+
+    // 2) Bare JSON fallback when no block calls found
+    if (calls.length === 0) {
+        const trimmed = text.trim();
+        const lenient = parseLenientJson(trimmed);
+        if (lenient !== NOTHING) {
+            const rawCalls = extractCallsFromData(lenient);
+            for (const raw of rawCalls) {
+                const normalized = normalizeRawCall(raw, calls.length);
+                if (!normalized) continue;
+                const name = normalized.function.name;
+                if (allowed && !allowed.has(name)) { dropped.push(`undeclared tool: ${name}`); continue; }
+                const parsedArgs = parseArgsObject(normalized.function.arguments);
+                if (!parsedArgs.ok) { dropped.push(`unusable arguments for ${name}: ${parsedArgs.error}`); continue; }
+                normalized.function.arguments = JSON.stringify(parsedArgs.value);
+                calls.push(normalized);
+            }
+            if (calls.length > 0) cleanText = '';
+        }
+    }
+
+    // Final required param validation: keep calls but caller can nudge; here we report as dropped? 
+    // Plan says "validate names/required params; reject broken arguments". Required missing should cause nudge/reject.
+    const missing = missingRequiredParams(calls, required);
+    if (missing.length > 0) {
+        for (const m of missing) dropped.push(`missing required parameter: ${m}`);
+        // remove calls with missing required params? simpler: mark unusable by returning no calls and dropped.
+        return { calls: [], dropped, text: cleanText.trim() };
+    }
+
+    // Ensure indices sequential
+    calls.forEach((c, i) => { c.index = i; });
+    return { calls, dropped, text: cleanText.trim() };
+}
+
+function jsonComplete(s) {
+    const t = String(s || '').trim();
+    if (!t.startsWith('{') && !t.startsWith('[')) return false;
+    try { JSON.parse(t); return true; } catch { return false; }
+}
+
+export function createNativeToolCallAccumulator() {
+    return { calls: [], order: [] };
+}
+
+export function collectNativeCall(acc, fc, allowedNames = null) {
+    if (!acc || !fc || typeof fc !== 'object') return;
+    const allowed = allowedNames instanceof Set ? allowedNames : (Array.isArray(allowedNames) ? new Set(allowedNames) : null);
+    const name = normalizeToolName(fc.name || fc.function?.name || '');
+    const rawArgs = typeof fc.arguments === 'string' ? fc.arguments : (fc.arguments ? JSON.stringify(fc.arguments) : (typeof fc.function?.arguments === 'string' ? fc.function.arguments : (fc.function?.arguments ? JSON.stringify(fc.function.arguments) : '')));
+    const cid = String(fc.id ?? fc.call_id ?? fc.tool_call_id ?? fc.index ?? '').trim();
+
+    if (!Array.isArray(acc.calls)) acc.calls = [];
+    if (!Array.isArray(acc.order)) acc.order = [];
+
+    let call = null;
+    if (cid) {
+        call = acc.calls.find(c => c.cid === cid && (!name || !c.name || c.name === name)) || null;
+        if (!call) {
+            call = { cid, name, arguments: '', emitted: false };
+            acc.calls.push(call);
+        }
+    } else {
+        call = acc.calls[acc.calls.length - 1] || null;
+        const newByName = !!(name && call && call.name && call.name !== name);
+        const boundary = !!(call && rawArgs && jsonComplete(call.arguments) && String(rawArgs).trim().startsWith('{') && !String(rawArgs).startsWith(call.arguments));
+        if (!call || newByName || boundary) {
+            call = { cid: '', name, arguments: '', emitted: false };
+            acc.calls.push(call);
+        }
+    }
+
+    if (name) call.name = name;
+    if (!rawArgs) return;
+    const prev = call.arguments || '';
+    if (!prev) call.arguments = rawArgs;
+    else if (rawArgs.startsWith(prev)) call.arguments = rawArgs;
+    else if (prev.startsWith(rawArgs)) { /* keep longer */ }
+    else call.arguments += rawArgs;
+}
+
+export function flushNativeToolCalls(acc, allowedNames = null) {
+    const allowed = allowedNames instanceof Set ? allowedNames : (Array.isArray(allowedNames) ? new Set(allowedNames) : null);
+    const out = { calls: [], dropped: [] };
+    if (!acc || !Array.isArray(acc.calls)) return out;
+
+    for (const entry of acc.calls) {
+        const name = normalizeToolName(entry?.name || '');
+        if (!name) continue;
+        if (allowed && !allowed.has(name)) {
+            out.dropped.push(`undeclared tool: ${name}`);
+            continue;
+        }
+        const rawArgs = String(entry.arguments || '').trim() || '{}';
+        const parsed = parseArgsObject(rawArgs);
+        if (!parsed.ok) {
+            out.dropped.push(`unusable arguments for ${name}: ${parsed.error}`);
+            continue;
+        }
+        out.calls.push({
+            id: String(entry.cid || `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`),
+            type: 'function',
+            function: { name, arguments: JSON.stringify(parsed.value) },
+            index: out.calls.length
+        });
+    }
+    return out;
+}
+
+export function mergeToolCalls(nativeCalls = [], textCalls = []) {
+    const merged = [];
+    const seen = new Set();
+    for (const call of [...(nativeCalls || []), ...(textCalls || [])]) {
+        const name = normalizeToolName(call?.function?.name || '');
+        const args = typeof call?.function?.arguments === 'string' ? call.function.arguments : JSON.stringify(call?.function?.arguments || {});
+        if (!name) continue;
+        const key = `${name}\n${args}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        merged.push({
+            id: call.id || `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`,
+            type: 'function',
+            function: { name, arguments: args },
+            index: merged.length
+        });
+    }
+    return merged;
+}

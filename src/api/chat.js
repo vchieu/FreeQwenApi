@@ -11,6 +11,10 @@ import {
     applyFeatureConfigMode, modeForReasoningEffort, createThinkingAccumulator,
     consumeThinkingDelta, reasoningFromCompletion
 } from './reasoning.js';
+import {
+    createNativeToolCallAccumulator, collectNativeCall, flushNativeToolCalls,
+    parseToolCalls, mergeToolCalls, toolNames, toolRequiredParams
+} from './toolCalls.js';
 import crypto from 'crypto';
 import {
     CHAT_API_URL, CREATE_CHAT_URL, CHAT_PAGE_URL, TASK_STATUS_URL,
@@ -536,7 +540,7 @@ function parseNonSseCompletionBody(body) {
     return { success: false, error: 'Unexpected non-SSE 200 response', errorBody: body };
 }
 
-async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk, onReasoning = null) {
+async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk, onReasoning = null, options = {}) {
     try {
         if (!token) return { success: false, error: 'Auth token not found' };
         if (typeof fetch !== 'function') return { success: false, error: 'Fetch API is unavailable' };
@@ -578,6 +582,8 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 
         const decoder = new TextDecoder();
         const thinkingState = createThinkingAccumulator();
+        const allowedToolNames = options.allowedToolNames instanceof Set ? options.allowedToolNames : null;
+        const nativeAcc = allowedToolNames ? createNativeToolCallAccumulator() : null;
         let buffer = '';
         let fullContent = '';
         let fullReasoning = '';
@@ -625,6 +631,15 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 
                     if (chunk.choices && chunk.choices[0]) {
                         const delta = chunk.choices[0].delta || chunk.choices[0].message;
+                        if (nativeAcc && delta?.function_call) {
+                            collectNativeCall(nativeAcc, delta.function_call, allowedToolNames);
+                        }
+                        if (nativeAcc && Array.isArray(delta?.tool_calls)) {
+                            for (const tc of delta.tool_calls) {
+                                const fn = tc?.function || tc;
+                                collectNativeCall(nativeAcc, { id: tc?.id ?? tc?.index, name: fn?.name, arguments: fn?.arguments }, allowedToolNames);
+                            }
+                        }
                         const { reasoning, content } = consumeThinkingDelta(thinkingState, delta);
                         if (content) {
                             fullContent += content;
@@ -654,27 +669,32 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
             return { success: false, ...streamError, hasStreamedChunks };
         }
 
+        const native = nativeAcc ? flushNativeToolCalls(nativeAcc, allowedToolNames) : { calls: [], dropped: [] };
+        const resultData = {
+            id: responseId || 'chatcmpl-' + Date.now(),
+            object: 'chat.completion',
+            created: Math.floor(Date.now() / 1000),
+            model: payload.model,
+            choices: [{
+                index: 0,
+                message: {
+                    role: 'assistant',
+                    content: fullContent,
+                    ...(fullReasoning ? { reasoning_content: fullReasoning } : {})
+                },
+                finish_reason: 'stop'
+            }],
+            usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            response_id: responseId
+        };
+        if (native.calls.length > 0) resultData.native_tool_calls = native.calls;
+        if (native.dropped.length > 0) resultData.native_tool_dropped = native.dropped;
+
         return {
             success: true,
             isTask: false,
             hasStreamedChunks,
-            data: {
-                id: responseId || 'chatcmpl-' + Date.now(),
-                object: 'chat.completion',
-                created: Math.floor(Date.now() / 1000),
-                model: payload.model,
-                choices: [{
-                    index: 0,
-                    message: {
-                        role: 'assistant',
-                        content: fullContent,
-                        ...(fullReasoning ? { reasoning_content: fullReasoning } : {})
-                    },
-                    finish_reason: 'stop'
-                }],
-                usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-                response_id: responseId
-            }
+            data: resultData
         };
     } catch (error) {
         return { success: false, error: error.toString() };
@@ -776,13 +796,14 @@ export async function deleteChatV2(chatId) {
     }
 }
 
-async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, onReasoning = null) {
+async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, onReasoning = null, options = {}) {
     const baxiaHeaders = loadBaxiaHeaders();
+    const allowedToolNames = options.allowedToolNames instanceof Set ? Array.from(options.allowedToolNames) : null;
     if (baxiaHeaders && payload?.stream !== false && typeof onChunk === 'function') {
         logInfo('Baxia headers found: request will go through browser (node-streaming skipped)');
     }
     if (!baxiaHeaders && payload?.stream !== false && typeof onChunk === 'function') {
-        const streamedResponse = await executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk, onReasoning);
+        const streamedResponse = await executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk, onReasoning, options);
 
         // Qwen's Aliyun WAF blocks the browserless node-streaming fetch and returns a
         // non-SSE captcha page (errorBody = WAF html). Do NOT return that - fall through
@@ -806,7 +827,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
         logWarn(`Node-streaming unavailable (${streamedResponse.error || 'unknown error'}), falling back to browser fetch.`);
     }
 
-    const requestBody = { apiUrl, payload, token, headers: baxiaHeaders || null };
+    const requestBody = { apiUrl, payload, token, headers: baxiaHeaders || null, allowedToolNames };
 
     logDebug(`Using token: ${token ? 'Session token' : 'No token'}`);
     logDebug(`API URL: ${apiUrl}`);
@@ -827,6 +848,75 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                 const raw = (v && typeof v === 'object' && !Array.isArray(v) && v.content !== undefined) ? v.content : v;
                 const list = Array.isArray(raw) ? raw : (raw == null ? [] : [raw]);
                 return list.map(p => partsText(p).trim()).filter(Boolean).join(sep);
+            };
+            const normalizeToolName = (name) => {
+                let n = String(name || '').trim();
+                const lower = n.toLowerCase();
+                for (const p of ['functions.', 'default_api.']) {
+                    if (lower.startsWith(p)) { n = n.slice(p.length); break; }
+                }
+                return n.trim();
+            };
+            const jsonComplete = (s) => {
+                const t = String(s || '').trim();
+                if (!t.startsWith('{') && !t.startsWith('[')) return false;
+                try { JSON.parse(t); return true; } catch { return false; }
+            };
+            const parseArgsObject = (rawArgs) => {
+                if (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) return { ok: true, value: rawArgs };
+                const t = typeof rawArgs === 'string' ? rawArgs.trim() : '';
+                if (!t) return { ok: true, value: {} };
+                try {
+                    const parsed = JSON.parse(t);
+                    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) return { ok: true, value: parsed };
+                    return { ok: false, error: 'arguments must be a JSON object' };
+                } catch (e) { return { ok: false, error: String(e && e.message || e) }; }
+            };
+            const allowedToolNames = Array.isArray(data.allowedToolNames) ? new Set(data.allowedToolNames) : null;
+            const nativeCalls = [];
+            const collectNative = (fc) => {
+                if (!fc || !allowedToolNames) return;
+                const name = normalizeToolName(fc.name || (fc.function && fc.function.name) || '');
+                const rawArgs = typeof fc.arguments === 'string' ? fc.arguments
+                    : (fc.arguments ? JSON.stringify(fc.arguments)
+                    : (typeof (fc.function && fc.function.arguments) === 'string' ? fc.function.arguments
+                    : (fc.function && fc.function.arguments ? JSON.stringify(fc.function.arguments) : '')));
+                const cid = String(fc.id ?? fc.call_id ?? fc.tool_call_id ?? fc.index ?? '').trim();
+                let call = null;
+                if (cid) {
+                    call = nativeCalls.find(c => c.cid === cid && (!name || !c.name || c.name === name)) || null;
+                    if (!call) { call = { cid, name, arguments: '' }; nativeCalls.push(call); }
+                } else {
+                    call = nativeCalls[nativeCalls.length - 1] || null;
+                    const newByName = !!(name && call && call.name && call.name !== name);
+                    const boundary = !!(call && rawArgs && jsonComplete(call.arguments) && String(rawArgs).trim().startsWith('{') && !String(rawArgs).startsWith(call.arguments));
+                    if (!call || newByName || boundary) { call = { cid: '', name, arguments: '' }; nativeCalls.push(call); }
+                }
+                if (name) call.name = name;
+                if (!rawArgs) return;
+                const prev = call.arguments || '';
+                if (!prev) call.arguments = rawArgs;
+                else if (rawArgs.startsWith(prev)) call.arguments = rawArgs;
+                else if (prev.startsWith(rawArgs)) { /* keep */ }
+                else call.arguments += rawArgs;
+            };
+            const flushNative = () => {
+                const out = { calls: [], dropped: [] };
+                for (const entry of nativeCalls) {
+                    const name = normalizeToolName(entry.name || '');
+                    if (!name) continue;
+                    if (allowedToolNames && !allowedToolNames.has(name)) { out.dropped.push('undeclared tool: ' + name); continue; }
+                    const rawArgs = String(entry.arguments || '').trim() || '{}';
+                    const parsed = parseArgsObject(rawArgs);
+                    if (!parsed.ok) { out.dropped.push('unusable arguments for ' + name + ': ' + parsed.error); continue; }
+                    out.calls.push({
+                        id: String(entry.cid || ('call_' + Math.random().toString(16).slice(2) + Date.now().toString(16))),
+                        type: 'function',
+                        function: { name, arguments: JSON.stringify(parsed.value) },
+                        index: out.calls.length
+                    });
+                }
+                return out;
             };
             const thinkState = { thought: '', seenTitles: [], blockFinished: false };
             const consumeThinking = (delta) => {
@@ -986,6 +1076,13 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                             if (chunk.choices && chunk.choices[0]) {
                                 const choice = chunk.choices[0];
                                 const delta = choice.delta || choice.message;
+                                if (delta && delta.function_call) collectNative(delta.function_call);
+                                if (delta && Array.isArray(delta.tool_calls)) {
+                                    for (const tc of delta.tool_calls) {
+                                        const fn = tc.function || tc;
+                                        collectNative({ id: tc.id ?? tc.index, name: fn.name, arguments: fn.arguments });
+                                    }
+                                }
                                 // Thinking text goes to reasoning_content only;
                                 // answer phases go to content. Handles both
                                 // thinking_summary and full thinking phases.
@@ -1003,26 +1100,30 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                     return { success: false, ...streamError };
                 }
 
+                const native = flushNative();
+                const resultData = {
+                    id: responseId || 'chatcmpl-' + Date.now(),
+                    object: 'chat.completion',
+                    created: Math.floor(Date.now() / 1000),
+                    model: data.payload.model,
+                    choices: [{
+                        index: 0,
+                        message: {
+                            role: 'assistant',
+                            content: fullContent,
+                            ...(fullReasoning ? { reasoning_content: fullReasoning } : {})
+                        },
+                        finish_reason: 'stop'
+                    }],
+                    usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+                    response_id: responseId
+                };
+                if (native.calls.length > 0) resultData.native_tool_calls = native.calls;
+                if (native.dropped.length > 0) resultData.native_tool_dropped = native.dropped;
                 return {
                     success: true,
                     isTask: false,
-                    data: {
-                        id: responseId || 'chatcmpl-' + Date.now(),
-                        object: 'chat.completion',
-                        created: Math.floor(Date.now() / 1000),
-                        model: data.payload.model,
-                        choices: [{
-                            index: 0,
-                            message: {
-                                role: 'assistant',
-                                content: fullContent,
-                                ...(fullReasoning ? { reasoning_content: fullReasoning } : {})
-                            },
-                            finish_reason: 'stop'
-                        }],
-                        usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
-                        response_id: responseId
-                    }
+                    data: resultData
                 };
             }
 
@@ -1188,12 +1289,47 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
 
         logInfo('Sending request to API v2...');
 
+        const allowedToolNames = Array.isArray(tools) && tools.length > 0 ? toolNames(tools) : null;
+        const requiredToolParams = allowedToolNames ? toolRequiredParams(tools) : null;
+
         const payload = buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType, size, reasoningMode);
         logDebug('=== PAYLOAD V2 ===\n' + JSON.stringify(payload, null, 2));
         logDebug(`Sending message to chat ${chatId} with parent_id: ${parentId || 'null'}`);
 
         const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
-        const response = await executeApiRequest(page, apiUrl, payload, authToken, onChunk, options.onReasoning || null);
+        let response = await executeApiRequest(page, apiUrl, payload, authToken, onChunk, options.onReasoning || null, { allowedToolNames });
+
+        // One nudge retry max per request when tools were declared and model missed/broke tool call format.
+        if (response.success && !response.isTask && allowedToolNames && !options._toolRetryDone) {
+            const content = response?.data?.choices?.[0]?.message?.content || '';
+            const nativeCalls = Array.isArray(response?.data?.native_tool_calls) ? response.data.native_tool_calls : [];
+            const nativeDropped = Array.isArray(response?.data?.native_tool_dropped) ? response.data.native_tool_dropped : [];
+            const parsed = parseToolCalls(content, allowedToolNames, requiredToolParams);
+            const merged = mergeToolCalls(nativeCalls, parsed.calls);
+            const dropped = [...nativeDropped, ...parsed.dropped];
+
+            if (merged.length === 0) {
+                const names = Array.from(allowedToolNames).join(', ');
+                const reason = dropped.length > 0 ? ` Previous attempt was rejected: ${dropped.join('; ')}.` : '';
+                const nudge = `\n\nIMPORTANT: Use a tool call now.${reason} Respond ONLY with a tool_call block using one of these tools: ${names}.`;
+                const retryPayload = buildPayloadV2(messageContent, model, chatId, parentId, files, `${systemMessage || ''}${nudge}`.trim(), tools, toolChoice, chatType, size, reasoningMode);
+                logWarn(`Tool call missing/broken; retrying once with nudge. dropped=${dropped.length}`);
+                response = await executeApiRequest(page, apiUrl, retryPayload, authToken, onChunk, options.onReasoning || null, { allowedToolNames });
+                if (response?.data) response.data._toolRetryDone = true;
+            } else {
+                // Keep merged native+text calls for route normalization
+                response.data.tool_calls_normalized = merged;
+                if (dropped.length > 0) response.data.tool_calls_dropped = dropped;
+            }
+        } else if (response?.success && !response?.isTask && allowedToolNames) {
+            const content = response?.data?.choices?.[0]?.message?.content || '';
+            const nativeCalls = Array.isArray(response?.data?.native_tool_calls) ? response.data.native_tool_calls : [];
+            const parsed = parseToolCalls(content, allowedToolNames, requiredToolParams);
+            const merged = mergeToolCalls(nativeCalls, parsed.calls);
+            if (merged.length > 0) response.data.tool_calls_normalized = merged;
+            const dropped = [...(response?.data?.native_tool_dropped || []), ...parsed.dropped];
+            if (dropped.length > 0) response.data.tool_calls_dropped = dropped;
+        }
 
         if (response.success && response.isTask) {
             logInfo('Response with task detected (video generation)');
