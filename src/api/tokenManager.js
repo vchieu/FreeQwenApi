@@ -40,7 +40,15 @@ export function saveTokens(tokens) {
 export async function getAvailableToken() {
     const tokens = loadTokens();
     const now = Date.now();
-    const valid = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid);
+    // Qwen access tokens rotate every ~15 minutes. A JWT that is about to
+    // expire would produce a 401 mid-request, so skip it and let the caller
+    // pick up a fresh one from the browser tab.
+    const valid = tokens.filter(t => {
+        if (t.invalid) return false;
+        if (t.resetAt && new Date(t.resetAt).getTime() > now) return false;
+        const { exp } = decodeTokenInfo(t.token);
+        return !exp || exp > now + 30_000;
+    });
     if (!valid.length) return null;
     const token = valid[pointer % valid.length];
     pointer = (pointer + 1) % valid.length;
@@ -83,6 +91,21 @@ export function markValid(id, newToken) {
         if (newToken) tokens[idx].token = newToken;
         saveTokens(tokens);
     }
+}
+
+// A fresh token read from the Qwen tab must clear `invalid` on the matching
+// account even when getAvailableToken() had no usable token at all.
+export function markValidForToken(token) {
+    if (!token) return false;
+    const { accountId } = decodeTokenInfo(token);
+    const tokens = loadTokens();
+    const idx = tokens.findIndex(t =>
+        t.token === token ||
+        (accountId && decodeTokenInfo(t.token).accountId === accountId)
+    );
+    if (idx === -1) return false;
+    markValid(tokens[idx].id, token);
+    return true;
 }
 
 // Sets a human-readable label for the account (to distinguish in the pool).

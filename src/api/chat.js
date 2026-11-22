@@ -2,7 +2,7 @@ import { getBrowserContext, getAuthenticationStatus, setAuthenticationStatus, en
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
 import { shutdownBrowser, initBrowser } from '../browser/browser.js';
 import { saveAuthToken } from '../browser/session.js';
-import { getAvailableToken, markRateLimited, removeInvalidToken, markValid } from './tokenManager.js';
+import { getAvailableToken, markRateLimited, removeInvalidToken, markValid, markValidForToken, decodeTokenInfo } from './tokenManager.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -365,16 +365,44 @@ async function readTokenFromQwenTab(browserContext) {
     return null;
 }
 
+function tokenIsFresh(token, skewMs = 30_000) {
+    const { exp } = decodeTokenInfo(token);
+    return !exp || exp > Date.now() + skewMs;
+}
+
+// Qwen rotates the short-lived token in the tab. When we catch the old one
+// just before rotation, wait briefly for the page to install the replacement
+// instead of firing a request that is guaranteed to return 401.
+async function waitForFreshToken(browserContext, timeoutMs = 12_000) {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const token = await readTokenFromQwenTab(browserContext);
+        if (token && tokenIsFresh(token)) return token;
+        await delay(400);
+    }
+    return null;
+}
+
 async function resolveAuthToken(browserContext) {
     const tokenObj = await getAvailableToken();
-    const browserToken = await readTokenFromQwenTab(browserContext);
+    let browserToken = await readTokenFromQwenTab(browserContext);
+
+    if (browserToken && !tokenIsFresh(browserToken)) {
+        const refreshed = await waitForFreshToken(browserContext);
+        if (refreshed) browserToken = refreshed;
+        else {
+            logWarn('Browser token is expiring and no fresh token is available yet');
+            browserToken = null;
+        }
+    }
 
     if (browserToken) {
         authToken = browserToken;
         saveAuthToken(browserToken);
         if (tokenObj?.id) markValid(tokenObj.id, browserToken);
+        else markValidForToken(browserToken);
         logInfo(`Using fresh browser token${tokenObj ? ` for ${tokenObj.id}` : ''}`);
-        return tokenObj?.id ? { ...tokenObj, token: browserToken } : { id: 'browser', token: browserToken };
+        return { ...(tokenObj || {}), id: tokenObj?.id || 'browser', token: browserToken, source: 'browser' };
     }
 
     if (tokenObj && tokenObj.token) {
@@ -667,6 +695,7 @@ async function syncTokenFromPage(page, tokenObj = null) {
         authToken = fresh;
         saveAuthToken(fresh);
         if (tokenObj?.id) markValid(tokenObj.id, fresh);
+        markValidForToken(fresh);
         logInfo('Token updated from browser');
     } catch (e) {
         logWarn(`Failed to update token from browser: ${e.message}`);
@@ -929,12 +958,29 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
 
     if (response.status === 401 || (response.errorBody && (response.errorBody.includes('Unauthorized') || response.errorBody.includes('Token has expired')))) {
         logWarn(`Token ${tokenObj?.id} is invalid (401). Removing and trying another.`);
+        if (response.errorBody) logWarn(`401 response body: ${String(response.errorBody).slice(0, 300)}`);
         authToken = null;
         browserTokenRateLimited = false;
-        if (tokenObj?.id && tokenObj.id !== 'browser') {
+        const isBrowserToken = tokenObj?.source === 'browser' || tokenObj?.id === 'browser';
+        if (tokenObj?.id && !isBrowserToken) {
             const { markInvalid } = await import('./tokenManager.js');
             markInvalid(tokenObj.id);
         }
+
+        // A browser token can be rejected simply because Qwen rotated it a
+        // second before our request. Do not burn the account in that case:
+        // wait for the rotation and retry the SAME chat once.
+        if (isBrowserToken && retryCount < MAX_RETRY_COUNT) {
+            const fresh = await waitForFreshToken(getBrowserContext());
+            if (fresh) {
+                authToken = fresh;
+                saveAuthToken(fresh);
+                markValidForToken(fresh);
+                logInfo('Retrying with freshly rotated browser token');
+                return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk);
+            }
+        }
+
         const { hasValidTokens } = await import('./tokenManager.js');
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
             // chatId/parentId are reset: when switching accounts the old chat

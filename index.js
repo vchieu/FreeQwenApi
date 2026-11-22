@@ -8,6 +8,7 @@ import { initBrowser, shutdownBrowser } from './src/browser/browser.js';
 import apiRoutes from './src/api/routes.js';
 import { getAvailableModelsFromFile, getApiKeys } from './src/api/chat.js';
 import { loadTokens } from './src/api/tokenManager.js';
+import { syncModels } from './scripts/core/sync_models.js';
 import { addAccountInteractive } from './src/utils/accountSetup.js';
 import { logHttpRequest, logInfo, logError, logWarn } from './src/logger/index.js';
 import { prompt } from './src/utils/prompt.js';
@@ -40,8 +41,11 @@ function ensureNonInteractiveTokens() {
     const now = Date.now();
     const validTokens = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid);
     if (!validTokens.length) {
-        logError('All accounts are unavailable. Please re-run auth before starting the server.');
-        process.exit(1);
+        // The short-lived token in the logged-in Qwen tab can still be usable
+        // even when every stored account is marked invalid; let the browser
+        // token path clear the flags instead of refusing to start.
+        logWarn('All stored accounts are unavailable; relying on the Qwen tab token.');
+        return;
     }
     logInfo(`Auto-start: detected ${tokens.length} accounts, ${validTokens.length} active.`);
 }
@@ -176,6 +180,16 @@ async function startServer() {
     if (!browserInitialized) {
         logError('Failed to initialize browser. Shutting down.');
         process.exit(1);
+    }
+
+    // Refresh the current Qwen model list once per server start, using the
+    // logged-in tab when available (the public API exposes fewer models).
+    try {
+        const models = await syncModels({ useBrowser: true });
+        logInfo(`Model list refreshed at startup: ${models.merged} models (${models.discovered} found in Qwen Chat)`);
+        if (models.added.length) logInfo(`New models: ${models.added.join(', ')}`);
+    } catch (error) {
+        logWarn(`Startup model sync failed: ${error.message}`);
     }
 
     try {

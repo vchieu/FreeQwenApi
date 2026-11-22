@@ -1,7 +1,9 @@
 import fs from 'fs';
 import path from 'path';
+import { fileURLToPath } from 'url';
 
 const QWEN_CHAT_URL = process.env.QWEN_CHAT_URL || 'https://chat.qwen.ai/';
+const QWEN_MODELS_API_URL = process.env.QWEN_MODELS_API_URL || 'https://chat.qwen.ai/api/v2/models';
 const OUTPUT_FILE = process.env.QWEN_MODELS_FILE || path.join(process.cwd(), 'src', 'AvailableModels.txt');
 const DOC_FILE = process.env.QWEN_MODELS_DOC || path.join(process.cwd(), 'docs', 'QWEN_CHAT_MODELS.md');
 
@@ -49,21 +51,22 @@ function capabilitiesOf(model) {
     .sort();
 }
 
-async function fetchQwenChatModels() {
-  const response = await fetch(QWEN_CHAT_URL, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
-    }
-  });
-
-  if (!response.ok) {
-    throw new Error(`Request to Qwen Chat failed: HTTP ${response.status}`);
+async function fetchModelsFromBrowser() {
+  const cdpUrl = process.env.QWEN_CDP_URL || 'http://127.0.0.1:9222';
+  const puppeteer = (await import('puppeteer')).default;
+  const browser = await puppeteer.connect({ browserURL: cdpUrl });
+  try {
+    const page = (await browser.pages()).find(p => p.url().includes('chat.qwen.ai'));
+    if (!page) throw new Error('No Qwen tab available');
+    const models = await page.evaluate(() => window.__prerendered_data?.models || []);
+    if (!Array.isArray(models) || !models.length) throw new Error('No models in Qwen tab');
+    return models;
+  } finally {
+    browser.disconnect();
   }
+}
 
-  const html = await response.text();
-  const data = extractPrerenderedJson(html);
-  const models = Array.isArray(data.models) ? data.models : [];
+function normalizeModels(models) {
   return models
     .map(model => ({
       id: model.id,
@@ -72,6 +75,43 @@ async function fetchQwenChatModels() {
       description: model?.info?.meta?.short_description || model?.info?.meta?.description || ''
     }))
     .filter(model => model.id);
+}
+
+async function fetchQwenChatModels(useBrowser = false) {
+  const headers = {
+    'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+    'Accept': 'application/json,text/html;q=0.9,*/*;q=0.8'
+  };
+  const sources = [
+    ...(useBrowser ? [{ browser: true }] : []),
+    { url: QWEN_MODELS_API_URL, json: true },
+    { url: QWEN_CHAT_URL, json: false }
+  ];
+  let lastError;
+
+  for (const source of sources) {
+    try {
+      let models;
+      if (source.browser) {
+        models = await fetchModelsFromBrowser();
+      } else {
+        const response = await fetch(source.url, { headers });
+        if (!response.ok) throw new Error(`Request to ${source.url} failed: HTTP ${response.status}`);
+        if (source.json) {
+          const data = await response.json();
+          models = data?.data?.data || data?.data || [];
+        } else {
+          const data = extractPrerenderedJson(await response.text());
+          models = data.models || [];
+        }
+      }
+      if (!Array.isArray(models) || !models.length) throw new Error(`No models found in ${source.url || 'Qwen tab'}`);
+      return normalizeModels(models);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw lastError;
 }
 
 function writeModelsFile(file, models) {
@@ -124,23 +164,28 @@ function writeDocFile(file, discoveredModels, mergedIds, previousIds) {
   fs.writeFileSync(file, lines.join('\n'), 'utf8');
 }
 
-async function main() {
+export async function syncModels(options = {}) {
   const existing = uniq(readExistingModels(OUTPUT_FILE));
-  const discovered = await fetchQwenChatModels();
+  const discovered = await fetchQwenChatModels(Boolean(options.useBrowser));
   const discoveredIds = uniq(discovered.map(model => model.id));
   const merged = uniq([...discoveredIds, ...existing]);
 
   writeModelsFile(OUTPUT_FILE, merged);
   writeDocFile(DOC_FILE, discovered, merged, existing);
 
-  console.log(`Found Qwen Chat models: ${discoveredIds.length}`);
-  console.log(`Endpoint model list saved: ${merged.length} models -> ${OUTPUT_FILE}`);
-  console.log(`Synchronization report saved: ${DOC_FILE}`);
   const added = discoveredIds.filter(id => !existing.includes(id));
-  if (added.length) console.log(`New models: ${added.join(', ')}`);
+  return { discovered: discoveredIds.length, merged: merged.length, added };
 }
 
-main().catch(error => {
-  console.error(`Model synchronization failed: ${error.message}`);
-  process.exit(1);
-});
+const invokedDirectly = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (invokedDirectly) {
+  syncModels().then(({ discovered, merged, added }) => {
+    console.log(`Found Qwen Chat models: ${discovered}`);
+    console.log(`Endpoint model list saved: ${merged} models -> ${OUTPUT_FILE}`);
+    console.log(`Synchronization report saved: ${DOC_FILE}`);
+    if (added.length) console.log(`New models: ${added.join(', ')}`);
+  }).catch(error => {
+    console.error(`Model synchronization failed: ${error.message}`);
+    process.exit(1);
+  });
+}
