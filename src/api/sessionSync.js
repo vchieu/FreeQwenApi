@@ -1,6 +1,6 @@
-// Applies session material pushed from the logged-in Qwen tab (CDP observer or
-// the optional Chrome extension). Token and Baxia/WAF headers come from the
-// same real UI request, so they stay in sync.
+// Applies session material pushed from the logged-in Qwen tab by the CDP
+// observer. Token and Baxia/WAF headers come from the same real UI request,
+// so they stay in sync.
 
 import fs from 'node:fs';
 import path from 'node:path';

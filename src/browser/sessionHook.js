@@ -1,6 +1,6 @@
-// CDP-injected observer for the real Qwen UI. Branded Chrome refuses
-// --load-extension, so we inject the same capture logic into every Qwen tab:
-// watch the page's own chat-completions requests and push the token + Baxia
+// CDP-injected observer for the real Qwen UI. The proxy injects this into
+// every Qwen tab automatically — no browser extension is needed. It watches
+// the page's own chat-completions requests and pushes the token + Baxia
 // headers to the local proxy. Requests are never modified or delayed.
 
 import { logInfo, logWarn } from '../logger/index.js';

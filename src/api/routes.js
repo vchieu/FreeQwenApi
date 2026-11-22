@@ -301,7 +301,7 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage, limits: { fileSize: MAX_FILE_SIZE } });
 
-// --- Session sync (CDP observer / optional Chrome extension) ----------------
+// --- Session sync (CDP observer) --------------------------------------------
 // Registered before authMiddleware: the browser-side observer cannot carry an
 // API key, so it uses a custom header + loopback + allowed-origin checks.
 function syncAuthorized(req, res, next) {
@@ -314,9 +314,7 @@ function syncAuthorized(req, res, next) {
         return res.status(403).json({ error: 'Session sync is loopback-only' });
     }
     const origin = req.get('origin');
-    const allowed = !origin ||
-        /^(chrome-extension|moz-extension|safari-web-extension):\/\//i.test(origin) ||
-        origin === 'https://chat.qwen.ai';
+    const allowed = !origin || origin === 'https://chat.qwen.ai';
     if (!allowed) return res.status(403).json({ error: 'Sync origin not allowed' });
     if (origin) res.set('Access-Control-Allow-Origin', origin);
     if (!String(req.get('content-type') || '').startsWith('application/json') && req.method !== 'GET') {
