@@ -1,14 +1,13 @@
-# Зависимости Node.js
+# Node.js dependencies
 node_modules/
 package-lock.json
 yarn.lock
 
-# Данные сессии и кэш
+# Session data and cache
 session/
 .cache/
 
-
-# Служебные файлы
+# Local environment and service files
 .DS_Store
 .env
 .env.local
@@ -16,26 +15,21 @@ session/
 .env.test.local
 .env.production.local
 
-# Логи
+# Logs
 logs
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
-# Файлы Python
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-venv/
-.env/
-.venv/
-
-# Файлы редакторов
+# Editor files
 .idea/
 .vscode/
 *.swp
-*.swo 
+*.swo
 
+# Local authorization template
 src/Authorization.txt
+
+# Planning scratch files
+.opencode/

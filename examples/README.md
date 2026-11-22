@@ -1,179 +1,134 @@
-# Примеры использования FreeQwenApi
+# FreeQwenApi Usage Examples
 
-> 🌐 [English](README_en.md) | **Русский** | [Tiếng Việt](README_vi.md)
+> 🌐 **English** is the only documentation language.
 
-В этой директории собраны примеры использования API-прокси для Qwen AI.
+This directory contains examples of using the API proxy for Qwen AI.
 
-## Установка и запуск
+## Installation and Running
 
-Установка зависимостей производится в корневой директории проекта:
+Dependencies are installed in the project root directory:
 
 ```bash
-# В корневой директории проекта
+# In the project root directory
 npm install
 ```
 
-Перед запуском примеров убедитесь, что сервер FreeQwenApi запущен и доступен по адресу `http://localhost:3264`.
+Before running examples, make sure the FreeQwenApi server is running and available at `http://localhost:3264`.
 
 ```bash
-# Запуск сервера
+# Start the server
 npm start
 
-# В отдельном терминале запустите примеры
+# In a separate terminal, run examples
 npm run example:simple
 npm run example:stream
-# и т.д.
+# etc.
 ```
 
-## Примеры с использованием OpenAI SDK
+## Examples Using OpenAI SDK
 
-### 1. Простой запрос (не потоковый)
+### 1. Simple Request (non-streaming)
 
 ```bash
 npm run example:simple
 ```
 
-Демонстрирует отправку простого запроса к Qwen AI с использованием OpenAI SDK.
+Demonstrates sending a simple request to Qwen AI using OpenAI SDK.
 
-### 2. Потоковый запрос
+### 2. Streaming Request
 
 ```bash
 npm run example:stream
 ```
 
-Показывает, как получать ответ в потоковом режиме, где токены приходят по мере их генерации.
+Shows how to receive responses in streaming mode, where tokens arrive as they are generated.
 
-### 3. Запрос с системным сообщением
+### 3. Request with System Message
 
 ```bash
 npm run example:system
 ```
 
-Пример использования системного сообщения для задания роли и инструкций модели.
+Example of using a system message to set the role and instructions for the model.
 
-### 4. Анализ изображения
+### 4. Image Analysis
 
 ```bash
 npm run example:image
 ```
 
-Демонстрация отправки изображения для анализа моделью (требуется заменить URL изображения в примере).
+Demonstration of sending an image for model analysis (requires replacing the image URL in the example).
 
-### 5. Диалог с несколькими сообщениями
+### 5. Multi-message Conversation
 
 ```bash
 npm run example:conversation
 ```
 
-Пример поддержания диалога из нескольких сообщений с сохранением контекста.
+Example of maintaining a multi-message conversation with context preservation.
 
-### 6. Совместимость с OpenAI API
+### 6. OpenAI API Compatibility
 
 ```bash
 npm run example:compatibility
 ```
 
-Демонстрация полной совместимости с форматом API OpenAI.
+Demonstration of full compatibility with OpenAI API format.
 
-## Примеры прямого использования API
+## Direct API Usage Examples
 
-### 1. Запрос с использованием fetch
+### 1. Request Using fetch
 
 ```bash
 npm run example:direct
 ```
 
-Пример отправки прямого запроса к API без использования SDK, с использованием нативного fetch.
+Example of sending a direct API request without using SDK, using native fetch.
 
-### 2. Запрос с использованием axios
+### 2. Request Using axios
 
 ```bash
 npm run example:axios
 ```
 
-Пример использования библиотеки axios для отправки запросов к API.
+Example of using the axios library to send API requests.
 
-## Тесты генерации контента
+## Content Generation Tests
 
-### Тест всех типов генерации
+### Test All Generation Types
 
 ```bash
 npm run test:features
 ```
 
-Тестирует все три режима: текстовый чат (t2t), генерацию изображений (t2i) и генерацию видео (t2v).
+Tests all three modes: text chat (t2t), image generation (t2i), and video generation (t2v).
 
-### Сравнение режимов polling для видео
+### Compare Video Polling Modes
 
 ```bash
 npm run test:video-polling
 ```
 
-Сравнивает server-side polling (сервер сам ждёт) и client-side polling (клиент поллит вручную).
+Compares server-side polling (server waits) and client-side polling (client polls manually).
 
-> Подробная документация по генерации изображений и видео: [IMAGE_VIDEO_GENERATION_GUIDE.md](../IMAGE_VIDEO_GENERATION_GUIDE.md)
+> Detailed documentation on image and video generation: [IMAGE_VIDEO_GENERATION_GUIDE.md](../IMAGE_VIDEO_GENERATION_GUIDE.md)
 
-## Модификация примеров
+## Modifying Examples
 
-Вы можете модифицировать примеры для своих нужд:
+You can modify examples for your needs:
 
-1. Изменяйте запросы и параметры в файлах примеров
-2. Попробуйте различные модели (список доступен через `/api/models`)
-3. Экспериментируйте с разными форматами запросов
+1. Change requests and parameters in example files
+2. Try different models (list available via `/api/models`)
+3. Experiment with different request formats
 
-## Примеры на Python
+## Working with Images
 
-Python-реализация прокси запускает сервер с теми же OpenAI-совместимыми эндпоинтами:
-- `POST /api/chat/completions`
-- `POST /api/v1/chat/completions`
-- `POST /api/chat`
+For image examples, you need to:
 
-Запуск:
-```bash
-pip install -r requirements.txt
-python main.py
-```
+1. Upload an image in the official Qwen web interface
+2. Get the image URL from network requests (see instructions in the main project's README.md)
+3. Replace `IMAGE_URL` in the example with the obtained URL
 
-После запуска можно использовать те же curl/OpenAI SDK примеры из этого каталога, только направив `base_url` на `http://localhost:3264/api`.
+## Additional Information
 
-### Python OpenAI SDK примеры
-
-Установите зависимости:
-```bash
-pip install openai
-```
-
-Запуск:
-```bash
-python examples/python-sdk/simple.py
-python examples/python-sdk/streaming.py
-python examples/python-sdk/system_message.py
-python examples/python-sdk/image_analysis.py
-python examples/python-sdk/conversation.py
-python examples/python-sdk/openai_compatibility.py
-```
-
-### Python direct API примеры (httpx)
-
-Установите зависимости:
-```bash
-pip install httpx
-```
-
-Запуск:
-```bash
-python examples/python-direct/httpx_example.py
-python examples/python-direct/httpx_streaming.py
-```
-
-## Работа с изображениями
-
-Для примеров с изображениями необходимо:
-
-1. Загрузить изображение в официальном веб-интерфейсе Qwen
-2. Получить URL изображения из сетевых запросов (см. инструкцию в README.md основного проекта)
-3. Заменить `IMAGE_URL` в примере на полученный URL
-
-## Дополнительная информация
-
-Подробная документация API доступна в README.md основного проекта.
+Detailed API documentation is available in the main project's README.md.

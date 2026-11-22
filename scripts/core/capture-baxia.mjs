@@ -54,7 +54,7 @@ let page = pages.find(p => p.url().includes('chat.qwen.ai'));
 
 if (!page) {
     page = pages.find(p => p.url() === 'about:blank') || await browser.newPage();
-    console.log('Открываю chat.qwen.ai...');
+    console.log('Opening chat.qwen.ai...');
     await page.goto('https://chat.qwen.ai/', { waitUntil: 'domcontentloaded', timeout: 60_000 });
 }
 
@@ -71,12 +71,12 @@ function trySave(requestId) {
 
     const headers = filterHeaders({ ...entry.headers, ...entry.extra });
     if (!save(headers, entry.url, entry.postData)) {
-        console.log('В запросе нет bx-ua/bx-umidtoken — похоже, WAF пропустил его без проверки.');
+        console.log('No bx-ua/bx-umidtoken in the request - the WAF likely let it through without a challenge.');
         return;
     }
 
-    console.log(`Сохранено в ${OUT}`);
-    console.log('Заголовки:', Object.keys(headers).sort().join(', '));
+    console.log(`Saved to ${OUT}`);
+    console.log('Headers:', Object.keys(headers).sort().join(', '));
     process.exit(0);
 }
 
@@ -87,7 +87,7 @@ cdp.on('Network.requestWillBeSent', event => {
     entry.headers = event.request.headers;
     entry.postData = event.request.postData;
     pending.set(event.requestId, entry);
-    console.log('Поймал completions-запрос, жду заголовки...');
+    console.log('Caught a completions request, waiting for headers...');
     trySave(event.requestId);
 });
 
@@ -98,11 +98,11 @@ cdp.on('Network.requestWillBeSentExtraInfo', event => {
     trySave(event.requestId);
 });
 
-console.log(`Слушаю сеть вкладки: ${page.url()}`);
-console.log('Отправьте одно сообщение в окне Qwen и дождитесь запроса completions.');
-console.log(`Таймаут: ${Math.round(TIMEOUT_MS / 1000)} с.`);
+console.log(`Listening to tab network: ${page.url()}`);
+console.log('Send one message in the Qwen window and wait for the completions request.');
+console.log(`Timeout: ${Math.round(TIMEOUT_MS / 1000)} s.`);
 
 setTimeout(() => {
-    console.error('Не дождался запроса /api/v2/chat/completions.');
+    console.error('Timed out waiting for a /api/v2/chat/completions request.');
     process.exit(1);
 }, TIMEOUT_MS);
