@@ -46,19 +46,23 @@ export const LOGS_DIR = process.env.LOGS_DIR || 'logs';
 export const VIEWPORT_WIDTH = Number(process.env.VIEWPORT_WIDTH) || 1920;
 export const VIEWPORT_HEIGHT = Number(process.env.VIEWPORT_HEIGHT) || 1080;
 export const USER_AGENT = process.env.USER_AGENT || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36';
+export const PUPPETEER_PROTOCOL_TIMEOUT_MS = Number(process.env.PUPPETEER_PROTOCOL_TIMEOUT_MS) || 300000;
 
 // --- Server ----------------------------------------------------------------
 export const PORT = Number(process.env.PORT) || 3264;
 export const HOST = process.env.HOST || '0.0.0.0';
 export const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'qwen3.7-plus';
 export const ALLOW_UNSCOPED_SESSION_CHAT_RESTORE = toBoolean(process.env.ALLOW_UNSCOPED_SESSION_CHAT_RESTORE);
-// Qwen chat history cleanup mode for one-shot chats (without conversation_id):
-//   failed (default) - delete only failed/errored chats;
-//   all / 1 / true   - delete all such chats;
-//   off / 0 / false  - delete nothing.
-const AUTO_DELETE_CHATS_MODE = (process.env.AUTO_DELETE_CHATS || 'failed').trim().toLowerCase();
+// Qwen chat history cleanup mode for proxy-created Qwen chats.
+//   all / 1 / true     (default) - delete chats created by this proxy after response;
+//   failed             - delete only failed/errored chats;
+//   off / 0 / false    - delete nothing.
+// NOTE: clients usually send full conversation history, so deleting Qwen-side chats
+// does not remove context from the next request. Set to 'failed' or 'off' if you
+// need to inspect chats in Qwen UI.
+const AUTO_DELETE_CHATS_MODE = (process.env.AUTO_DELETE_CHATS || 'all').trim().toLowerCase();
 export const AUTO_DELETE_CHATS = ['1', 'true', 'yes', 'on', 'all'].includes(AUTO_DELETE_CHATS_MODE);
-export const DELETE_FAILED_CHATS = AUTO_DELETE_CHATS || !['0', 'false', 'off', 'no', 'none'].includes(AUTO_DELETE_CHATS_MODE);
+export const DELETE_FAILED_CHATS = AUTO_DELETE_CHATS || ['failed', 'error', 'errors'].includes(AUTO_DELETE_CHATS_MODE);
 
 // --- Logging ---------------------------------------------------------------
 export const LOG_LEVEL = process.env.LOG_LEVEL || 'info';

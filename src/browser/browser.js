@@ -9,6 +9,7 @@ import { logInfo, logError, logWarn, logDebug } from '../logger/index.js';
 import {
     CHAT_PAGE_URL, NAVIGATION_TIMEOUT, RETRY_DELAY,
     VIEWPORT_WIDTH, VIEWPORT_HEIGHT, USER_AGENT,
+    PUPPETEER_PROTOCOL_TIMEOUT_MS,
     SESSION_DIR, ACCOUNTS_DIR, PORT
 } from '../config.js';
 import { installSessionHook } from './sessionHook.js';
@@ -36,12 +37,14 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
             // CDP evaluate no longer hangs - no empty-browser login required.
             browserInstance = await puppeteer.connect({
                 browserURL: cdpUrl,
+                protocolTimeout: PUPPETEER_PROTOCOL_TIMEOUT_MS,
                 defaultViewport: { width: VIEWPORT_WIDTH, height: VIEWPORT_HEIGHT }
             });
         } else {
             browserInstance = await puppeteer.launch({
                 headless: !visibleMode,
                 slowMo: visibleMode ? 30 : 0,
+                protocolTimeout: PUPPETEER_PROTOCOL_TIMEOUT_MS,
                 executablePath: process.env.CHROME_PATH || undefined,
                 args: [
                     '--no-sandbox', '--disable-setuid-sandbox',

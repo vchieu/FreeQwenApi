@@ -1,6 +1,9 @@
 import { DEFAULT_MODEL } from '../config.js';
 
 const CANONICAL_MODELS = Object.freeze([
+    "qwen4-max",
+    "qwen3.8-max",
+    "qwen3.8-omni-flash",
     "qwen3.7-max",
     "qwen3.7-plus",
     "qwen3.6-plus",
@@ -36,6 +39,25 @@ const CANONICAL_MODELS = Object.freeze([
 const CANONICAL_MODEL_SET = new Set(CANONICAL_MODELS);
 
 const ALIAS_GROUPS = Object.freeze({
+    "qwen4-max": [
+        "Qwen4-Max",
+        "qwen4-max-latest",
+        "qwen-4-max",
+        "qwen4max"
+    ],
+    "qwen3.8-max": [
+        "Qwen3.8-Max",
+        "qwen3.8-max-latest",
+        "qwen-3.8-max",
+        "qwen38-max",
+        "qwen38max"
+    ],
+    "qwen3.8-omni-flash": [
+        "Qwen3.8-Omni-Flash",
+        "qwen3.8-omni-flash-latest",
+        "qwen3.8-omni",
+        "qwen38-omni-flash"
+    ],
     "qwen3.7-max": [
         "Qwen3.7-Max",
         "qwen3.7-max-latest",
@@ -230,25 +252,36 @@ const buildModelMapping = () => {
 export const MODEL_MAPPING = buildModelMapping();
 
 /**
- * Resolves requested model to an available model
+ * Resolves requested model to an available model.
+ * Unknown models are rejected (no silent fallback) so callers can return a clear
+ * error instead of silently sending a different model upstream.
  * @param {string} requestedModel - Requested model
- * @param {string} defaultModel - Default model
- * @returns {string} - Available model
+ * @param {string} [defaultModel=DEFAULT_MODEL] - Default model when request omits model
+ * @returns {{model:string|null, reason:string, requested:string|null}}
  */
-export function getMappedModel(requestedModel, defaultModel = DEFAULT_MODEL) {
-    if (!requestedModel) return defaultModel;
-
-    // Check exact match in mapping
-    if (MODEL_MAPPING[requestedModel]) {
-        return MODEL_MAPPING[requestedModel];
+export function resolveRequestedModel(requestedModel, defaultModel = DEFAULT_MODEL) {
+    if (!requestedModel) {
+        return { model: defaultModel, reason: 'default', requested: null };
     }
 
-    // Check if requested model is already available
+    if (MODEL_MAPPING[requestedModel]) {
+        const mapped = MODEL_MAPPING[requestedModel];
+        return { model: mapped, reason: mapped === requestedModel ? 'exact' : 'alias', requested: requestedModel };
+    }
+
     const availableModels = Object.values(MODEL_MAPPING);
     if (availableModels.includes(requestedModel)) {
-        return requestedModel;
+        return { model: requestedModel, reason: 'canonical', requested: requestedModel };
     }
 
-    // Return default model if no match found
-    return defaultModel;
+    return { model: null, reason: 'unsupported', requested: requestedModel };
+}
+
+/**
+ * Backward-compatible helper. Prefer resolveRequestedModel() so callers can
+ * distinguish "unsupported" from "mapped to default".
+ */
+export function getMappedModel(requestedModel, defaultModel = DEFAULT_MODEL) {
+    const resolved = resolveRequestedModel(requestedModel, defaultModel);
+    return resolved.model || defaultModel;
 }

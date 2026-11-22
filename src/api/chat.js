@@ -616,12 +616,16 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
                     const chunk = JSON.parse(jsonStr);
 
                     if (chunk.code === 'RateLimited' || (chunk.code && chunk.detail)) {
-                        streamError = { status: 429, errorBody: JSON.stringify(chunk) };
+                        const errBody = JSON.stringify(chunk);
+                        logWarn(`[upstream-error] stream status=429 model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${errBody.slice(0, 500)}`);
+                        streamError = { status: 429, errorBody: errBody };
                         finished = true;
                         break;
                     }
                     if (chunk.error && !chunk.choices) {
-                        streamError = { status: 500, errorBody: JSON.stringify(chunk) };
+                        const errBody = JSON.stringify(chunk);
+                        logWarn(`[upstream-error] stream status=500 model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${errBody.slice(0, 500)}`);
+                        streamError = { status: 500, errorBody: errBody };
                         finished = true;
                         break;
                     }
@@ -783,13 +787,13 @@ export async function deleteChatV2(chatId) {
         }, { id: chatId, token: authToken, extraHeaders: headers });
 
         if (result.ok) {
-            logInfo(`Chat ${chatId} deleted from Qwen history`);
+            logInfo(`[chat-cleanup] deleted chat ${chatId} status=${result.status}`);
             return true;
         }
-        logWarn(`Failed to delete chat ${chatId}: ${result.status || result.error}`);
+        logWarn(`[chat-cleanup] failed chat ${chatId} status=${result.status || 'n/a'} error=${result.error || ''} body=${(result.body || '').slice(0, 120)}`);
         return false;
     } catch (e) {
-        logWarn(`Failed to delete chat ${chatId}: ${e.message}`);
+        logWarn(`[chat-cleanup] exception deleting chat ${chatId}: ${e.message}`);
         return false;
     } finally {
         if (page) pagePool.releasePage(page);

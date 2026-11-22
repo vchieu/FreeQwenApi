@@ -3,7 +3,7 @@ import { sendMessage, getAllModels, getApiKeys, createChatV2, pollQwenTaskStatus
 import { getAuthenticationStatus, getBrowserContext } from '../browser/browser.js';
 import { checkAuthentication } from '../browser/auth.js';
 import { logInfo, logError, logDebug, logWarn } from '../logger/index.js';
-import { getMappedModel } from './modelMapping.js';
+import { resolveRequestedModel } from './modelMapping.js';
 import { getStsToken, uploadFileToQwen } from './fileUpload.js';
 import { loadHistory, saveHistory } from './chatHistory.js';
 import { generateImage, getAvailableImageModels, checkImageApiAvailability } from './imageGeneration.js';
@@ -222,13 +222,37 @@ const sessionToChatMap = new Map(); // session-key -> {chatId, parentId, timesta
 
 // One-shot chats (without conversation_id) are deleted from Qwen history:
 // failed/empty - always (mode "failed"), successful - only with AUTO_DELETE_CHATS=all.
-function cleanupEphemeralChat(result, effectiveChatId, isMeta) {
-    if (isMeta || effectiveChatId || !result?.chatId) return;
+function cleanupEphemeralChat(result, requestContext = {}) {
+    const { explicitChatId = null, effectiveChatId = null, isMeta = false, model = null } = requestContext;
+    const qwenChatId = result?.chatId;
+    const failed = Boolean(result?.error) || !Array.isArray(result?.choices) || result.choices.length === 0;
+    const mode = AUTO_DELETE_CHATS ? 'all' : (DELETE_FAILED_CHATS ? 'failed' : 'off');
+    const base = { mode, qwenChatId, explicitChatId: explicitChatId || null, effectiveChatId: effectiveChatId || null, isMeta, failed, model: model || null };
 
-    const failed = Boolean(result.error) || !Array.isArray(result.choices) || result.choices.length === 0;
-    if (!AUTO_DELETE_CHATS && !(DELETE_FAILED_CHATS && failed)) return;
+    if (!qwenChatId) {
+        logDebug(`[chat-cleanup] skip ${JSON.stringify({ ...base, reason: 'no_qwen_chat_id' })}`);
+        return;
+    }
+    if (isMeta) {
+        logDebug(`[chat-cleanup] skip ${JSON.stringify({ ...base, reason: 'meta_request' })}`);
+        return;
+    }
 
-    deleteChatV2(result.chatId).catch(() => {});
+    const shouldDelete = AUTO_DELETE_CHATS || (DELETE_FAILED_CHATS && failed);
+    if (!shouldDelete) {
+        logDebug(`[chat-cleanup] skip ${JSON.stringify({ ...base, reason: 'mode_does_not_apply' })}`);
+        return;
+    }
+
+    logInfo(`[chat-cleanup] delete ${JSON.stringify({ ...base, reason: failed ? 'failed_or_empty' : 'mode_all' })}`);
+    deleteChatV2(qwenChatId)
+        .then((ok) => {
+            if (ok) logInfo(`[chat-cleanup] deleted ${JSON.stringify({ qwenChatId, model: model || null })}`);
+            else logWarn(`[chat-cleanup] delete returned false ${JSON.stringify({ qwenChatId, model: model || null })}`);
+        })
+        .catch((error) => {
+            logWarn(`[chat-cleanup] delete failed ${JSON.stringify({ qwenChatId, model: model || null, error: error?.message || String(error) })}`);
+        });
 }
 
 function getSessionKey(req) {
@@ -831,12 +855,16 @@ router.post('/chat', async (req, res) => {
             logInfo(`History contains ${allMessages.length} messages`);
         }
 
-        let mappedModel = model || DEFAULT_MODEL;
-        if (model) {
-            mappedModel = getMappedModel(model);
-            if (mappedModel !== model) {
-                logInfo(`Model "${model}" replaced with "${mappedModel}"`);
-            }
+        const resolvedModel = resolveRequestedModel(model, DEFAULT_MODEL);
+        if (!resolvedModel.model) {
+            logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model, reason: resolvedModel.reason, endpoint: '/api/chat' })}`);
+            return res.status(400).json({ error: { message: `Model "${model}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
+        }
+        const mappedModel = resolvedModel.model;
+        if (resolvedModel.requested && resolvedModel.requested !== mappedModel) {
+            logInfo(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/chat' })}`);
+        } else {
+            logDebug(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/chat' })}`);
         }
         logInfo(`Using model: ${mappedModel}`);
 
@@ -1260,7 +1288,12 @@ router.post('/accounts/:id/label', localOnly, sameOriginOnly, (req, res) => {
 router.post('/chats', async (req, res) => {
     try {
         const { name, model } = req.body;
-        const chatModel = model ? getMappedModel(model) : DEFAULT_MODEL;
+        const resolvedModel = resolveRequestedModel(model, DEFAULT_MODEL);
+        if (!resolvedModel.model) {
+            logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model, reason: resolvedModel.reason, endpoint: '/api/chats' })}`);
+            return res.status(400).json({ error: { message: `Model "${model}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
+        }
+        const chatModel = resolvedModel.model;
         logInfo(`Creating new chat${name ? ` with name: ${name}` : ''}, model: ${chatModel}`);
         const result = await createChatV2(chatModel, name || 'New chat');
         if (result.error) { logError(`Error creating chat: ${result.error}`); return res.status(500).json({ error: result.error }); }
@@ -1386,9 +1419,16 @@ router.post('/chat/completions', async (req, res) => {
             logDebug('OpenWebUI meta-request: using separate chat (no history link)');
         }
 
-        let mappedModel = model ? getMappedModel(model) : DEFAULT_MODEL;
-        if (model && mappedModel !== model) {
-            logInfo(`Model "${model}" replaced with "${mappedModel}"`);
+        const resolvedModel = resolveRequestedModel(model, DEFAULT_MODEL);
+        if (!resolvedModel.model) {
+            logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model, reason: resolvedModel.reason, endpoint: '/api/chat/completions' })}`);
+            return res.status(400).json({ error: { message: `Model "${model}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
+        }
+        const mappedModel = resolvedModel.model;
+        if (resolvedModel.requested && resolvedModel.requested !== mappedModel) {
+            logInfo(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/chat/completions' })}`);
+        } else {
+            logDebug(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/chat/completions' })}`);
         }
         logInfo(`Using model: ${mappedModel}`);
         if (systemMessage) logInfo(`System message: ${systemMessage.substring(0, 50)}${systemMessage.length > 50 ? '...' : ''}`);
@@ -1473,8 +1513,8 @@ router.post('/chat/completions', async (req, res) => {
                     { ...reasoningOptions, onReasoning: reasoningCallback }
                 );
 
-                // One-shot chat: delete failed immediately, successful - by policy.
-                cleanupEphemeralChat(result, effectiveChatId, isMeta);
+                // Cleanup chat by configured policy (default all).
+                cleanupEphemeralChat(result, { explicitChatId, effectiveChatId, isMeta, model: mappedModel });
 
                                 if (captureToolCalls) {
                     const { calls: toolCalls, dropped } = resolveToolCalls(result, combinedTools);
@@ -1564,8 +1604,8 @@ router.post('/chat/completions', async (req, res) => {
             const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
             const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, reasoningOptions);
 
-            // One-shot chat: delete failed immediately, successful - by policy.
-            cleanupEphemeralChat(result, effectiveChatId, isMeta);
+            // Cleanup chat by configured policy (default all).
+            cleanupEphemeralChat(result, { explicitChatId, effectiveChatId, isMeta, model: mappedModel });
 
             // Save chatId to session for subsequent requests
             if (!isMeta && result.chatId) {
@@ -1746,9 +1786,16 @@ router.post('/v1/chat/completions', async (req, res) => {
             logDebug('OpenWebUI meta-request: using separate chat (no history link)');
         }
 
-        let mappedModel = model ? getMappedModel(model) : DEFAULT_MODEL;
-        if (model && mappedModel !== model) {
-            logInfo(`Model "${model}" replaced with "${mappedModel}"`);
+        const resolvedModel = resolveRequestedModel(model, DEFAULT_MODEL);
+        if (!resolvedModel.model) {
+            logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model, reason: resolvedModel.reason, endpoint: '/api/v1/chat/completions' })}`);
+            return res.status(400).json({ error: { message: `Model "${model}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
+        }
+        const mappedModel = resolvedModel.model;
+        if (resolvedModel.requested && resolvedModel.requested !== mappedModel) {
+            logInfo(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/v1/chat/completions' })}`);
+        } else {
+            logDebug(`[model-resolve] ${JSON.stringify({ requested: resolvedModel.requested, mapped: mappedModel, reason: resolvedModel.reason, endpoint: '/api/v1/chat/completions' })}`);
         }
         logInfo(`Using model: ${mappedModel}`);
 
@@ -2209,7 +2256,12 @@ router.post('/images/generations', async (req, res) => {
             }));
         }
 
-        const chatModel = getMappedModel(model || CHAT_MEDIA_MODEL);
+        const resolvedModel = resolveRequestedModel(model || CHAT_MEDIA_MODEL, DEFAULT_MODEL);
+        if (!resolvedModel.model) {
+            logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model || CHAT_MEDIA_MODEL, reason: resolvedModel.reason, endpoint: req.path })}`);
+            return res.status(400).json({ error: { message: `Model "${model || CHAT_MEDIA_MODEL}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
+        }
+        const chatModel = resolvedModel.model;
         const aspectRatio = normalizeQwenAspectRatio(size, req.body.aspect_ratio || '16:9');
         const result = await sendMessage(
             prompt,
@@ -2261,7 +2313,12 @@ router.post('/videos/generations', async (req, res) => {
             return res.status(400).json({ error: 'Parameter "prompt" is required' });
         }
 
-        const chatModel = getMappedModel(model || CHAT_MEDIA_MODEL);
+        const resolvedModel = resolveRequestedModel(model || CHAT_MEDIA_MODEL, DEFAULT_MODEL);
+        if (!resolvedModel.model) {
+            logWarn(`[model-resolve] unsupported ${JSON.stringify({ requested: model || CHAT_MEDIA_MODEL, reason: resolvedModel.reason, endpoint: req.path })}`);
+            return res.status(400).json({ error: { message: `Model "${model || CHAT_MEDIA_MODEL}" is not supported by this proxy.`, type: 'invalid_request_error', code: 'model_not_supported' } });
+        }
+        const chatModel = resolvedModel.model;
         const aspectRatio = normalizeQwenAspectRatio(size, req.body.aspect_ratio || '16:9');
         const result = await sendMessage(
             prompt,
