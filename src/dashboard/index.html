@@ -259,7 +259,7 @@
         <div class="row"><label class="k">Base URL</label><div class="val" id="baseUrl">—</div><button class="sm" data-copy="baseUrl" aria-label="Copy"><svg class="ic"><use href="#i-copy"/></svg></button></div>
         <div class="row"><label class="k">Open WebUI</label><div class="val" id="baseUrlApi">—</div><button class="sm" data-copy="baseUrlApi" aria-label="Copy"><svg class="ic"><use href="#i-copy"/></svg></button></div>
         <div class="row"><label class="k">API Key</label><div class="val">any non-empty (<b>sk-qwen</b>)</div><button class="sm" data-copy-text="sk-qwen" aria-label="Copy"><svg class="ic"><use href="#i-copy"/></svg></button></div>
-        <div class="row"><label class="k">Model</label><div class="val" id="defModel">qwen3.7-max</div><button class="sm" data-copy="defModel" aria-label="Copy"><svg class="ic"><use href="#i-copy"/></svg></button></div>
+        <div class="row"><label class="k">Model</label><div class="val" id="defModel">qwen3.7-plus</div><button class="sm" data-copy="defModel" aria-label="Copy"><svg class="ic"><use href="#i-copy"/></svg></button></div>
         <div class="row" style="margin-top:var(--s3)">
           <button class="sm" id="copyCurl"><svg class="ic"><use href="#i-copy"/></svg>cURL</button>
         </div>
@@ -338,7 +338,7 @@ $('#copySnippet').onclick=()=>copyText('copy(localStorage.token)');
 $('#copyCurl').onclick=()=>copyText(`curl ${apiV1}/chat/completions \\
 -H "Authorization: Bearer sk-qwen" \\
 -H "Content-Type: application/json" \\
--d '{"model":"qwen3.7-max","messages":[{"role":"user","content":"Hello"}]}'`);
+-d '{"model":"qwen3.7-plus","messages":[{"role":"user","content":"Hello"}]}'`);
 
 // Status + KPI --------------------------------------------------------------
 async function loadHealth(){
@@ -361,7 +361,7 @@ async function loadModels(){
   const ids=await fetchModels();
   $('#modelCount').textContent=ids.length;
   $('#modelList').innerHTML=ids.map(id=>`<span class="chip" data-model="${esc(id)}">${esc(id)}</span>`).join('')||'<span class="hint err-text">failed to load</span>';
-  if(ids.length && !ids.includes('qwen3.7-max')) $('#defModel').textContent=ids[0];
+  if(ids.length && !ids.includes('qwen3.7-plus')) $('#defModel').textContent=ids[0];
 }
 document.addEventListener('click', e=>{ const c=e.target.closest('.chip[data-model]'); if(c) copyText(c.dataset.model); });
 
@@ -438,7 +438,7 @@ setInterval(()=>{ if($('#tab-overview').classList.contains('active') && inited.o
 
 // Chat (history + files + markdown, via /api/chat/completions) --------------
 let chatHistory=[], chatBusy=false, chatAbort=null, pendingFiles=[];
-async function loadChatModels(){ const ids=await fetchModels(); $('#chatModel').innerHTML=ids.map(id=>`<option ${id==='qwen3.7-max'?'selected':''}>${esc(id)}</option>`).join('')||'<option>qwen3.7-max</option>'; renderChat(); }
+async function loadChatModels(){ const ids=await fetchModels(); $('#chatModel').innerHTML=ids.map(id=>`<option ${id==='qwen3.7-plus'?'selected':''}>${esc(id)}</option>`).join('')||'<option>qwen3.7-plus</option>'; renderChat(); }
 function attHtml(a){ return isImg(a) ? `<img src="${esc(a.url)}" alt="${esc(a.name)}"><a href="${esc(dlUrl(a.url,a.name))}">download</a>` : `<a href="${esc(dlUrl(a.url,a.name))}">${esc(a.name)}</a>`; }
 function bubbleEl(m){
   const d=document.createElement('div'); d.className='bubble '+m.role+(m.err?' err':'');

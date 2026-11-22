@@ -50,7 +50,7 @@ export const USER_AGENT = process.env.USER_AGENT || 'Mozilla/5.0 (Windows NT 10.
 // --- Server ----------------------------------------------------------------
 export const PORT = Number(process.env.PORT) || 3264;
 export const HOST = process.env.HOST || '0.0.0.0';
-export const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'qwen3.7-max';
+export const DEFAULT_MODEL = process.env.DEFAULT_MODEL || 'qwen3.7-plus';
 export const ALLOW_UNSCOPED_SESSION_CHAT_RESTORE = toBoolean(process.env.ALLOW_UNSCOPED_SESSION_CHAT_RESTORE);
 // Qwen chat history cleanup mode for one-shot chats (without conversation_id):
 //   failed (default) - delete only failed/errored chats;
