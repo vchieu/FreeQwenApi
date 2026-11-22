@@ -1,6 +1,10 @@
 // Tool-call parsing/normalization for Qwen -> OpenAI-compatible responses.
 // Pure module (no I/O) so scripts/core/verify-tools.mjs can verify offline.
 // Mirrors the in-page SSE constraints by keeping logic dependency-free.
+//
+// messagesToQwenPrompt() ports the Python qwen-web2api tools.py approach:
+//   flatten messages -> one prompt with a pinned '# Tool Use' block, then
+//   model outputs ```tool_call fences which parseToolCalls() decodes.
 
 import crypto from 'crypto';
 
@@ -432,6 +436,193 @@ export function flushNativeToolCalls(acc, allowedNames = null) {
         });
     }
     return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// messagesToQwenPrompt  — port of qwen-web2api/tools.py:messages_to_prompt()
+//
+// Converts an OpenAI messages array (+ optional tools/tool_choice) into a
+// single text prompt that Qwen Web understands.  The tool definitions are
+// rendered as a pinned "# Tool Use" block at the top; each message role is
+// serialised as labelled text; previous tool calls/results are reproduced as
+// ```tool_call fences + "[Tool result for …]" lines so the model has full
+// context.  Returns the finished prompt string.
+//
+// Usage (in routes.js):
+//   const prompt = messagesToQwenPrompt(messages, tools, tool_choice);
+//   // send prompt as the messageContent; do NOT set payload.tools
+// ─────────────────────────────────────────────────────────────────────────────
+
+const _TOOL_REMINDER = '\n\n[Reminder: you have working tools. To know what a file ' +
+    'contains or what a command produced, call the tool -- do ' +
+    'not answer from memory and do not claim to have read or ' +
+    'run anything you have not.]';
+
+function _stringifyContent(content) {
+    if (content === null || content === undefined) return '';
+    if (typeof content === 'string') return content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    if (Array.isArray(content)) {
+        const parts = [];
+        for (const c of content) {
+            if (c && typeof c === 'object') {
+                if (c.type === 'text' || c.type === 'input_text' || c.type === 'output_text') {
+                    if (c.text) parts.push(c.text);
+                } else if (typeof c.text === 'string') {
+                    parts.push(c.text);
+                }
+            } else if (typeof c === 'string') {
+                parts.push(c);
+            }
+        }
+        return parts.filter(Boolean).join('\n').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    }
+    return String(content);
+}
+
+function _fnOf(t) {
+    return (t && t.type === 'function' && t.function) ? t.function : (t && t.function ? t.function : t);
+}
+
+function _choiceInstruction(tool_choice) {
+    if (tool_choice === 'none') return '\n\nIMPORTANT: Do NOT call any tools. Respond with text only.';
+    if (tool_choice === 'required') return '\n\nIMPORTANT: You MUST call at least one tool. Do not respond with text only.';
+    if (tool_choice && typeof tool_choice === 'object') {
+        const fn = tool_choice.function;
+        const name = (fn && typeof fn === 'object') ? fn.name : (tool_choice.name || null);
+        if (name) return `\n\nIMPORTANT: You MUST call the tool "${name}". Do not call other tools.`;
+    }
+    return '';
+}
+
+function _toolUseBlock(toolDefs, constraint) {
+    const toolsJson = JSON.stringify(toolDefs, null, 0);
+    return (
+        '# Tool Use\n\n' +
+        'The tools below are connected to the user\'s machine and execute for ' +
+        'real the moment you call them.\n\n' +
+        'Call format (use this exact format):\n' +
+        '```tool_call\n' +
+        '{"name": "<tool_name>", "arguments": {<parameters>}}\n' +
+        '```\n\n' +
+        'Rules:\n' +
+        '- Each turn do exactly ONE of: (A) you need to read or change ' +
+        'something -> output ONLY tool_call block(s); (B) you already have ' +
+        'everything -> answer as plain text with NO block. Never both, and ' +
+        'never any prose after the block.\n' +
+        '- If the conversation\'s own instructions require every reply to use ' +
+        'a tool (for example an error such as "You did not use a tool in ' +
+        'your previous response"), do NOT answer in plain text: deliver the ' +
+        'final answer through the matching completion tool (for example ' +
+        'attempt_completion) as a tool_call block.\n' +
+        '- Every parameter belongs inside the "arguments" object, keyed ' +
+        'exactly like the tool\'s "parameters" properties -- never beside ' +
+        '"name".\n' +
+        '- Emit several blocks in one turn when the calls are independent.\n' +
+        '- Before reviewing or editing code, read the actual files with a ' +
+        'read/search tool first. Listing file names is not reading.\n' +
+        '- Never write [Tool result for ...] yourself and never invent a ' +
+        'result: emit the block and stop.\n' +
+        '- Never claim the tools are unavailable or that you lack ' +
+        'permission: they are connected and will run.\n\n' +
+        `Available tools:\n${toolsJson}${constraint}`
+    );
+}
+
+/**
+ * Convert an OpenAI messages array + tools into a single Qwen-Web prompt string.
+ *
+ * @param {Array}  messages    - OpenAI messages array
+ * @param {Array}  [tools]     - OpenAI tools array (optional)
+ * @param {*}      [tool_choice] - OpenAI tool_choice value (optional)
+ * @returns {string}  Complete prompt ready to send as the user message
+ */
+export function messagesToQwenPrompt(messages, tools = null, tool_choice = null) {
+    const parts = [];
+    let toolBlock = null;
+
+    // Build pinned tool-use block if tools are present and tool_choice != 'none'
+    if (tools && Array.isArray(tools) && tools.length > 0 && tool_choice !== 'none') {
+        const defs = [];
+        for (const t of tools) {
+            if (!t || typeof t !== 'object') continue;
+            const fn = _fnOf(t);
+            if (!fn || typeof fn !== 'object' || !fn.name) continue;
+            defs.push({
+                name: fn.name,
+                description: fn.description || '',
+                parameters: fn.parameters || {}
+            });
+        }
+        if (defs.length > 0) {
+            toolBlock = _toolUseBlock(defs, _choiceInstruction(tool_choice));
+        }
+    }
+
+    // Build id->name map from assistant tool_calls for tool result labelling
+    const idToName = {};
+    for (const m of messages || []) {
+        if (!m || m.role !== 'assistant') continue;
+        for (const tc of m.tool_calls || []) {
+            const fn = (tc && tc.function) || {};
+            if (tc && tc.id && fn.name) idToName[tc.id] = fn.name;
+        }
+    }
+
+    // Serialise each message
+    const combined = new Set(); // tool_call_ids already included inline with assistant
+    for (let i = 0; i < (messages || []).length; i++) {
+        const m = messages[i];
+        if (!m || typeof m !== 'object') continue;
+        let role = m.role || 'user';
+        if (role === 'developer') role = 'system';
+        const content = _stringifyContent(m.content);
+
+        if (role === 'system') {
+            parts.push(`[System instruction]: ${content}`);
+        } else if (role === 'assistant') {
+            if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+                // Render tool calls as fence blocks, then inline any following tool results
+                const blocks = [];
+                for (const tc of m.tool_calls) {
+                    const fn = (tc && tc.function) || {};
+                    let args = fn.arguments || '{}';
+                    if (typeof args !== 'string') args = JSON.stringify(args, null, 0);
+                    try { JSON.parse(args); } catch { args = '{}'; }
+                    blocks.push(
+                        '```tool_call\n' +
+                        JSON.stringify({ id: tc.id || '', name: fn.name || '', arguments: JSON.parse(args) }) +
+                        '\n```'
+                    );
+                }
+                let text = `[Assistant]: ${content}\n` + blocks.join('\n');
+                // Collect following tool result messages and inline them
+                for (let j = i + 1; j < messages.length; j++) {
+                    const nm = messages[j];
+                    if (!nm || nm.role !== 'tool') break;
+                    const tcid = nm.tool_call_id || '';
+                    combined.add(tcid);
+                    const name = nm.name || idToName[tcid] || 'tool';
+                    text += `\n[Tool result for ${name} (id=${tcid})]: ` + _stringifyContent(nm.content);
+                }
+                parts.push(text);
+            } else {
+                parts.push(`[Assistant]: ${content}`);
+            }
+        } else if (role === 'tool') {
+            const tcid = m.tool_call_id || '';
+            if (combined.has(tcid)) continue; // already inlined above
+            const name = m.name || idToName[tcid] || 'tool';
+            parts.push(`[Tool result for ${name} (id=${tcid})]: ${content}`);
+        } else {
+            // user (or unknown role)
+            parts.push(content);
+        }
+    }
+
+    if (toolBlock) parts.push(_TOOL_REMINDER);
+
+    const bodyText = parts.filter(Boolean).join('\n\n');
+    return toolBlock ? `${toolBlock}\n\n${bodyText}` : bodyText;
 }
 
 export function mergeToolCalls(nativeCalls = [], textCalls = []) {
