@@ -1,6 +1,6 @@
 # Qwen Chat Model Synchronization
 
-Generated: 2026-11-22T01:31:14.628Z
+Generated: 2026-11-22T01:46:14.816Z
 
 Source: prerendered model metadata from https://chat.qwen.ai/.
 
@@ -15,7 +15,7 @@ Source: prerendered model metadata from https://chat.qwen.ai/.
 
 ## Added by Latest Synchronization
 
-- `qwen4-max`
+- No new models.
 
 ## Endpoint Models Not in Current Qwen Chat Landing Metadata
 

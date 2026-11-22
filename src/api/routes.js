@@ -14,6 +14,7 @@ import fs from 'fs';
 import crypto from 'crypto';
 import { listTokens, markInvalid, markRateLimited, markValid, addTokenFromString, deleteAccount, decodeTokenInfo, updateAccountToken, setLabel } from './tokenManager.js';
 import { FORGETMEAI_WATERMARK } from '../utils/branding.js';
+import { applySessionSync, getSessionSyncStatus } from './sessionSync.js';
 
 // Function for generating a deterministic chatId based on history
 function generateChatIdFromHistory(messages) {
@@ -299,6 +300,40 @@ const storage = multer.diskStorage({
 });
 
 const upload = multer({ storage, limits: { fileSize: MAX_FILE_SIZE } });
+
+// --- Session sync (CDP observer / optional Chrome extension) ----------------
+// Registered before authMiddleware: the browser-side observer cannot carry an
+// API key, so it uses a custom header + loopback + allowed-origin checks.
+function syncAuthorized(req, res, next) {
+    if (req.get('x-qwen-sync') !== '1') {
+        return res.status(403).json({ error: 'Sync header required' });
+    }
+    const ip = req.socket?.remoteAddress || '';
+    if (ip !== '127.0.0.1' && ip !== '::1' && ip !== '::ffff:127.0.0.1') {
+        logWarn(`Blocked non-local session sync from ${ip}`);
+        return res.status(403).json({ error: 'Session sync is loopback-only' });
+    }
+    const origin = req.get('origin');
+    const allowed = !origin ||
+        /^(chrome-extension|moz-extension|safari-web-extension):\/\//i.test(origin) ||
+        origin === 'https://chat.qwen.ai';
+    if (!allowed) return res.status(403).json({ error: 'Sync origin not allowed' });
+    if (origin) res.set('Access-Control-Allow-Origin', origin);
+    if (!String(req.get('content-type') || '').startsWith('application/json') && req.method !== 'GET') {
+        return res.status(415).json({ error: 'Content-Type must be application/json' });
+    }
+    next();
+}
+
+router.get('/session/sync', syncAuthorized, (req, res) => {
+    res.json(getSessionSyncStatus());
+});
+
+router.post('/session/sync', syncAuthorized, (req, res) => {
+    const result = applySessionSync(req.body);
+    if (result.error) return res.status(400).json(result);
+    res.json(result);
+});
 
 // --- Auth middleware ---------------------------------------------------------
 

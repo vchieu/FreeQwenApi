@@ -9,8 +9,9 @@ import { logInfo, logError, logWarn, logDebug } from '../logger/index.js';
 import {
     CHAT_PAGE_URL, NAVIGATION_TIMEOUT, RETRY_DELAY,
     VIEWPORT_WIDTH, VIEWPORT_HEIGHT, USER_AGENT,
-    SESSION_DIR, ACCOUNTS_DIR
+    SESSION_DIR, ACCOUNTS_DIR, PORT
 } from '../config.js';
+import { installSessionHook } from './sessionHook.js';
 
 puppeteer.use(StealthPlugin());
 
@@ -115,6 +116,9 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
         });
 
         browserContext = page;
+        if (cdpUrl) {
+            await installSessionHook(browserInstance, `http://127.0.0.1:${process.env.PORT || PORT}/api/session/sync`);
+        }
         logInfo('Browser initialized with maximum anti-detection');
 
         // CDP-connected Chrome is already a real, logged-in session - skip the

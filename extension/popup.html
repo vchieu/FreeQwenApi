@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Qwen Session Sync</title>
+  <style>
+    body { font: 13px system-ui, sans-serif; width: 260px; padding: 12px; margin: 0; }
+    h1 { font-size: 15px; margin: 0 0 8px; }
+    .row { margin: 4px 0; word-break: break-all; }
+    .label { color: #666; }
+    button { margin-top: 10px; padding: 6px 10px; cursor: pointer; width: 100%; }
+    code { font-size: 11px; }
+  </style>
+</head>
+<body>
+  <h1>Qwen Session Sync</h1>
+  <div class="row"><span class="label">Captured chat:</span> <code id="chat">—</code></div>
+  <div class="row"><span class="label">Last push:</span> <code id="result">—</code></div>
+  <button id="sync">Sync now</button>
+  <script src="popup.js"></script>
+</body>
+</html>
