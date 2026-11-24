@@ -19,13 +19,13 @@ import {
 } from './authRecovery.js';
 import {
     CAPTCHA_NOTICE, detectCaptchaSignal, isCaptchaResponse, isChatInProgress,
-    isVisibleBox, shouldRetryNetworkError
+    isProtocolTimeoutError, isVisibleBox, shouldRetryNetworkError
 } from './resilience.js';
 import { sendDesktopNotification } from '../utils/notify.js';
 import crypto from 'crypto';
 import {
     CHAT_API_URL, CREATE_CHAT_URL, CHAT_PAGE_URL, TASK_STATUS_URL,
-    PAGE_TIMEOUT, RETRY_DELAY, PAGE_POOL_SIZE,
+    PAGE_TIMEOUT, RETRY_DELAY, PAGE_POOL_SIZE, USER_AGENT,
     DEFAULT_MODEL, MAX_RETRY_COUNT,
     TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL,
     RATE_LIMIT_HOURS, CAPTCHA_POLL_INTERVAL_MS, CAPTCHA_WAIT_TIMEOUT_MS
@@ -246,11 +246,13 @@ async function isHealthyQwenPage(page) {
         if (!page || page.isClosed()) return false;
         const url = page.url();
         if (!url.includes('chat.qwen.ai') || url.includes('_____tmd_____')) return false;
-        return await page.evaluate((selector) => {
+        // A frozen tab must not cost a full protocolTimeout (5 min) just to
+        // decide whether it is healthy.
+        return await withTimeout(page.evaluate((selector) => {
             if (document.querySelector(selector)) return false;
             if ((document.body?.innerText || '').includes('Access Verification')) return false;
             try { return Boolean(localStorage.getItem('token')); } catch { return true; }
-        }, CAPTCHA_SELECTOR);
+        }, CAPTCHA_SELECTOR), 5_000, false);
     } catch {
         return false;
     }
@@ -295,7 +297,8 @@ export const pagePool = {
                     logWarn('Page from pool is closed, skipping');
                     continue;
                 }
-                await page.evaluate(() => document.readyState);
+                const ready = await withTimeout(page.evaluate(() => document.readyState), 15_000, null);
+                if (ready === null) throw new Error('Pooled page health check timed out');
                 return page;
             } catch (e) {
                 logWarn(`Page from pool is stale (${e.message?.substring(0, 60)}), creating new`);
@@ -811,13 +814,40 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
         if (!token) return { success: false, error: 'Auth token not found' };
         if (typeof fetch !== 'function') return { success: false, error: 'Fetch API is unavailable' };
 
+        // Mirror the headers the browser path sends. Without the Baxia headers
+        // and a Chrome UA Qwen's WAF serves a non-SSE challenge page; without a
+        // single fresh X-Request-Id it answers Internal_Server_Error.
+        const headers = {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+            'Accept': 'application/json',
+            'X-Accel-Buffering': 'no',
+            'User-Agent': USER_AGENT
+        };
+        if (options.headers && typeof options.headers === 'object') {
+            Object.assign(headers, options.headers);
+        }
+        // A browserless fetch needs the tab's session cookies and a normal
+        // Origin/Referer or Qwen's WAF answers 200 with a non-SSE challenge.
+        if (options.cookie) {
+            headers['Cookie'] = options.cookie;
+            try {
+                const origin = new URL(apiUrl).origin;
+                headers['Origin'] = origin;
+                headers['Referer'] = `${origin}/`;
+            } catch { /* apiUrl is always absolute in practice */ }
+        }
+        for (const key of Object.keys(headers)) {
+            if (/^x-request-id$/i.test(key)) delete headers[key];
+        }
+        headers['X-Request-Id'] = crypto.randomUUID
+            ? crypto.randomUUID()
+            : String(Date.now()) + Math.random().toString(16).slice(2);
+        headers['Authorization'] = `Bearer ${token}`;
+
         const response = await fetch(apiUrl, {
             method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'Authorization': `Bearer ${token}`,
-                'Accept': '*/*'
-            },
+            headers,
             body: JSON.stringify(payload)
         });
 
@@ -1001,6 +1031,28 @@ export function loadBaxiaHeaders() {
     }
 }
 
+// `loadBaxiaHeaders()` deliberately drops cookies (the browser supplies them
+// itself). A Node fetch has no browser cookie jar, so copy the Qwen cookies
+// from the worker tab before using the streaming path.
+async function qwenCookieHeader(page) {
+    try {
+        const client = await page.createCDPSession();
+        try {
+            const { cookies } = await client.send('Network.getAllCookies');
+            const cookie = cookies
+                .filter(c => /(^|\.)qwen\.ai$/.test(c.domain))
+                .map(c => `${c.name}=${c.value}`)
+                .join('; ');
+            return cookie || null;
+        } finally {
+            await client.detach();
+        }
+    } catch (e) {
+        logWarn(`Could not read Qwen cookies for node streaming: ${e.message}`);
+        return null;
+    }
+}
+
 // Qwen web tokens live ~15 minutes; the page keeps refreshing them. Take the
 // freshest token straight from the tab before each request.
 async function syncTokenFromPage(page, tokenObj = null) {
@@ -1071,16 +1123,37 @@ export async function deleteChatV2(chatId) {
 async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, onReasoning = null, options = {}) {
     const baxiaHeaders = loadBaxiaHeaders();
     const allowedToolNames = options.allowedToolNames instanceof Set ? Array.from(options.allowedToolNames) : null;
-    if (baxiaHeaders && payload?.stream !== false && typeof onChunk === 'function') {
+    const collectOnly = options.collectOnly === true;
+    const wantsStreaming = payload?.stream !== false && (typeof onChunk === 'function' || collectOnly);
+    // Tools callers collect the answer in Node instead of emitting client chunks.
+    // With the captured Baxia headers + real UA that fetch passes Qwen's WAF, so
+    // it no longer needs a single page.evaluate that can run past protocolTimeout.
+    const useNodeStreaming = wantsStreaming && (!baxiaHeaders || collectOnly);
+    if (baxiaHeaders && wantsStreaming && !useNodeStreaming) {
         logInfo('Baxia headers found: request will go through browser (node-streaming skipped)');
     }
-    if (!baxiaHeaders && payload?.stream !== false && typeof onChunk === 'function') {
-        const streamedResponse = await executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk, onReasoning, options);
 
-        // Qwen's Aliyun WAF blocks the browserless node-streaming fetch and returns a
-        // non-SSE captcha page (errorBody = WAF html). Do NOT return that - fall through
-        // to the browser (page.evaluate) path, which carries the real session and is not
-        // challenged. Without this, streaming requests surface the captcha as the answer.
+    // Watch the tab from the start: a captcha can appear during the Node fetch
+    // too, and the browser fallback below needs the same watcher instance.
+    const captchaWatcher = startCaptchaWatcher(page, () => {
+        const notify = typeof options.onCaptcha === 'function'
+            ? options.onCaptcha
+            : (typeof onChunk === 'function' ? onChunk : null);
+        if (notify) notify(CAPTCHA_NOTICE);
+    });
+
+    if (useNodeStreaming) {
+        const cookie = await qwenCookieHeader(page);
+        const streamedResponse = await executeApiRequestWithNodeStreaming(
+            apiUrl, payload, token,
+            typeof onChunk === 'function' ? onChunk : null,
+            onReasoning,
+            { ...options, headers: baxiaHeaders || undefined, cookie }
+        );
+
+        // Qwen's Aliyun WAF blocks a browserless fetch lacking the real session
+        // headers and returns a non-SSE challenge page. Do NOT return that -
+        // fall through to browser evaluate, which carries the actual session.
         const wafBlockedNodeStream =
             streamedResponse.success !== true &&
             /Unexpected non-SSE 200/i.test(String(streamedResponse.error || ''));
@@ -1093,6 +1166,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
         );
 
         if (canReturnDirectly) {
+            captchaWatcher.stop();
             return streamedResponse;
         }
 
@@ -1104,12 +1178,6 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
     logDebug(`Using token: ${token ? 'Session token' : 'No token'}`);
     logDebug(`API URL: ${apiUrl}`);
 
-    const captchaWatcher = startCaptchaWatcher(page, () => {
-        const notify = typeof options.onCaptcha === 'function'
-            ? options.onCaptcha
-            : (typeof onChunk === 'function' ? onChunk : null);
-        if (notify) notify(CAPTCHA_NOTICE);
-    });
     let rawPromise;
     try {
         rawPromise = page.evaluate(async (data) => {
@@ -1479,6 +1547,20 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         return { error: 'Qwen is still generating the previous answer. Please retry shortly.', chatId };
     }
 
+    // Puppeteer cancelled a CDP call after protocolTimeout. The tab's fetch may
+    // still be generating server-side, so retry on a NEW chat like CHAT_IN_PROGRESS
+    // instead of replaying into the abandoned one. Never surface the raw
+    // `Error: ProtocolError...` string to the client.
+    if (response.protocolTimeout || isProtocolTimeoutError(response)) {
+        if (retryCount < MAX_RETRY_COUNT) {
+            logWarn(`Protocol timeout; retrying on a fresh chat (${retryCount + 1}/${MAX_RETRY_COUNT})`);
+            if (chatId) deleteChatV2(chatId).catch(() => {});
+            await delay(RETRY_DELAY);
+            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
+        }
+        return { error: 'Qwen browser did not respond in time. Please retry shortly.', chatId, protocolTimeout: true };
+    }
+
     // Transient browser/network failures (WAF reset, socket hang up, tab
     // navigation) previously went straight to the client. Retry the same chat
     // a bounded number of times; never replay an already-streamed answer.
@@ -1671,7 +1753,17 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         logDebug(`Sending message to chat ${chatId} with parent_id: ${parentId || 'null'}`);
 
         const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
-        let response = await executeApiRequest(page, apiUrl, payload, authToken, onChunk, options.onReasoning || null, { allowedToolNames, onCaptcha: options.onCaptcha });
+        // Tool routes pass no client callback (they need the whole answer to
+        // parse tool calls). Give them an internal sink so the request streams
+        // through Node instead of waiting on one 5-minute page.evaluate.
+        const collectOnly = options.collectOnly === true && typeof onChunk !== 'function';
+        const streamChunk = collectOnly ? () => {} : onChunk;
+        // Tool routes write reasoning once from the completed response (inside
+        // writeToolCallsSse / the final fallback). Suppress live reasoning here
+        // to avoid emitting the same block twice.
+        const streamReasoning = collectOnly ? null : (options.onReasoning || null);
+        const apiOptions = { allowedToolNames, onCaptcha: options.onCaptcha, collectOnly };
+        let response = await executeApiRequest(page, apiUrl, payload, authToken, streamChunk, streamReasoning, apiOptions);
 
         // One nudge retry max per request when tools were declared and model missed/broke tool call format.
         if (response.success && !response.isTask && allowedToolNames && !options._toolRetryDone) {
@@ -1682,7 +1774,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
                 const nudge = `\n\nIMPORTANT: Use a tool call now.${reason} Respond ONLY with a tool_call block using one of these tools: ${names}.`;
                 const retryPayload = buildPayloadV2(messageContent, model, chatId, parentId, files, `${systemMessage || ''}${nudge}`.trim(), tools, toolChoice, chatType, size, reasoningMode);
                 logWarn(`Tool call missing/broken; retrying once with nudge. dropped=${first.dropped.length}`);
-                response = await executeApiRequest(page, apiUrl, retryPayload, authToken, onChunk, options.onReasoning || null, { allowedToolNames, onCaptcha: options.onCaptcha });
+                response = await executeApiRequest(page, apiUrl, retryPayload, authToken, streamChunk, streamReasoning, apiOptions);
                 if (response?.data) response.data._toolRetryDone = true;
                 // Parse the retry too — otherwise its tool call stays as text.
                 finalizeToolCallsInResponse(response, allowedToolNames, requiredToolParams);
@@ -1795,7 +1887,17 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         return handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk, options, tools, toolChoice, systemMessage);
     } catch (error) {
         logError('Error sending message', error);
-        return { error: error.toString(), chatId };
+        const text = String(error);
+        // A thrown CDP error used to be returned verbatim to the client. Route
+        // it through the same bounded fresh-chat retry as an evaluate error.
+        if (isProtocolTimeoutError({ error: text })) {
+            return handleApiError(
+                { success: false, error: text, protocolTimeout: true, chatId },
+                tokenObj, message, model, chatId, parentId, files, retryCount,
+                chatType, size, waitForCompletion, onChunk, options, tools, toolChoice, systemMessage
+            );
+        }
+        return { error: text, chatId };
     } finally {
         if (page) {
             pagePool.releasePage(page);
@@ -2015,7 +2117,19 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
         return { error: cleanError };
     } catch (error) {
         logError('Error creating chat', error);
-        return { error: error.toString() };
+        const text = String(error);
+        // A frozen tab can also time out while creating the chat (seen at
+        // 13:12 -> 13:17 in the log). Give it one bounded retry on a new page.
+        if (isProtocolTimeoutError({ error: text }) && retryCount < MAX_RETRY_COUNT) {
+            logWarn(`Chat creation protocol timeout; retrying (${retryCount + 1}/${MAX_RETRY_COUNT})`);
+            await delay(RETRY_DELAY);
+            return createChatV2(model, title, retryCount + 1, chatType, tokenObj);
+        }
+        const protocolTimeout = isProtocolTimeoutError({ error: text });
+        return {
+            error: protocolTimeout ? 'Qwen browser did not respond in time. Please retry shortly.' : text,
+            protocolTimeout
+        };
     } finally {
         if (page) {
             pagePool.releasePage(page);

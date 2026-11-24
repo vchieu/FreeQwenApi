@@ -6,6 +6,11 @@ export const CAPTCHA_NOTICE =
 
 const NETWORK_ERROR_RE = /network error|fetch failed|failed to fetch|econnreset|econnrefused|enotfound|ehostunreach|socket hang up|err_network|networkerror|network timeout|request timeout|aborted|the operation was aborted|timeout of \d+ms exceeded/i;
 
+// Puppeteer cancels any CDP command (including a long page.evaluate) after
+// `protocolTimeout`. Unlike a network fetch failure, the browser fetch may still
+// be generating server-side, so recovery has to move to a fresh chat.
+const PROTOCOL_TIMEOUT_RE = /runtime\.(?:callfunctionon|evaluate)\s+timed out|protocol\s*timeout|protocolerror|target\s*closed/i;
+
 /**
  * A fetch that dies mid-flight (WAF reset, socket hang up, browser navigation)
  * is worth retrying on the same chat. HTTP/API errors are handled elsewhere,
@@ -21,6 +26,20 @@ export function isRetryableNetworkError(response = {}) {
 
 export function shouldRetryNetworkError(response, retryCount, maxRetryCount = 3) {
     return isRetryableNetworkError(response) && Number(retryCount) < Number(maxRetryCount);
+}
+
+/**
+ * `Runtime.callFunctionOn timed out` / `Target closed` come from Puppeteer, not
+ * from Qwen. They are retryable, but never replay into the old chat: the tab's
+ * fetch may still be running upstream. Partial streams are excluded for the
+ * same reason as network errors (would duplicate already-delivered text).
+ */
+export function isProtocolTimeoutError(response = {}) {
+    if (!response || response.captcha || response.verification) return false;
+    if (response.hasStreamedChunks === true) return false;
+    if (Number(response.status) >= 400) return false;
+    const text = [response.error, response.statusText].filter(Boolean).join(' ');
+    return text ? PROTOCOL_TIMEOUT_RE.test(String(text)) : false;
 }
 
 /**

@@ -1608,6 +1608,10 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         {
                             ...reasoningOptions,
                             onReasoning: reasoningCallback,
+                            // Tool routes need the whole answer for tool-call
+                            // parsing: stream it through Node with an internal
+                            // sink instead of one long page.evaluate.
+                            collectOnly: captureToolCalls,
                             // Captcha notice must reach the client immediately,
                             // even when tools suppress the regular content callback.
                             onCaptcha: (text) => writeSse({
@@ -2026,6 +2030,10 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         {
                             ...reasoningOptions,
                             onReasoning: reasoningCallback,
+                            // Tool routes need the whole answer for tool-call
+                            // parsing: stream it through Node with an internal
+                            // sink instead of one long page.evaluate.
+                            collectOnly: captureToolCalls,
                             // Captcha notice must reach the client immediately,
                             // even when tools suppress the regular content callback.
                             onCaptcha: (text) => writeSse({

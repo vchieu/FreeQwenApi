@@ -8,6 +8,7 @@ import {
     detectCaptchaSignal,
     isCaptchaResponse,
     isChatInProgress,
+    isProtocolTimeoutError,
     isVisibleBox
 } from '../../src/api/resilience.js';
 import { notificationCommand } from '../../src/utils/notify.js';
@@ -80,6 +81,23 @@ check('ordinary 500 is not misclassified', () => {
     assert.equal(isChatInProgress({ status: 500, errorBody: '{"data":{"code":"Internal_Server_Error"}}' }), false);
 });
 
+console.log('Puppeteer protocol timeout detection:');
+check('Runtime.callFunctionOn timeout is recognized', () => {
+    assert.equal(isProtocolTimeoutError({
+        success: false,
+        error: 'ProtocolError: Runtime.callFunctionOn timed out. Increase the \'protocolTimeout\' setting in launch/connect calls for a higher timeout if needed.'
+    }), true);
+});
+check('closed CDP target is recognized', () => {
+    assert.equal(isProtocolTimeoutError({ error: 'TargetCloseError: Protocol error (Runtime.callFunctionOn): Target closed' }), true);
+});
+check('ordinary errors and partial streams are not protocol timeouts', () => {
+    assert.equal(isProtocolTimeoutError({ error: 'TypeError: network error' }), false);
+    assert.equal(isProtocolTimeoutError({ status: 500, errorBody: 'oops' }), false);
+    assert.equal(isProtocolTimeoutError({ error: 'Runtime.callFunctionOn timed out', hasStreamedChunks: true }), false);
+    assert.equal(isProtocolTimeoutError({ captcha: true, error: 'Runtime.callFunctionOn timed out' }), false);
+});
+
 console.log('Desktop notification commands:');
 const win = notificationCommand('win32', 'FreeQwenApi', CAPTCHA_NOTICE);
 check('Windows uses PowerShell with the message', () => {
@@ -107,7 +125,7 @@ check('unsupported platform is a no-op', () => {
     assert.equal(notificationCommand('freebsd', 'title', 'message'), null);
 });
 
-const TOTAL = 7 + 8 + 5 + 2;
+const TOTAL = 7 + 8 + 2 + 3 + 5;
 console.log(`\nchecks: ${checks}`);
 console.log(checks === TOTAL ? 'PASS' : `FAIL (expected ${TOTAL} checks, got ${checks})`);
 process.exit(checks === TOTAL ? 0 : 1);
