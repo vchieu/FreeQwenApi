@@ -166,9 +166,11 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
     ```
     ````
     hoặc thẻ XML `<tool_call><function=...><parameter=...>...</parameter></function></tool_call>`.
-- `parseToolCalls()` phân tích cú pháp, chịu lỗi (lenient JSON repair: tự động sửa lỗi thiếu arguments key dạng `{"name":"foo",{"path":"x"}}`, sửa trailing commas, single quotes).
+- `parseToolCalls()` chấp nhận cả JSON trần/prose + JSON/nhiều JSON trần liên tiếp trong cùng một turn, miễn object có shape tool (`name` + `arguments`). JSON thường không có shape tool vẫn giữ nguyên là text; fence bị từ chối do có prose cùng dòng vẫn là text (được coi là mô tả, không phải lời gọi).
+- Parser chịu lỗi (lenient JSON repair: tự động sửa lỗi thiếu arguments key dạng `{"name":"foo",{"path":"x"}}`, sửa trailing commas, single quotes).
 - Lọc bỏ các tool không khai báo (ví dụ `code_interpreter` tích hợp của Qwen) hoặc thiếu param bắt buộc.
-- Phần chữ giải thích (prose) đi cùng tool call được bảo toàn trong `content`, các block fence được tách sạch sẽ.
+- Phần chữ giải thích (prose) đi cùng tool call được bảo toàn trong `content`, các block fence/JSON đã parse được tách sạch sẽ.
+- `sendMessage()` gom hậu xử lý tool call thành `finalizeToolCallsInResponse()` gọi lại sau cả nudge retry: response thứ hai cũng luôn có `tool_calls_normalized`, `tool_calls_clean_text`, không để tool call sót lại thành text. `routes.js` giữ prose đó thay vì ép `content` về `''`.
 
 ### 7. Media & Async Tasks
 - Hỗ trợ Text-to-Image (`/api/images/generations`) qua Qwen Chat (`chatType: t2i`) và DashScope fallback.

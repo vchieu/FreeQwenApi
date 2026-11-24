@@ -216,7 +216,7 @@ function collectJsonObjects(text) {
         if (end === -1) break;
         const slice = text.slice(start, end);
         try {
-            objs.push({ value: JSON.parse(slice), end });
+            objs.push({ value: JSON.parse(slice), start, end });
             i = end;
         } catch {
             i++;
@@ -324,12 +324,57 @@ function extractCallsFromData(data) {
     return [];
 }
 
+// Keep the strict tool shape here: a plain JSON answer like {"name":"Alice"}
+// must not turn into a tool call just because tools were declared on the request.
+function looksLikeToolCallObject(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    if (value.function && typeof value.function === 'object' && value.function.name) return true;
+    if (!value.name && !value.tool && !value.tool_name && !value.action) return false;
+    return ARGUMENT_KEYS.some(k => Object.prototype.hasOwnProperty.call(value, k));
+}
+
+// Qwen sometimes answers with the JSON call un-fenced, mixed with prose or
+// several calls in one turn. The old fallback only accepted exactly one JSON
+// object as the whole message, so those calls leaked into `content` as text.
+function collectBareToolCallObjects(text, excludeSpans = []) {
+    return collectJsonObjects(text).filter(obj =>
+        looksLikeToolCallObject(obj.value) &&
+        // JSON inside a fence/XML block that was rejected as "mid-sentence" is
+        // still a description, not a call (see verify-tools.mjs regression).
+        !excludeSpans.some(([start, end]) => obj.start >= start && obj.start < end)
+    );
+}
+
+// Remove the now-empty ```tool_call / <tool_call> wrapper left behind when a
+// JSON object inside it was consumed by the bare-object sweep.
+function stripEmptyToolWrappers(text) {
+    return String(text)
+        .replace(/```(?:tool_call|function_call|tool_code|json)[ \t]*\r?\n?[ \t]*(?=```|$)/gi, '')
+        .replace(/^[ \t]*```[ \t]*$/gm, '')
+        .replace(/<tool_call>[ \t\r\n]*<\/tool_call>/gi, '');
+}
+
+function addNormalizedCalls(rawCalls, ctx) {
+    const { allowed, dropped, calls } = ctx;
+    for (const raw of rawCalls) {
+        const normalized = normalizeRawCall(raw, calls.length);
+        if (!normalized) continue;
+        const name = normalized.function.name;
+        if (allowed && !allowed.has(name)) { dropped.push(`undeclared tool: ${name}`); continue; }
+        const parsedArgs = parseArgsObject(normalized.function.arguments);
+        if (!parsedArgs.ok) { dropped.push(`unusable arguments for ${name}: ${parsedArgs.error}`); continue; }
+        normalized.function.arguments = JSON.stringify(parsedArgs.value);
+        calls.push(normalized);
+    }
+}
+
 export function parseToolCalls(text, allowedNames = null, requiredByName = null) {
     if (typeof text !== 'string') return { calls: [], dropped: [], text: '' };
     const allowed = allowedNames instanceof Set ? allowedNames : (Array.isArray(allowedNames) ? new Set(allowedNames) : null);
     const required = requiredByName || {};
     const calls = [];
     const dropped = [];
+    const ctx = { allowed, dropped, calls };
     let cleanText = text;
 
     // 1) Structured blocks (fenced/XML)
@@ -346,44 +391,38 @@ export function parseToolCalls(text, allowedNames = null, requiredByName = null)
         return prefix.length === 0; // skip block when prose precedes it on the same line
     });
 
-    if (blocks.length > 0) {
-        // Fence/XML blocks existed — do NOT fall through to bare JSON fallback
-        // (the raw fence text would spuriously match the JSON extractor).
+    if (validBlocks.length > 0) {
         // Remove valid blocks from cleanText in reverse order (preserve positions).
         const sorted = [...validBlocks].sort((a, b) => b.start - a.start);
         for (const b of sorted) {
             cleanText = cleanText.slice(0, b.start) + cleanText.slice(b.end);
         }
-        for (const block of validBlocks) {
-            const rawCalls = extractCallsFromData(block.data);
-            for (const raw of rawCalls) {
-                const normalized = normalizeRawCall(raw, calls.length);
-                if (!normalized) continue;
-                const name = normalized.function.name;
-                if (allowed && !allowed.has(name)) { dropped.push(`undeclared tool: ${name}`); continue; }
-                const parsedArgs = parseArgsObject(normalized.function.arguments);
-                if (!parsedArgs.ok) { dropped.push(`unusable arguments for ${name}: ${parsedArgs.error}`); continue; }
-                normalized.function.arguments = JSON.stringify(parsedArgs.value);
-                calls.push(normalized);
+        for (const block of validBlocks) addNormalizedCalls(extractCallsFromData(block.data), ctx);
+    }
+
+    // 2) Bare JSON sweep. Runs when structured parsing produced nothing usable:
+    // prose + JSON, several calls, or the JSON left behind by a fence that was
+    // rejected as "mid-sentence" (validBlocks empty but the fence text remains).
+    if (calls.length === 0 && (blocks.length === 0 || validBlocks.length === 0)) {
+        const bare = collectBareToolCallObjects(text, blocks.map(b => [b.start, b.end]));
+        if (bare.length > 0) {
+            const bareCalls = bare.flatMap(obj => extractCallsFromData(obj.value));
+            addNormalizedCalls(bareCalls, ctx);
+            if (calls.length > 0) {
+                for (const obj of [...bare].sort((a, b) => b.start - a.start)) {
+                    cleanText = cleanText.slice(0, obj.start) + cleanText.slice(obj.end);
+                }
+                cleanText = stripEmptyToolWrappers(cleanText);
             }
         }
-    } else {
-        // 2) Bare JSON fallback — only when no fence/XML blocks found at all
-        const trimmed = text.trim();
-        const lenient = parseLenientJson(trimmed);
-        if (lenient !== NOTHING) {
-            const rawCalls = extractCallsFromData(lenient);
-            for (const raw of rawCalls) {
-                const normalized = normalizeRawCall(raw, calls.length);
-                if (!normalized) continue;
-                const name = normalized.function.name;
-                if (allowed && !allowed.has(name)) { dropped.push(`undeclared tool: ${name}`); continue; }
-                const parsedArgs = parseArgsObject(normalized.function.arguments);
-                if (!parsedArgs.ok) { dropped.push(`unusable arguments for ${name}: ${parsedArgs.error}`); continue; }
-                normalized.function.arguments = JSON.stringify(parsedArgs.value);
-                calls.push(normalized);
+        // 3) Lenient repair for malformed single objects (e.g. {"name":"x",{...}}).
+        // Only when no fence exists, otherwise the raw fence text would match.
+        if (calls.length === 0 && blocks.length === 0) {
+            const lenient = parseLenientJson(text.trim());
+            if (lenient !== NOTHING) {
+                addNormalizedCalls(extractCallsFromData(lenient), ctx);
+                if (calls.length > 0) cleanText = '';
             }
-            if (calls.length > 0) cleanText = '';
         }
     }
 

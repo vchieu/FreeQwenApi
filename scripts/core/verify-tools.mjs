@@ -260,6 +260,7 @@ check('fence mid-sentence (prose on same line before it) -> block skipped (not a
     const text = 'I will call ```tool_call\n{"name":"read_file","arguments":{"path":"b.txt"}}\n```';
     const r = parseToolCalls(text, toolNames([READ_TOOL]));
     assert.equal(r.calls.length, 0, 'mid-sentence fence should not be treated as a call');
+    assert.ok(r.text.includes('{"name":"read_file"'), 'rejected fence stays as text, not a call');
 });
 
 check('cleanText has prose but no fence when tool call present', () => {
@@ -271,6 +272,39 @@ check('cleanText has prose but no fence when tool call present', () => {
 });
 
 
+console.log('\ntext tool-call fallback (bare JSON):');
+check('prose + bare JSON -> call extracted, JSON not leaked into text', () => {
+    const text = 'Tôi sẽ cập nhật danh sách việc.\n{"name":"todowrite","arguments":{"todos":[{"content":"x","status":"in_progress"}]}}\nXong.';
+    const r = parseToolCalls(text, new Set(['todowrite']), { todowrite: new Set(['todos']) });
+    assert.equal(r.calls.length, 1);
+    assert.equal(r.calls[0].function.name, 'todowrite');
+    assert.deepEqual(JSON.parse(r.calls[0].function.arguments), { todos: [{ content: 'x', status: 'in_progress' }] });
+    assert.ok(!r.text.includes('"name":"todowrite"'), 'JSON must not leak into content');
+    assert.ok(r.text.includes('Tôi sẽ cập nhật danh sách việc.') && r.text.includes('Xong.'), 'prose preserved');
+});
+
+check('two bare JSON calls in one text -> both extracted', () => {
+    const text = 'First.\n{"name":"get_weather","arguments":{"city":"Hanoi"}}\nSecond.\n{"name":"search_files","arguments":{"query":"TODO"}}';
+    const r = parseToolCalls(text, allowed, required);
+    assert.equal(r.calls.length, 2);
+    assert.deepEqual(r.calls.map(c => c.function.name), ['get_weather', 'search_files']);
+    assert.ok(!r.text.includes('"name":'), 'no JSON leaked into text');
+});
+
+check('plain JSON answer without tool shape stays text', () => {
+    const r = parseToolCalls('{"name":"Alice","age":30}', allowed, required);
+    assert.equal(r.calls.length, 0);
+    assert.ok(r.text.includes('Alice'), 'ordinary JSON answer preserved');
+});
+
+check('native call + bare JSON call merge without duplication', () => {
+    const native = [{ id: 'n1', type: 'function', function: { name: 'get_weather', arguments: '{"city":"Hanoi"}' }, index: 0 }];
+    const parsed = parseToolCalls('{"name":"search_files","arguments":{"query":"x"}}', allowed, required);
+    const merged = mergeToolCalls(native, parsed.calls);
+    assert.equal(merged.length, 2);
+    assert.deepEqual(merged.map(c => c.function.name), ['get_weather', 'search_files']);
+});
+
 console.log('\nparseLenientJson – Qwen malformed tool call recovery:');
 check('{"name":"foo",{...}} missing arguments key recovered', () => {
     // Qwen sometimes omits "arguments": key: {"name":"read_file",{"path":"x.js"}}
@@ -281,7 +315,7 @@ check('{"name":"foo",{...}} missing arguments key recovered', () => {
     assert.deepEqual(JSON.parse(r.calls[0].function.arguments), { path: 'x.js' });
 });
 
-const TOTAL = 10 + 16 + 4 + 1;
+const TOTAL = 10 + 16 + 4 + 4 + 1;
 console.log(`\nchecks: ${checks}`);
 console.log(checks === TOTAL ? 'PASS' : `FAIL (expected ${TOTAL} checks, got ${checks})`);
 process.exit(checks === TOTAL ? 0 : 1);

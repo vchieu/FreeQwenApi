@@ -677,7 +677,13 @@ function resolveToolCalls(result, combinedTools) {
     const nativeCalls = Array.isArray(result?.native_tool_calls) ? result.native_tool_calls : [];
     const normalized = Array.isArray(result?.tool_calls_normalized) ? result.tool_calls_normalized : null;
     if (normalized) {
-        return { calls: normalizeOpenAIToolCalls(normalized), dropped: result?.tool_calls_dropped || result?.native_tool_dropped || [], cleanText: '' };
+        // chat.js sends the prose with the fence/JSON removed; keep it instead
+        // of silently dropping it when tool_calls are present.
+        return {
+            calls: normalizeOpenAIToolCalls(normalized),
+            dropped: result?.tool_calls_dropped || result?.native_tool_dropped || [],
+            cleanText: typeof result?.tool_calls_clean_text === 'string' ? result.tool_calls_clean_text : ''
+        };
     }
     const content = result?.choices?.[0]?.message?.content || '';
     const parsed = parseToolCalls(content, allowed, required);

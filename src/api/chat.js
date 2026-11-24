@@ -1288,6 +1288,29 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
 
 // --- Main public API -------------------------------------------------------
 
+// Normalize native + text tool calls for EVERY response, including the nudge
+// retry. The old code only did it for the first answer, so a valid text tool
+// call in the retried answer leaked into `content` as plain text (see the
+// `todowrite` fence left as text in opencode session ses_df45b870...).
+function finalizeToolCallsInResponse(response, allowedToolNames, requiredToolParams) {
+    if (!response?.success || response.isTask || !allowedToolNames || !response.data) {
+        return { merged: [], dropped: [], cleanText: '' };
+    }
+    const content = response.data.choices?.[0]?.message?.content || '';
+    const nativeCalls = Array.isArray(response.data.native_tool_calls) ? response.data.native_tool_calls : [];
+    const nativeDropped = Array.isArray(response.data.native_tool_dropped) ? response.data.native_tool_dropped : [];
+    const parsed = parseToolCalls(content, allowedToolNames, requiredToolParams);
+    const merged = mergeToolCalls(nativeCalls, parsed.calls);
+    const dropped = [...nativeDropped, ...parsed.dropped];
+
+    if (merged.length > 0) response.data.tool_calls_normalized = merged;
+    else delete response.data.tool_calls_normalized;
+    if (dropped.length > 0) response.data.tool_calls_dropped = dropped;
+    // Prose around the call must survive even when normalized calls are present.
+    response.data.tool_calls_clean_text = parsed.text;
+    return { merged, dropped, cleanText: parsed.text };
+}
+
 export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null, options = {}) {
     if (!availableModels) availableModels = getAvailableModelsFromFile();
 
@@ -1367,34 +1390,20 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
 
         // One nudge retry max per request when tools were declared and model missed/broke tool call format.
         if (response.success && !response.isTask && allowedToolNames && !options._toolRetryDone) {
-            const content = response?.data?.choices?.[0]?.message?.content || '';
-            const nativeCalls = Array.isArray(response?.data?.native_tool_calls) ? response.data.native_tool_calls : [];
-            const nativeDropped = Array.isArray(response?.data?.native_tool_dropped) ? response.data.native_tool_dropped : [];
-            const parsed = parseToolCalls(content, allowedToolNames, requiredToolParams);
-            const merged = mergeToolCalls(nativeCalls, parsed.calls);
-            const dropped = [...nativeDropped, ...parsed.dropped];
-
-            if (merged.length === 0) {
+            const first = finalizeToolCallsInResponse(response, allowedToolNames, requiredToolParams);
+            if (first.merged.length === 0) {
                 const names = Array.from(allowedToolNames).join(', ');
-                const reason = dropped.length > 0 ? ` Previous attempt was rejected: ${dropped.join('; ')}.` : '';
+                const reason = first.dropped.length > 0 ? ` Previous attempt was rejected: ${first.dropped.join('; ')}.` : '';
                 const nudge = `\n\nIMPORTANT: Use a tool call now.${reason} Respond ONLY with a tool_call block using one of these tools: ${names}.`;
                 const retryPayload = buildPayloadV2(messageContent, model, chatId, parentId, files, `${systemMessage || ''}${nudge}`.trim(), tools, toolChoice, chatType, size, reasoningMode);
-                logWarn(`Tool call missing/broken; retrying once with nudge. dropped=${dropped.length}`);
+                logWarn(`Tool call missing/broken; retrying once with nudge. dropped=${first.dropped.length}`);
                 response = await executeApiRequest(page, apiUrl, retryPayload, authToken, onChunk, options.onReasoning || null, { allowedToolNames });
                 if (response?.data) response.data._toolRetryDone = true;
-            } else {
-                // Keep merged native+text calls for route normalization
-                response.data.tool_calls_normalized = merged;
-                if (dropped.length > 0) response.data.tool_calls_dropped = dropped;
+                // Parse the retry too — otherwise its tool call stays as text.
+                finalizeToolCallsInResponse(response, allowedToolNames, requiredToolParams);
             }
         } else if (response?.success && !response?.isTask && allowedToolNames) {
-            const content = response?.data?.choices?.[0]?.message?.content || '';
-            const nativeCalls = Array.isArray(response?.data?.native_tool_calls) ? response.data.native_tool_calls : [];
-            const parsed = parseToolCalls(content, allowedToolNames, requiredToolParams);
-            const merged = mergeToolCalls(nativeCalls, parsed.calls);
-            if (merged.length > 0) response.data.tool_calls_normalized = merged;
-            const dropped = [...(response?.data?.native_tool_dropped || []), ...parsed.dropped];
-            if (dropped.length > 0) response.data.tool_calls_dropped = dropped;
+            finalizeToolCallsInResponse(response, allowedToolNames, requiredToolParams);
         }
 
         if (response.success && response.isTask) {
