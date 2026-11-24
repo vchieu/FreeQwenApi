@@ -25,6 +25,9 @@ export const AUTH_TIMEOUT = Number(process.env.AUTH_TIMEOUT) || 120_000;
 export const NAVIGATION_TIMEOUT = Number(process.env.NAVIGATION_TIMEOUT) || 60_000;
 export const RETRY_DELAY = Number(process.env.RETRY_DELAY) || 2_000;
 export const STREAMING_CHUNK_DELAY = Number(process.env.STREAMING_CHUNK_DELAY) || 20;
+// A stalled Node fetch used to hang forever (no protocolTimeout to rescue it).
+// Bound it so the retry/fallback path can take over instead of blocking the client.
+export const NODE_STREAM_TIMEOUT_MS = Number(process.env.NODE_STREAM_TIMEOUT_MS) || 180_000;
 
 // --- Limits ----------------------------------------------------------------
 export const PAGE_POOL_SIZE = Number(process.env.PAGE_POOL_SIZE) || 3;

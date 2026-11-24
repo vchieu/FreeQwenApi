@@ -9,6 +9,7 @@ import {
     isCaptchaResponse,
     isChatInProgress,
     isProtocolTimeoutError,
+    isNodeStreamTimeout,
     isVisibleBox
 } from '../../src/api/resilience.js';
 import { notificationCommand } from '../../src/utils/notify.js';
@@ -98,6 +99,17 @@ check('ordinary errors and partial streams are not protocol timeouts', () => {
     assert.equal(isProtocolTimeoutError({ captcha: true, error: 'Runtime.callFunctionOn timed out' }), false);
 });
 
+console.log('Node fetch timeout detection:');
+check('AbortSignal.timeout on node stream is recognized', () => {
+    assert.equal(isNodeStreamTimeout({ nodeTimeout: true, error: 'TimeoutError: The operation was aborted due to timeout' }), true);
+});
+check('ordinary network errors and partial streams are not node timeouts', () => {
+    assert.equal(isNodeStreamTimeout({ error: 'TypeError: network error' }), false);
+    assert.equal(isNodeStreamTimeout({ nodeTimeout: true, hasStreamedChunks: true }), false);
+    assert.equal(isNodeStreamTimeout({ nodeTimeout: true, status: 500 }), false);
+    assert.equal(isNodeStreamTimeout({ nodeTimeout: true, captcha: true }), false);
+});
+
 console.log('Desktop notification commands:');
 const win = notificationCommand('win32', 'FreeQwenApi', CAPTCHA_NOTICE);
 check('Windows uses PowerShell with the message', () => {
@@ -125,7 +137,7 @@ check('unsupported platform is a no-op', () => {
     assert.equal(notificationCommand('freebsd', 'title', 'message'), null);
 });
 
-const TOTAL = 7 + 8 + 2 + 3 + 5;
+const TOTAL = 7 + 8 + 2 + 3 + 2 + 5;
 console.log(`\nchecks: ${checks}`);
 console.log(checks === TOTAL ? 'PASS' : `FAIL (expected ${TOTAL} checks, got ${checks})`);
 process.exit(checks === TOTAL ? 0 : 1);

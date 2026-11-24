@@ -43,6 +43,17 @@ export function isProtocolTimeoutError(response = {}) {
 }
 
 /**
+ * Node fetch stalled past NODE_STREAM_TIMEOUT_MS. Just like a protocol timeout,
+ * Qwen may still be generating upstream, so recovery must use a fresh chat.
+ */
+export function isNodeStreamTimeout(response = {}) {
+    if (!response || response.captcha || response.verification) return false;
+    if (response.hasStreamedChunks === true) return false;
+    if (Number(response.status) >= 400) return false;
+    return response.nodeTimeout === true;
+}
+
+/**
  * Qwen refuses a second message while the previous answer is still generating:
  * HTTP 500 with `data.code = CHAT_IN_PROGRESS`. This happens routinely after a
  * captcha kills the browser fetch - the server-side generation keeps running.

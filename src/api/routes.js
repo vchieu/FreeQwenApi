@@ -18,6 +18,22 @@ import { applySessionSync, getSessionSyncStatus } from './sessionSync.js';
 import { reasoningOptionsFromEffort } from './reasoning.js';
 import { parseToolCalls, mergeToolCalls, toolNames, toolRequiredParams, messagesToQwenPrompt } from './toolCalls.js';
 
+// Control messages (captcha status, upstream errors) must never go into
+// `delta.content`: OpenAI clients concatenate that field into the assistant's
+// answer, so the notice used to show up glued to the real model text. Emit an
+// out-of-band chunk with an empty delta instead; clients ignore the extra field
+// while the desktop alert / logs still carry the information.
+function writeProxyNotice(writeSse, model, text, kind = 'notice', finishReason = null) {
+    writeSse({
+        id: 'chatcmpl-stream',
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: model || DEFAULT_MODEL,
+        choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+        proxy_notice: { kind, message: String(text) }
+    });
+}
+
 // Function for generating a deterministic chatId based on history
 function generateChatIdFromHistory(messages) {
     if (!Array.isArray(messages) || messages.length === 0) {
@@ -800,11 +816,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
             const result = await sendMessage(messageContent, mappedModel, chatId, parentId, null, combinedTools, toolChoice, systemMessage);
 
             if (result.error) {
-                writeSse({
-                    id: 'chatcmpl-stream', object: 'chat.completion.chunk',
-                    created: Math.floor(Date.now() / 1000), model: mappedModel,
-                    choices: [{ index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: null }]
-                });
+                writeProxyNotice(writeSse, mappedModel, `Error: ${result.error}`, 'error');
             } else if (result.choices?.[0]?.message) {
                 const content = String(result.choices[0].message.content || '');
                 const codePoints = Array.from(content);
@@ -969,14 +981,9 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                             ...reasoningOptions,
                             onReasoning: reasoningCallback,
                             // Captcha notice must reach the client immediately,
-                            // even when tools suppress the regular content callback.
-                            onCaptcha: (text) => writeSse({
-                                id: 'chatcmpl-stream',
-                                object: 'chat.completion.chunk',
-                                created: Math.floor(Date.now() / 1000),
-                                model: mappedModel || DEFAULT_MODEL,
-                                choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
-                            })
+                            // but as an out-of-band chunk — never as delta.content,
+                            // which clients would glue onto the model's answer.
+                            onCaptcha: (text) => writeProxyNotice(writeSse, mappedModel || DEFAULT_MODEL, text, 'captcha')
                         }
                     );
 
@@ -985,15 +992,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
 
                     if (result.error) {
-                        writeSse({
-                            id: 'chatcmpl-' + Date.now(),
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: 'stop' }
-                            ]
-                        });
+                        writeProxyNotice(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, 'error', 'stop');
                     } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                         // Qwen returned JSON/normal response instead of SSE - send final as single chunk
                         const content = result.choices[0].message.content;
@@ -1613,14 +1612,9 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                             // sink instead of one long page.evaluate.
                             collectOnly: captureToolCalls,
                             // Captcha notice must reach the client immediately,
-                            // even when tools suppress the regular content callback.
-                            onCaptcha: (text) => writeSse({
-                                id: 'chatcmpl-stream',
-                                object: 'chat.completion.chunk',
-                                created: Math.floor(Date.now() / 1000),
-                                model: mappedModel || DEFAULT_MODEL,
-                                choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
-                            })
+                            // but as an out-of-band chunk — never as delta.content,
+                            // which clients would glue onto the model's answer.
+                            onCaptcha: (text) => writeProxyNotice(writeSse, mappedModel || DEFAULT_MODEL, text, 'captcha')
                         }
                     );
 
@@ -1657,15 +1651,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
 
                     if (result.error) {
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: null }
-                            ]
-                        });
+                        writeProxyNotice(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, 'error');
                     } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                         // Qwen returned JSON/normal response instead of SSE - send final as single chunk
                         // When captureToolCalls is active, use cleanText (fence blocks stripped)
@@ -2035,14 +2021,9 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                             // sink instead of one long page.evaluate.
                             collectOnly: captureToolCalls,
                             // Captcha notice must reach the client immediately,
-                            // even when tools suppress the regular content callback.
-                            onCaptcha: (text) => writeSse({
-                                id: 'chatcmpl-stream',
-                                object: 'chat.completion.chunk',
-                                created: Math.floor(Date.now() / 1000),
-                                model: mappedModel || DEFAULT_MODEL,
-                                choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
-                            })
+                            // but as an out-of-band chunk — never as delta.content,
+                            // which clients would glue onto the model's answer.
+                            onCaptcha: (text) => writeProxyNotice(writeSse, mappedModel || DEFAULT_MODEL, text, 'captcha')
                         }
                     );
 
@@ -2071,15 +2052,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
 
                     if (result.error) {
-                        writeSse({
-                            id: 'chatcmpl-stream',
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: mappedModel || DEFAULT_MODEL,
-                            choices: [
-                                { index: 0, delta: { content: `Error: ${result.error}` }, finish_reason: 'stop' }
-                            ]
-                        });
+                        writeProxyNotice(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, 'error', 'stop');
                     } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                         // Qwen returned JSON/normal response instead of SSE - send final as single chunk
                         // When captureToolCalls is active, use cleanText (fence blocks stripped)

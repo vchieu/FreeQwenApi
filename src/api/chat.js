@@ -19,13 +19,13 @@ import {
 } from './authRecovery.js';
 import {
     CAPTCHA_NOTICE, detectCaptchaSignal, isCaptchaResponse, isChatInProgress,
-    isProtocolTimeoutError, isVisibleBox, shouldRetryNetworkError
+    isProtocolTimeoutError, isNodeStreamTimeout, isVisibleBox, shouldRetryNetworkError
 } from './resilience.js';
 import { sendDesktopNotification } from '../utils/notify.js';
 import crypto from 'crypto';
 import {
     CHAT_API_URL, CREATE_CHAT_URL, CHAT_PAGE_URL, TASK_STATUS_URL,
-    PAGE_TIMEOUT, RETRY_DELAY, PAGE_POOL_SIZE, USER_AGENT,
+    PAGE_TIMEOUT, RETRY_DELAY, PAGE_POOL_SIZE, USER_AGENT, NODE_STREAM_TIMEOUT_MS,
     DEFAULT_MODEL, MAX_RETRY_COUNT,
     TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL,
     RATE_LIMIT_HOURS, CAPTCHA_POLL_INTERVAL_MS, CAPTCHA_WAIT_TIMEOUT_MS
@@ -848,7 +848,11 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
         const response = await fetch(apiUrl, {
             method: 'POST',
             headers,
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
+            // Without this a stalled connection hangs forever (seen as a 6.5 min
+            // dead request with no log line). The resulting TimeoutError is
+            // flagged below and retried on a fresh chat by isNodeStreamTimeout.
+            signal: AbortSignal.timeout(NODE_STREAM_TIMEOUT_MS)
         });
 
         if (!response.ok) {
@@ -997,9 +1001,11 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
             data: resultData
         };
     } catch (error) {
+        const text = error?.toString ? error.toString() : String(error);
+        const nodeTimeout = error?.name === 'TimeoutError' || /aborted due to timeout|operation timed out/i.test(text);
         // Preserve this flag: retrying after partial SSE output would duplicate
         // already-delivered text in the client.
-        return { success: false, error: error.toString(), hasStreamedChunks };
+        return { success: false, error: text, nodeTimeout, hasStreamedChunks };
     }
 }
 
@@ -1547,18 +1553,19 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         return { error: 'Qwen is still generating the previous answer. Please retry shortly.', chatId };
     }
 
-    // Puppeteer cancelled a CDP call after protocolTimeout. The tab's fetch may
-    // still be generating server-side, so retry on a NEW chat like CHAT_IN_PROGRESS
-    // instead of replaying into the abandoned one. Never surface the raw
-    // `Error: ProtocolError...` string to the client.
-    if (response.protocolTimeout || isProtocolTimeoutError(response)) {
+    // Puppeteer cancelled a CDP call after protocolTimeout, or the Node fetch
+    // stalled past NODE_STREAM_TIMEOUT_MS. Qwen may still be generating
+    // server-side, so retry on a NEW chat like CHAT_IN_PROGRESS instead of
+    // replaying into the abandoned one. Never surface the raw
+    // `Error: ProtocolError...` / `TimeoutError...` string to the client.
+    if (response.protocolTimeout || isProtocolTimeoutError(response) || isNodeStreamTimeout(response)) {
         if (retryCount < MAX_RETRY_COUNT) {
-            logWarn(`Protocol timeout; retrying on a fresh chat (${retryCount + 1}/${MAX_RETRY_COUNT})`);
+            logWarn(`Stream timeout; retrying on a fresh chat (${retryCount + 1}/${MAX_RETRY_COUNT})`);
             if (chatId) deleteChatV2(chatId).catch(() => {});
             await delay(RETRY_DELAY);
             return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
         }
-        return { error: 'Qwen browser did not respond in time. Please retry shortly.', chatId, protocolTimeout: true };
+        return { error: 'Qwen did not respond in time. Please retry shortly.', chatId, timeout: true };
     }
 
     // Transient browser/network failures (WAF reset, socket hang up, tab
