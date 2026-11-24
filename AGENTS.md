@@ -66,7 +66,7 @@ curl -X POST http://127.0.0.1:3264/api/chat/completions \
 | `src/api/sessionSync.js` | Nhận & validate token/Baxia headers từ CDP observer; ghi file atomic `baxia.json`, update `tokens.json` | Cập nhật WAF headers, logic lọc header, lưu trữ token tự động |
 | `src/api/tokenManager.js` | Quản lý danh sách tài khoản, trạng thái rate-limit, đánh dấu invalid / phục hồi | Đọc/ghi `session/tokens.json`, giải mã JWT, xoay vòng tài khoản |
 | `src/api/modelMapping.js` | Chuẩn hoá tên model, resolve alias/custom model về canonical Qwen model | Thêm alias model, map model từ client bên thứ ba |
-| `src/api/fileUpload.js` | Upload file lên OSS của Qwen qua STS token | Upload file đính kèm, tài liệu, hình ảnh |
+| `src/api/fileUpload.js` | Upload file lên OSS của Qwen qua STS token; `collectImageParts()` / `prepareOpenAIImages()` chuyển ảnh OpenAI thành `messages[].files` | Upload file đính kèm, tài liệu, hình ảnh, xử lý ảnh OpenAI `image_url` |
 | `src/api/imageGeneration.js` | Sinh ảnh qua Qwen Chat (`chatType: t2i`) hoặc DashScope | Sửa prompt sinh ảnh, đổi tỷ lệ khung hình |
 | `src/api/chatHistory.js` | Lưu/đọc lịch sử hội thoại cục bộ theo chatId trong `session/history/` | Debug lịch sử, đồng bộ context hội thoại |
 | `src/browser/browser.js` | Khởi tạo Puppeteer / kết nối CDP (`QWEN_CDP_URL`), quản lý browser context | Cấu hình CDP, viewport, User-Agent, stealth flags |
@@ -75,7 +75,7 @@ curl -X POST http://127.0.0.1:3264/api/chat/completions \
 | `src/config.js` | Điểm tập trung đọc biến môi trường và fallback default constants | Xem default timeout, kích thước pool, port, URL endpoints |
 | `src/env.js` | Autoload file `.env` trước khi khởi chạy các module khác | Nạp biến môi trường |
 | `scripts/core/start-cdp.mjs` | Script launcher mở Chrome có CDP port 9222 và chạy proxy | Chỉnh tham số khởi động Chrome, profile dir |
-| `scripts/core/verify-*.mjs` | Bộ 3 script test offline (parser, reasoning, tools) | Kiểm tra regression logic cốt lõi mà không cần mở trình duyệt |
+| `scripts/core/verify-*.mjs` | Bộ 4 script test offline (parser, reasoning, tools, images) | Kiểm tra regression logic cốt lõi mà không cần mở trình duyệt |
 | `session/` | Thư mục runtime gitignored (`baxia.json`, `tokens.json`, `history/`) | Xem trạng thái token, header WAF thực tế |
 
 ### Luồng xử lý chat completion
@@ -174,6 +174,7 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 - Hỗ trợ Text-to-Image (`/api/images/generations`) qua Qwen Chat (`chatType: t2i`) và DashScope fallback.
 - Hỗ trợ Text-to-Video (`/api/videos/generations`) qua Qwen Chat (`chatType: t2v`).
 - Polling trạng thái tác vụ qua `/api/tasks/status/:taskId`.
+- Ảnh đầu vào OpenAI (`image_url` dạng data URL hoặc http URL) trong `/api/chat/completions` và `/api/v1/chat/completions` được tải lên OSS Qwen rồi đưa vào `messages[].files` theo đúng shape UI; nội dung `content` chỉ giữ phần text.
 
 ## Điểm dễ vỡ (Learned the hard way)
 
@@ -185,6 +186,9 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 6. **Chat biến mất trên web Qwen**: Khi `AUTO_DELETE_CHATS=all` (mặc định), proxy tự động gọi `deleteChatV2()` để dọn dẹp các chat tạm sinh ra. Đây là hành vi bình thường, không phải lỗi.
 7. **OpenWebUI Meta Request**: Các request kiểm tra tiêu đề/tags từ Open WebUI (`isOpenWebUiMetaRequest`) được tách ra xử lý riêng để không làm hỏng context hội thoại chính.
 8. **401 khi tạo chat cũng có dạng HTTP 200**: `createChatV2()` có thể nhận `200` với body `{success:false, data:{code:"unauthorized", details:"401 Unauthorized"}}`. Phải coi như 401, đợi token xoay trong tab Qwen (loại trừ token vừa bị từ chối) rồi retry tối đa `MAX_RETRY_COUNT`; không trả lỗi ngay cho client. Token dùng cho retry cũng phải được giữ nguyên khi gửi message.
+9. **STS upload đã chuyển sang `/api/v2/files/getstsToken`**: URL v1 trả `405`. Response có dạng `{success:true, request_id, data:{...}}` — `getStsToken()` phải unwrap lấy `data` thì `uploadFile()` mới thấy `file_path`/`file_id`. Ảnh sau khi upload phải nằm ở `messages[].files` (type `image`, `file_class: vision`, `url` là signed OSS URL), không được nhét vào `content`.
+10. **`messages[].content` của Qwen Web phải là string**: Sau khi tách các part `image_url` ra khỏi content của OpenAI, nếu còn lại mảng part (`[{type:'text',...}]`) thì Qwen trả `internal_error` ngay. `prepareOpenAIImages()` phải gom các part text còn lại thành một string trước khi gọi `sendMessage()`.
+11. **Chỉ upload ảnh của lượt hiện tại**: Client OpenAI (OpenWebUI...) gửi lại toàn bộ history, trong đó có cả ảnh của các lượt trước. `collectImageParts()` chỉ chọn ảnh trong user message cuối; ảnh cũ được thay bằng placeholder `[image]` và không upload lại, nếu không mỗi request sẽ đính lại toàn bộ ảnh cũ vào chat Qwen. Test regression: `verify-images.mjs`.
 
 ## Quy ước code & test
 
@@ -193,9 +197,9 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 - **Pure Modules**: Các module xử lý logic (như `toolCalls.js`, `reasoning.js`, `sessionSync.js`) phải giữ tính chất pure (không gắn chặt vào DOM hay I/O nặng) để có thể chạy test offline qua `scripts/core/verify-*.mjs`.
 - **Bảo mật**: Tuyệt đối không commit thư mục `session/`, `.env`, `logs/`, `.opencode/`.
 - **Chạy kiểm tra trước khi hoàn thành**:
-  - Chạy cú pháp và 3 script verify offline:
+  - Chạy cú pháp và 4 script verify offline:
     ```bash
-    cmd /c "node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node scripts/core/verify-parser.mjs && node scripts/core/verify-reasoning.mjs && node scripts/core/verify-tools.mjs"
+    cmd /c "node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/fileUpload.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node scripts/core/verify-parser.mjs && node scripts/core/verify-reasoning.mjs && node scripts/core/verify-tools.mjs && node scripts/core/verify-images.mjs"
     ```
 
 ## Cập nhật tài liệu

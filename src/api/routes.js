@@ -4,7 +4,7 @@ import { getAuthenticationStatus, getBrowserContext } from '../browser/browser.j
 import { checkAuthentication } from '../browser/auth.js';
 import { logInfo, logError, logDebug, logWarn } from '../logger/index.js';
 import { resolveRequestedModel } from './modelMapping.js';
-import { getStsToken, uploadFileToQwen } from './fileUpload.js';
+import { getStsToken, uploadFileToQwen, prepareOpenAIImages } from './fileUpload.js';
 import { loadHistory, saveHistory } from './chatHistory.js';
 import { generateImage, getAvailableImageModels, checkImageApiAvailability } from './imageGeneration.js';
 import { MAX_FILE_SIZE, UPLOADS_DIR, DEFAULT_MODEL, STREAMING_CHUNK_DELAY, ALLOW_UNSCOPED_SESSION_CHAT_RESTORE, AUTO_DELETE_CHATS, DELETE_FAILED_CHATS } from '../config.js';
@@ -1436,12 +1436,24 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
 
             const hasTools = Array.isArray(combinedTools) && combinedTools.length > 0;
 
+            // Upload OpenAI image_url parts to Qwen OSS and move them into
+            // messages[].files - the shape Qwen Web actually understands.
+            let imageFiles = [];
+            if (Array.isArray(messages)) {
+                const preparedImages = await prepareOpenAIImages(messages);
+                if (preparedImages.error) {
+                    return res.status(400).json({ error: { message: preparedImages.error, type: 'invalid_request_error' } });
+                }
+                imageFiles = preparedImages.files || [];
+                if (imageFiles.length) logInfo(`Prepared ${imageFiles.length} image attachment(s) for Qwen`);
+            }
+
             // When tools are present, fold the entire messages array (including system,
             // history, tool calls/results) into one Qwen-readable prompt using the
             // tool_call fence format that Qwen Web understands.  Qwen's web API does not
             // natively parse OpenAI tool schemas, so we never send payload.tools to it.
             let messageContent;
-            let files = [];
+            let files = imageFiles;
             let promptSystemMessage = null; // system sent separately only when NO tools
             if (hasTools) {
                 messageContent = messagesToQwenPrompt(messages, combinedTools, tool_choice);
@@ -1453,7 +1465,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     return res.status(400).json({ error: 'No user messages in request' });
                 }
                 messageContent = preparedInput.messageContent;
-                files = preparedInput.files || [];
+                files = [...(preparedInput.files || []), ...imageFiles];
                 if (preparedInput.folded) {
                     logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
                 }
@@ -1674,7 +1686,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                 }
             } else {
                 const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, null, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, reasoningOptions);
+                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, reasoningOptions);
 
                 // Cleanup chat by configured policy (default all).
                 cleanupEphemeralChat(result, { explicitChatId, effectiveChatId, isMeta, model: mappedModel });
@@ -1826,12 +1838,24 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
 
             const hasTools = Array.isArray(combinedTools) && combinedTools.length > 0;
 
+            // Upload OpenAI image_url parts to Qwen OSS and move them into
+            // messages[].files - the shape Qwen Web actually understands.
+            let imageFiles = [];
+            if (Array.isArray(messages)) {
+                const preparedImages = await prepareOpenAIImages(messages);
+                if (preparedImages.error) {
+                    return res.status(400).json({ error: { message: preparedImages.error, type: 'invalid_request_error' } });
+                }
+                imageFiles = preparedImages.files || [];
+                if (imageFiles.length) logInfo(`Prepared ${imageFiles.length} image attachment(s) for Qwen`);
+            }
+
             // When tools are present, fold the entire messages array (including system,
             // history, tool calls/results) into one Qwen-readable prompt using the
             // tool_call fence format that Qwen Web understands.  Qwen's web API does not
             // natively parse OpenAI tool schemas, so we never send payload.tools to it.
             let messageContent;
-            let files = [];
+            let files = imageFiles;
             let promptSystemMessage = null; // system sent separately only when NO tools
             if (hasTools) {
                 messageContent = messagesToQwenPrompt(messages, combinedTools, tool_choice);
@@ -1843,7 +1867,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     return res.status(400).json({ error: 'No user messages in request' });
                 }
                 messageContent = preparedInput.messageContent;
-                files = preparedInput.files || [];
+                files = [...(preparedInput.files || []), ...imageFiles];
                 if (preparedInput.folded) {
                     logInfo('OpenAI/Hermes transcript folded into user message for context/tool-result preservation');
                 }
