@@ -2,7 +2,7 @@ import { getBrowserContext, getAuthenticationStatus, setAuthenticationStatus, en
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
 import { shutdownBrowser, initBrowser } from '../browser/browser.js';
 import { saveAuthToken } from '../browser/session.js';
-import { getAvailableToken, markRateLimited, removeInvalidToken, markValid, markValidForToken, decodeTokenInfo } from './tokenManager.js';
+import { getAvailableToken, markRateLimited, removeInvalidToken, markInvalid, markValid, markValidForToken, decodeTokenInfo } from './tokenManager.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -381,11 +381,13 @@ function tokenIsFresh(token, skewMs = 30_000) {
 // Qwen rotates the short-lived token in the tab. When we catch the old one
 // just before rotation, wait briefly for the page to install the replacement
 // instead of firing a request that is guaranteed to return 401.
-async function waitForFreshToken(browserContext, timeoutMs = 12_000) {
+async function waitForFreshToken(browserContext, timeoutMs = 12_000, excludeToken = null) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
         const token = await readTokenFromQwenTab(browserContext);
-        if (token && tokenIsFresh(token)) return token;
+        // excludeToken prevents an immediate retry with the very token that
+        // was just rejected (JWT can still be unexpired after a server-side rotation).
+        if (token && token !== excludeToken && tokenIsFresh(token)) return token;
         await delay(400);
     }
     return null;
@@ -1169,7 +1171,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         // second before our request. Do not burn the account in that case:
         // wait for the rotation and retry the SAME chat once.
         if (isBrowserToken && retryCount < MAX_RETRY_COUNT) {
-            const fresh = await waitForFreshToken(getBrowserContext());
+            const fresh = await waitForFreshToken(getBrowserContext(), 12_000, tokenObj?.token);
             if (fresh) {
                 authToken = fresh;
                 saveAuthToken(fresh);
@@ -1248,10 +1250,12 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         logWarn(`Unknown reasoning_effort "${reasoningEffort}"; keeping current feature_config`);
     }
 
+    let chatAuthRetried = false;
     if (!chatId) {
         const newChatResult = await createChatV2(model, 'New chat', 0, chatType, tokenObj);
-        if (newChatResult.error) return { error: 'Failed to create chat: ' + newChatResult.error };
+        if (newChatResult.error) return { error: 'Failed to create chat: ' + newChatResult.error, status: newChatResult.status, unauthorized: newChatResult.unauthorized };
         chatId = newChatResult.chatId;
+        chatAuthRetried = Boolean(newChatResult.authRetried);
         logInfo(`Created new chat v2 with ID: ${chatId}`);
     }
 
@@ -1277,7 +1281,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     let page = null;
     try {
         page = await pagePool.getPage(browserContext);
-        await syncTokenFromPage(page, tokenObj);
+        if (!chatAuthRetried) await syncTokenFromPage(page, tokenObj);
 
         const verificationNeeded = await checkVerification(page);
         if (verificationNeeded) {
@@ -1535,9 +1539,52 @@ export function getAuthToken() {
     return authToken;
 }
 
+// Qwen sometimes answers with HTTP 200 and a body like
+// { success: false, data: { code: "unauthorized", details: "401 Unauthorized" } }
+// - handle it exactly like an HTTP 401.
+function isUnauthorizedResult(result = {}) {
+    if (result.status === 401) return true;
+    const candidates = [result.errorBody, result.error];
+    if (result.data) candidates.push(JSON.stringify(result.data));
+    return candidates.some(value => {
+        if (!value) return false;
+        return /401\s+unauthorized|\bunauthorized\b|token has expired/i.test(String(value));
+    });
+}
+
+// Recover from a 401 while creating a chat: first wait for the rotated token
+// in the live Qwen tab, then fall back to another stored account.
+// Returns the token object to use for the retry, or null when nothing is left.
+async function refreshTokenAfter401(browserContext, failedToken, tokenObj) {
+    browserTokenRateLimited = false;
+
+    const fresh = await waitForFreshToken(browserContext, 12_000, failedToken || null);
+    if (fresh) {
+        authToken = fresh;
+        saveAuthToken(fresh);
+        markValidForToken(fresh);
+        logInfo('Refreshed browser token after chat-creation 401');
+        return { ...(tokenObj || {}), id: tokenObj?.id || 'browser', token: fresh, source: 'browser' };
+    }
+
+    if (tokenObj?.id && tokenObj.source !== 'browser' && tokenObj.id !== 'browser') {
+        markInvalid(tokenObj.id);
+        logWarn(`Token ${tokenObj.id} invalid (401) during chat creation; trying another account.`);
+    }
+
+    authToken = null;
+    const next = await getAvailableToken();
+    if (next?.token && next.token !== failedToken) {
+        authToken = next.token;
+        logInfo(`Switching to account ${next.id} after chat-creation 401`);
+        return next;
+    }
+    return null;
+}
+
 // --- createChatV2 ----------------------------------------------------------
 
-export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', retryCount = 0, chatType = 't2t', tokenObj = null) {
+export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', retryCount = 0, chatType = 't2t', tokenObj = null, skipPageTokenSync = false, authRetried = false) {
     const browserContext = getBrowserContext();
     if (!browserContext) return { error: 'Browser is not initialized' };
 
@@ -1559,10 +1606,13 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
     let page = null;
     try {
         page = await pagePool.getPage(browserContext);
-        await syncTokenFromPage(page, tokenObj);
+        // On an auth retry the token was just refreshed/switched; do not let a
+        // stale token still sitting in the page overwrite it.
+        if (!skipPageTokenSync) await syncTokenFromPage(page, tokenObj);
+        const requestToken = authToken;
 
         const payload = { title, models: [model], chat_mode: 'normal', chat_type: chatType, timestamp: Date.now() };
-        const requestBody = { apiUrl: CREATE_CHAT_URL, payload, token: authToken, headers: loadBaxiaHeaders() || null };
+        const requestBody = { apiUrl: CREATE_CHAT_URL, payload, token: requestToken, headers: loadBaxiaHeaders() || null };
 
         const result = await page.evaluate(async (data) => {
             try {
@@ -1589,7 +1639,27 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
 
         if (result.success && result.data.success) {
             logInfo(`Chat created: ${result.data.data.id}`);
-            return { success: true, chatId: result.data.data.id, requestId: result.data.request_id };
+            return { success: true, chatId: result.data.data.id, requestId: result.data.request_id, authRetried };
+        }
+
+        if (isUnauthorizedResult(result)) {
+            logWarn(`Chat creation unauthorized (401), attempt ${retryCount + 1}`);
+            if (result.errorBody) logWarn(`401 response body: ${String(result.errorBody).slice(0, 300)}`);
+            const unauthorizedError = { error: 'All tokens are invalid (401). Re-authentication required.', status: 401, unauthorized: true };
+            if (retryCount >= MAX_RETRY_COUNT) {
+                logError('Chat creation 401 retries exhausted.');
+                return unauthorizedError;
+            }
+            const refreshed = await refreshTokenAfter401(browserContext, requestToken, tokenObj);
+            if (!refreshed) {
+                logError('No fresh token available for chat creation retry.');
+                return unauthorizedError;
+            }
+            // Keep the caller (sendMessage) on the same token we use to retry
+            // so chat creation and message sending stay under one account.
+            if (tokenObj) Object.assign(tokenObj, refreshed);
+            logInfo(`Retrying chat creation with refreshed token (attempt ${retryCount + 2})`);
+            return createChatV2(model, title, retryCount + 1, chatType, tokenObj, true, true);
         }
 
         const isTransient = result.status >= 500 && result.status < 600;

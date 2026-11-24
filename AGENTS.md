@@ -184,6 +184,7 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 5. **Slider Captcha (`nc_1_nocaptcha`)**: Nếu xuất hiện slider captcha hoặc trang chuyển hướng về `_____tmd_____/report`, **dừng tự động ngay lập tức** và thông báo cho người dùng kéo captcha trên giao diện trình duyệt. Không cố giải captcha bằng code.
 6. **Chat biến mất trên web Qwen**: Khi `AUTO_DELETE_CHATS=all` (mặc định), proxy tự động gọi `deleteChatV2()` để dọn dẹp các chat tạm sinh ra. Đây là hành vi bình thường, không phải lỗi.
 7. **OpenWebUI Meta Request**: Các request kiểm tra tiêu đề/tags từ Open WebUI (`isOpenWebUiMetaRequest`) được tách ra xử lý riêng để không làm hỏng context hội thoại chính.
+8. **401 khi tạo chat cũng có dạng HTTP 200**: `createChatV2()` có thể nhận `200` với body `{success:false, data:{code:"unauthorized", details:"401 Unauthorized"}}`. Phải coi như 401, đợi token xoay trong tab Qwen (loại trừ token vừa bị từ chối) rồi retry tối đa `MAX_RETRY_COUNT`; không trả lỗi ngay cho client. Token dùng cho retry cũng phải được giữ nguyên khi gửi message.
 
 ## Quy ước code & test
 
