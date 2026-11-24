@@ -69,8 +69,50 @@ async function getPage(context) {
     throw new Error('Invalid context: not a Puppeteer instance, not a Playwright context');
 }
 
+// Ad-hoc CDP tabs created by pagePool are routinely served a slider captcha by
+// Qwen's WAF. An already-open healthy tab carries the same real session without
+// adding a new browser target, so prefer it as the fetch worker. The proxy only
+// runs page.evaluate(fetch(...)) there - it never navigates or closes that tab.
+const CAPTCHA_SELECTOR = '#nc_1_nocaptcha, .nc_scale, [id*="nocaptcha"], iframe[src*="_____tmd_____"]';
+
+async function isHealthyQwenPage(page) {
+    try {
+        if (!page || page.isClosed()) return false;
+        const url = page.url();
+        if (!url.includes('chat.qwen.ai') || url.includes('_____tmd_____')) return false;
+        return await page.evaluate((selector) => {
+            if (document.querySelector(selector)) return false;
+            if ((document.body?.innerText || '').includes('Access Verification')) return false;
+            try { return Boolean(localStorage.getItem('token')); } catch { return true; }
+        }, CAPTCHA_SELECTOR);
+    } catch {
+        return false;
+    }
+}
+
+async function findHealthyQwenPage(context, excludePages) {
+    const baseContext = getBrowserContext() || context;
+    const browser = (baseContext && typeof baseContext.browser === 'function')
+        ? baseContext.browser()
+        : (baseContext && typeof baseContext.pages === 'function' ? baseContext : null);
+    if (!browser || typeof browser.pages !== 'function') return null;
+
+    // Include baseContext: in CDP mode it is the tab opened at startup, which
+    // is exactly the healthy session tab. It is never closed by releasePage().
+    const excluded = new Set(excludePages);
+    const candidates = (await browser.pages()).filter(page => !excluded.has(page));
+    const score = (page) => (page.url().includes('/c/') ? 1 : 0);
+    candidates.sort((a, b) => score(b) - score(a));
+
+    for (const candidate of candidates) {
+        if (await isHealthyQwenPage(candidate)) return candidate;
+    }
+    return null;
+}
+
 export const pagePool = {
     pages: [],
+    borrowed: new Set(),
     maxSize: PAGE_POOL_SIZE,
 
     async getPage(context) {
@@ -97,6 +139,15 @@ export const pagePool = {
             }
         }
 
+        // Borrow a healthy tab that is already open before spawning a fresh
+        // target - new targets are what Qwen's WAF challenges with a captcha.
+        const shared = await findHealthyQwenPage(baseContext, this.pages);
+        if (shared) {
+            this.borrowed.add(shared);
+            logInfo('Reusing existing healthy Qwen tab for API requests');
+            return shared;
+        }
+
         const newPage = await getPage(baseContext);
         await newPage.goto(CHAT_PAGE_URL, { waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
 
@@ -120,6 +171,12 @@ export const pagePool = {
             if (page.isClosed()) return;
         } catch { return; }
 
+        if (this.borrowed.has(page)) {
+            // Owned by the UI - never close it or push it into the worker pool.
+            this.borrowed.delete(page);
+            return;
+        }
+
         const baseContext = getBrowserContext();
         if (page === baseContext) {
             // Base page is kept separately from the pool.
@@ -136,12 +193,13 @@ export const pagePool = {
     async clear() {
         const baseContext = getBrowserContext();
         for (const page of this.pages) {
-            if (page === baseContext) continue;
+            if (page === baseContext || this.borrowed.has(page)) continue;
             try { await page.close(); } catch (e) {
                 logError('Error closing page in pool', e);
             }
         }
         this.pages = [];
+        this.borrowed.clear();
     }
 };
 
@@ -712,7 +770,7 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
 // captured from one real UI request; they live for the whole session.
 const BAXIA_HEADERS_FILE = path.join(__dirname, '..', '..', 'session', 'baxia.json');
 
-function loadBaxiaHeaders() {
+export function loadBaxiaHeaders() {
     try {
         if (!fs.existsSync(BAXIA_HEADERS_FILE)) return null;
         const raw = JSON.parse(fs.readFileSync(BAXIA_HEADERS_FILE, 'utf8'));

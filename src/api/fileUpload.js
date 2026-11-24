@@ -1,6 +1,6 @@
 import { getBrowserContext } from '../browser/browser.js';
 import { logInfo, logError } from '../logger/index.js';
-import { getAuthToken, extractAuthToken, pagePool } from './chat.js';
+import { getAuthToken, extractAuthToken, pagePool, loadBaxiaHeaders } from './chat.js';
 import { getAvailableToken, decodeTokenInfo } from './tokenManager.js';
 import fs from 'fs';
 import path from 'path';
@@ -272,17 +272,30 @@ export async function getStsToken(fileInfo) {
     let page = null;
     try {
         page = await pagePool.getPage(browserContext);
+        // The real UI sends the full Baxia header set (Version/source/Timezone/
+        // bx-*) on every /api/v2 request. Sending only Authorization makes WAF
+        // serve a captcha challenge, which navigates the tab and kills the
+        // evaluate context. Mirror the UI header set exactly.
+        const extraHeaders = loadBaxiaHeaders() || {};
         const result = await page.evaluate(async (data) => {
             try {
+                const headers = { ...data.extraHeaders, 'Authorization': `Bearer ${data.token}` };
+                headers['X-Request-Id'] = crypto.randomUUID
+                    ? crypto.randomUUID()
+                    : String(Date.now()) + Math.random().toString(16).slice(2);
                 const response = await fetch(data.apiUrl, {
                     method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${data.token}`, 'Accept': 'application/json' },
+                    headers,
                     body: JSON.stringify(data.fileInfo)
                 });
-                if (response.ok) return { success: true, data: await response.json() };
+                if (response.ok) {
+                    const text = await response.text();
+                    try { return { success: true, data: JSON.parse(text) }; }
+                    catch { return { success: false, status: 200, errorBody: text.slice(0, 200) }; }
+                }
                 return { success: false, status: response.status, statusText: response.statusText, errorBody: await response.text() };
             } catch (error) { return { success: false, error: error.toString() }; }
-        }, { apiUrl: STS_TOKEN_API_URL, token, fileInfo });
+        }, { apiUrl: STS_TOKEN_API_URL, token, fileInfo, extraHeaders });
 
         if (result.success) {
             const body = result.data || {};
