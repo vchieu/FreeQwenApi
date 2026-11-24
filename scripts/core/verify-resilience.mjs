@@ -1,0 +1,113 @@
+// Offline checks for transient network retry + captcha notification plumbing.
+// No browser, network or notification process is started.
+import assert from 'node:assert/strict';
+import {
+    CAPTCHA_NOTICE,
+    isRetryableNetworkError,
+    shouldRetryNetworkError,
+    detectCaptchaSignal,
+    isCaptchaResponse,
+    isChatInProgress,
+    isVisibleBox
+} from '../../src/api/resilience.js';
+import { notificationCommand } from '../../src/utils/notify.js';
+
+let checks = 0;
+function check(name, fn) {
+    fn();
+    checks++;
+    console.log(`  ok - ${name}`);
+}
+
+console.log('Network error detection:');
+check('browser fetch TypeError is retryable', () => {
+    assert.equal(isRetryableNetworkError({ success: false, error: 'TypeError: network error' }), true);
+});
+check('node fetch failure is retryable', () => {
+    assert.equal(isRetryableNetworkError({ success: false, error: 'TypeError: fetch failed' }), true);
+});
+check('socket hang up is retryable', () => {
+    assert.equal(isRetryableNetworkError({ error: 'Error: socket hang up' }), true);
+});
+check('HTTP 500 is not a network retry', () => {
+    assert.equal(isRetryableNetworkError({ status: 500, errorBody: 'oops' }), false);
+});
+check('partially streamed answer is never replayed', () => {
+    assert.equal(isRetryableNetworkError({ error: 'TypeError: network error', hasStreamedChunks: true }), false);
+});
+check('captcha response is not treated as a network error', () => {
+    assert.equal(isRetryableNetworkError({ captcha: true, error: 'network error' }), false);
+});
+check('retry budget is respected', () => {
+    assert.equal(shouldRetryNetworkError({ error: 'network error' }, 2, 3), true);
+    assert.equal(shouldRetryNetworkError({ error: 'network error' }, 3, 3), false);
+});
+
+console.log('Captcha signal detection:');
+check('WAF report URL is detected', () => {
+    assert.equal(detectCaptchaSignal({ url: 'https://chat.qwen.ai/_____tmd_____/report?x=1' }), 'slider');
+});
+check('slider captcha DOM marker is detected', () => {
+    assert.equal(detectCaptchaSignal({ text: 'Please slide nc_1_nocaptcha to verify' }), 'slider');
+});
+check('Verification page title is detected', () => {
+    assert.equal(detectCaptchaSignal({ title: 'Verification - Qwen' }), 'verification');
+});
+check('Chinese slider marker is detected', () => {
+    assert.equal(detectCaptchaSignal({ text: '请完成安全验证后继续' }), 'slider');
+});
+check('plain chat page is not a captcha', () => {
+    assert.equal(detectCaptchaSignal({ url: 'https://chat.qwen.ai/c/abc', title: 'Qwen', text: 'Hello there' }), null);
+});
+check('captcha HTML in an upstream error is recognized', () => {
+    assert.equal(isCaptchaResponse({ errorBody: '<html>Verification required</html>' }), true);
+});
+check('notice tells the user what to do', () => {
+    assert.match(CAPTCHA_NOTICE, /resolve captcha/i);
+});
+check('hidden captcha iframe (0x0) is not an active captcha', () => {
+    // Qwen leaves a 0x0 baxia-dialog-content iframe after the slider is solved.
+    assert.equal(isVisibleBox(null), false);
+    assert.equal(isVisibleBox({ width: 0, height: 0 }), false);
+    assert.equal(isVisibleBox({ width: 120, height: 80 }), true);
+});
+
+console.log('Qwen CHAT_IN_PROGRESS recovery:');
+check('500 CHAT_IN_PROGRESS body is recognized', () => {
+    assert.equal(isChatInProgress({ status: 500, errorBody: '{"success":false,"data":{"code":"CHAT_IN_PROGRESS","details":"The chat is in progress!"}}' }), true);
+});
+check('ordinary 500 is not misclassified', () => {
+    assert.equal(isChatInProgress({ status: 500, errorBody: '{"data":{"code":"Internal_Server_Error"}}' }), false);
+});
+
+console.log('Desktop notification commands:');
+const win = notificationCommand('win32', 'FreeQwenApi', CAPTCHA_NOTICE);
+check('Windows uses PowerShell with the message', () => {
+    assert.equal(win.cmd, 'powershell.exe');
+    assert.equal(win.args[1], '-Command');
+    assert.match(win.args[2], /MessageBox/);
+    assert.match(win.args[2], /resolve captcha/i);
+    assert.ok(!win.args.includes('-NonInteractive'));
+});
+const mac = notificationCommand('darwin', 'FreeQwenApi', CAPTCHA_NOTICE);
+check('macOS uses osascript display notification', () => {
+    assert.equal(mac.cmd, 'osascript');
+    assert.match(mac.args[1], /display notification/);
+});
+const linux = notificationCommand('linux', 'FreeQwenApi', CAPTCHA_NOTICE);
+check('Linux uses notify-send', () => {
+    assert.equal(linux.cmd, 'notify-send');
+    assert.match(linux.args[1], /resolve captcha/i);
+});
+check('quotes are stripped from notification text', () => {
+    const spec = notificationCommand('darwin', 'A"B', "it's fine");
+    assert.doesNotMatch(spec.args[1], /["']{2}/);
+});
+check('unsupported platform is a no-op', () => {
+    assert.equal(notificationCommand('freebsd', 'title', 'message'), null);
+});
+
+const TOTAL = 7 + 8 + 5 + 2;
+console.log(`\nchecks: ${checks}`);
+console.log(checks === TOTAL ? 'PASS' : `FAIL (expected ${TOTAL} checks, got ${checks})`);
+process.exit(checks === TOTAL ? 0 : 1);

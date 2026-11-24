@@ -32,16 +32,18 @@ Kiểm tra cú pháp & kiểm tra offline (không cần browser, không cần ne
 
 ```bash
 # Cú pháp (Windows CMD)
-node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node --check src/api/authRecovery.js
+node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/resilience.js && node --check src/utils/notify.js && node --check src/api/fileUpload.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node --check src/api/authRecovery.js
 
 # Hoặc PowerShell
-node --check index.js; node --check src/api/chat.js; node --check src/api/routes.js; node --check src/api/reasoning.js; node --check src/api/toolCalls.js; node --check src/api/authRecovery.js
+node --check index.js; node --check src/api/chat.js; node --check src/api/routes.js; node --check src/api/resilience.js; node --check src/utils/notify.js; node --check src/api/fileUpload.js; node --check src/api/reasoning.js; node --check src/api/toolCalls.js; node --check src/api/authRecovery.js
 
 # Chạy bộ verify offline
 node scripts/core/verify-parser.mjs            # Kiểm tra parser SSE câu trả lời
 node scripts/core/verify-reasoning.mjs         # Kiểm tra mapping reasoning_effort & thinking stream
 node scripts/core/verify-tools.mjs             # Kiểm tra parser tool_calls, format prompt, recovery JSON, text tool call
 node scripts/core/verify-auth-retry.mjs        # Kiểm tra nhận diện 401, chọn token xoay, chọn tab proxy-owned
+node scripts/core/verify-images.mjs            # Kiểm tra tách/chỉ upload ảnh lượt hiện tại
+node scripts/core/verify-resilience.mjs        # Kiểm tra retry network error, phát hiện captcha, lệnh notification
 ```
 
 Kiểm tra trực tiếp endpoint khi proxy đang chạy:
@@ -64,6 +66,8 @@ curl -X POST http://127.0.0.1:3264/api/chat/completions \
 | `src/api/chat.js` | Giao tiếp core với Qwen: build payload, header Baxia, `sendMessage()`, `executeApiRequest()`, page pool, delete chat | Lỗi kết nối Qwen, request header WAF, gọi browser evaluate, vòng đời chat |
 | `src/api/toolCalls.js` | Pure module: `messagesToQwenPrompt()` (chèn `# Tool Use`), `parseToolCalls()` (fence/XML + JSON trần/prose/nhiều call), lenient JSON parser | Sửa cách gọi tool, định dạng tool_call fences, recovery lỗi JSON arguments |
 | `src/api/authRecovery.js` | Pure module: nhận diện 401, chọn token xoay hợp lệ, chọn tab proxy-owned để reload | Sửa luồng retry 401, chờ/xoay token |
+| `src/api/resilience.js` | Pure module: phân loại lỗi mạng có thể retry, nhận diện tín hiệu captcha (WAF `_____tmd_____`, slider `nc_1_nocaptcha`, title `Verification`), text thông báo | Sửa retry network error, phát hiện/handle captcha |
+| `src/utils/notify.js` | Fire-and-forget desktop alert (Windows MessageBox, macOS `osascript`, Linux `notify-send`); `notificationCommand()` pure để test | Sửa cách notify user khi cần giải captcha |
 | `src/api/reasoning.js` | Pure module: map `reasoning_effort` → Qwen `feature_config`, accumulator stream thinking | Chỉnh chế độ suy nghĩ (Fast/Auto/Thinking), xử lý stream suy nghĩ |
 | `src/api/sessionSync.js` | Nhận & validate token/Baxia headers từ CDP observer; ghi file atomic `baxia.json`, update `tokens.json` | Cập nhật WAF headers, logic lọc header, lưu trữ token tự động |
 | `src/api/tokenManager.js` | Quản lý danh sách tài khoản, trạng thái rate-limit, đánh dấu invalid / phục hồi | Đọc/ghi `session/tokens.json`, giải mã JWT, xoay vòng tài khoản |
@@ -77,7 +81,7 @@ curl -X POST http://127.0.0.1:3264/api/chat/completions \
 | `src/config.js` | Điểm tập trung đọc biến môi trường và fallback default constants | Xem default timeout, kích thước pool, port, URL endpoints |
 | `src/env.js` | Autoload file `.env` trước khi khởi chạy các module khác | Nạp biến môi trường |
 | `scripts/core/start-cdp.mjs` | Script launcher mở Chrome có CDP port 9222 và chạy proxy | Chỉnh tham số khởi động Chrome, profile dir |
-| `scripts/core/verify-*.mjs` | Bộ 4 script test offline (parser, reasoning, tools, images) | Kiểm tra regression logic cốt lõi mà không cần mở trình duyệt |
+| `scripts/core/verify-*.mjs` | Bộ 6 script test offline (parser, reasoning, tools, images, auth-retry, resilience) | Kiểm tra regression logic cốt lõi mà không cần mở trình duyệt |
 | `session/` | Thư mục runtime gitignored (`baxia.json`, `tokens.json`, `history/`) | Xem trạng thái token, header WAF thực tế |
 
 ### Luồng xử lý chat completion
@@ -115,6 +119,9 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
   - `RETRY_DELAY`: 2,000 ms.
   - `STREAMING_CHUNK_DELAY`: 20 ms.
   - `TASK_POLL_INTERVAL`: 2,000 ms; `TASK_POLL_MAX_ATTEMPTS`: 90.
+  - `CAPTCHA_POLL_INTERVAL_MS`: 1,000 ms — chu kỳ poll trạng thái tab Qwen để phát hiện captcha.
+  - `CAPTCHA_WAIT_TIMEOUT_MS`: 300,000 ms (5 phút) — tối đa chờ user kéo slider trước khi trả lỗi cho client.
+  - `QWEN_CAPTCHA_NOTIFY`: đặt `off` để tắt desktop notification (mặc định bật).
 - **Dọn dẹp hội thoại Qwen (`AUTO_DELETE_CHATS`)**:
   - `AUTO_DELETE_CHATS` (`all` / `true` / `1`): Xoá các chat do proxy tạo ra trên Qwen sau khi trả lời xong.
   - `failed`: Chỉ xoá chat khi gặp lỗi.
@@ -174,7 +181,14 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 - Phần chữ giải thích (prose) đi cùng tool call được bảo toàn trong `content`, các block fence/JSON đã parse được tách sạch sẽ.
 - `sendMessage()` gom hậu xử lý tool call thành `finalizeToolCallsInResponse()` gọi lại sau cả nudge retry: response thứ hai cũng luôn có `tool_calls_normalized`, `tool_calls_clean_text`, không để tool call sót lại thành text. `routes.js` giữ prose đó thay vì ép `content` về `''`.
 
-### 7. Media & Async Tasks
+### 7. Network retry & Captcha notification
+- `fetch` trong tab Qwen đôi khi chết giữa chừng (`TypeError: network error`, `socket hang up`, `fetch failed`) do WAF reset hoặc tab chuyển hướng. `src/api/resilience.js` phân loại đây là lỗi mạng tạm thời: `handleApiError()` chờ `RETRY_DELAY` rồi retry **cùng chat** (giữ nguyên `tools`/`systemMessage`), tối đa `MAX_RETRY_COUNT`. HTTP 4xx/5xx và response đã stream một phần (`hasStreamedChunks`) **không** retry để tránh nhân đôi content.
+- Captcha được nhận diện sớm cả trước lẫn trong lúc request (`readCaptchaSignal()` + `startCaptchaWatcher()`): URL `_____tmd_____`, marker slider `nc_1_nocaptcha`/`baxia-dialog`, hoặc title `Verification`. Khi phát hiện: bắn desktop notification ngay (`src/utils/notify.js`: MessageBox trên Windows, `osascript` trên macOS, `notify-send` trên Linux) và gửi chunk SSE `Please resolve captcha to continue...` cho client (kể cả route có `tools` qua `onCaptcha`).
+- Proxy tiếp tục poll tab (`CAPTCHA_POLL_INTERVAL_MS`) tối đa `CAPTCHA_WAIT_TIMEOUT_MS`; sau khi user kéo slider xong tự động retry (trên chat mới, xem bên dưới). Nếu hết timeout trả `{error, verification:true, captcha:true}` để client biết thay vì im lặng đến lúc `PAGE_TIMEOUT`. Không bao giờ tự solve captcha bằng code.
+- **Chỉ xét frame visible**: Qwen giữ lại iframe 0x0 `baxia-dialog-content` (`_____tmd_____/punish`) sau khi đã giải captcha. `readCaptchaSignal()` dùng `frame.frameElement().boundingBox()` (`isVisibleBox()`) để bỏ frame ẩn; nếu quét URL mọi frame thì `waitForCaptchaClear()` sẽ chạy đúng 300s rồi trả lỗi dù user đã kéo slider xong.
+- **Sau captcha phải retry chat MỚI**: fetch trong tab chết khi WAF chặn nhưng phía Qwen vẫn đang generate. Gửi lại vào cùng `chat_id` bị `500 {"data":{"code":"CHAT_IN_PROGRESS","details":"The chat is in progress!"}}`. `handleApiError()` nhận diện `isChatInProgress()`, xoá chat cũ rồi retry với `chatId=null/parentId=null` (history vẫn nằm trong `messages`). Đường captcha-recovery cũng làm vậy luôn, không đợi dò lỗi.
+
+### 8. Media & Async Tasks
 - Hỗ trợ Text-to-Image (`/api/images/generations`) qua Qwen Chat (`chatType: t2i`) và DashScope fallback.
 - Hỗ trợ Text-to-Video (`/api/videos/generations`) qua Qwen Chat (`chatType: t2v`).
 - Polling trạng thái tác vụ qua `/api/tasks/status/:taskId`.
@@ -186,7 +200,7 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 2. **x-request-id trùng lặp hoặc cũ**: Bắt buộc strip `x-request-id` có sẵn và chỉ chèn 1 UUID duy nhất. 2 ID gây lỗi 500, ID cũ gây lỗi 403 `FAIL_SYS_USER_VALIDATE`.
 3. **Headless Timeout**: Không chạy Chrome headless tự tạo mà không có flag stealth/profile thật. Luôn ưu tiên đường CDP nối vào Chrome thật (`start:cdp`).
 4. **Token hết hạn**: Không tin tưởng tuyệt đối vào token trong file `tokens.json`. Token trong `localStorage` của tab Qwen mới là nguồn chuẩn.
-5. **Slider Captcha (`nc_1_nocaptcha`)**: Nếu xuất hiện slider captcha hoặc trang chuyển hướng về `_____tmd_____/report`, **dừng tự động ngay lập tức** và thông báo cho người dùng kéo captcha trên giao diện trình duyệt. Không cố giải captcha bằng code.
+5. **Slider Captcha (`nc_1_nocaptcha`)**: Nếu xuất hiện slider captcha hoặc trang chuyển hướng về `_____tmd_____/report`, **dừng tự động ngay lập tức** (không cố giải bằng code), bắn desktop notification + SSE notice cho client, rồi chờ user kéo captcha và retry cùng chat. Không restart browser như cũ (việc đó làm mất tab user đang thao tác). Test regression: `verify-resilience.mjs`.
 6. **Chat biến mất trên web Qwen**: Khi `AUTO_DELETE_CHATS=all` (mặc định), proxy tự động gọi `deleteChatV2()` để dọn dẹp các chat tạm sinh ra. Đây là hành vi bình thường, không phải lỗi.
 7. **OpenWebUI Meta Request**: Các request kiểm tra tiêu đề/tags từ Open WebUI (`isOpenWebUiMetaRequest`) được tách ra xử lý riêng để không làm hỏng context hội thoại chính.
 8. **401 khi tạo chat cũng có dạng HTTP 200**: `createChatV2()` có thể nhận `200` với body `{success:false, data:{code:"unauthorized", details:"401 Unauthorized"}}`. Phải coi như 401, dùng `recoverBrowserToken()` (chờ xoay ngắn → reload tab proxy-owned để ép token mới, loại trừ token vừa bị từ chối) rồi retry tối đa `MAX_RETRY_COUNT`; không trả lỗi ngay cho client. Token dùng cho retry cũng phải được giữ nguyên khi gửi message. Test regression: `verify-auth-retry.mjs`.
@@ -194,6 +208,11 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 10. **`messages[].content` của Qwen Web phải là string**: Sau khi tách các part `image_url` ra khỏi content của OpenAI, nếu còn lại mảng part (`[{type:'text',...}]`) thì Qwen trả `internal_error` ngay. `prepareOpenAIImages()` phải gom các part text còn lại thành một string trước khi gọi `sendMessage()`.
 11. **Chỉ upload ảnh của lượt hiện tại**: Client OpenAI (OpenWebUI...) gửi lại toàn bộ history, trong đó có cả ảnh của các lượt trước. `collectImageParts()` chỉ chọn ảnh trong user message cuối; ảnh cũ được thay bằng placeholder `[image]` và không upload lại, nếu không mỗi request sẽ đính lại toàn bộ ảnh cũ vào chat Qwen. Test regression: `verify-images.mjs`.
 12. **Tool call có thể là text trần**: Qwen đôi khi trả `{"name":"...","arguments":{...}}` không có fence, kèm prose hoặc nhiều call liên tiếp. `parseToolCalls()` phải quét mọi object có shape tool, cắt khỏi `content` (fence hợp lệ đứng riêng vẫn được parse như cũ; fence có prose cùng dòng là mô tả và giữ nguyên). `finalizeToolCallsInResponse()` phải chạy lại sau nudge retry (`_toolRetryDone`) nếu không tool call sẽ sót lại thành text như đã thấy với `todowrite`. Test regression: `verify-tools.mjs`.
+13. **`TypeError: network error` không được trả thẳng cho client**: Đây là `fetch` trong tab bị WAF/reset chặng giữa SSE. `handleApiError()` phải retry cùng chat (tối đa `MAX_RETRY_COUNT`). Đường node-streaming phải gắn `hasStreamedChunks` ngay trong `catch`, nếu không response sẽ bị coi là chưa stream và fallback sang browser → gửi lại cả nội dung cũ. Test regression: `verify-resilience.mjs`.
+14. **Captcha mà user không để ý thì request đứng timeout**: `checkVerification()` cũ chỉ đọc title và `promptUser()` trên stdin (hang ở `NON_INTERACTIVE`). Giờ dùng `readCaptchaSignal()` + watcher poll tab; SSE notice + desktop alert được bắn ngay, client thấy thông báo thay vì đợi `PAGE_TIMEOUT`. `routes.js` phải truyền `onCaptcha` ngay cả khi route có `tools` (lúc đó `streamingCallback` bị tắt). Test regression: `verify-resilience.mjs`.
+15. **Popup Windows biến mất khi spawn notification**: `spawn('powershell.exe', ..., {detached:true})` và cờ `-NonInteractive` làm `MessageBox::Show()` trả về ngay **không hiện UI**. Phải spawnAttached (`detached` mặc định `false`) rồi `child.unref()`; giữ `windowsHide:false`. Ngoài ra slider captcha nằm trong iframe và marker là id/class (`nc_1_nocaptcha`), không phải `innerText` — `readCaptchaSignal()` phải quét `page.frames()` + thuộc tính phần tử visible.
+16. **Client đứng sau khi user đã kéo slider xong**: Qwen không xoá iframe 0x0 `baxia-dialog-content` (`_____tmd_____/punish`) sau khi solve. Nếu `readCaptchaSignal()` quét URL **mọi** frame, `waitForCaptchaClear()` thấy captcha liên tục và chỉ thoát sau 300s rồi trả lỗi — client tưởng proxy treo. Phải lọc frame bằng `frame.frameElement().boundingBox()`/`isVisibleBox()` trước khi check URL lẫn HTML. Test regression: `verify-resilience.mjs`.
+17. **`CHAT_IN_PROGRESS` sau captcha**: fetch chết ở browser nhưng Qwen vẫn generate; retry cùng `chat_id` nhận `500 {"data":{"code":"CHAT_IN_PROGRESS","details":"The chat is in progress!"}}`. `isChatInProgress()` (pure) + `handleApiError()` phải xoá chat cũ rồi retry với `chatId=null/parentId=null` thay vì trả lỗi cho client. Log cũ ghi `Error getting response: undefined` vì chỉ đọc `response.error`; giờ ưu tiên `errorBody`. Test regression: `verify-resilience.mjs`.
 
 ## Quy ước code & test
 
@@ -202,9 +221,9 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 - **Pure Modules**: Các module xử lý logic (như `toolCalls.js`, `reasoning.js`, `sessionSync.js`) phải giữ tính chất pure (không gắn chặt vào DOM hay I/O nặng) để có thể chạy test offline qua `scripts/core/verify-*.mjs`.
 - **Bảo mật**: Tuyệt đối không commit thư mục `session/`, `.env`, `logs/`, `.opencode/`.
 - **Chạy kiểm tra trước khi hoàn thành**:
-  - Chạy cú pháp và 5 script verify offline:
+  - Chạy cú pháp và 6 script verify offline:
     ```bash
-    cmd /c "node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/fileUpload.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node --check src/api/authRecovery.js && node scripts/core/verify-parser.mjs && node scripts/core/verify-reasoning.mjs && node scripts/core/verify-tools.mjs && node scripts/core/verify-images.mjs && node scripts/core/verify-auth-retry.mjs"
+    cmd /c "node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/resilience.js && node --check src/utils/notify.js && node --check src/api/fileUpload.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node --check src/api/authRecovery.js && node scripts/core/verify-parser.mjs && node scripts/core/verify-reasoning.mjs && node scripts/core/verify-tools.mjs && node scripts/core/verify-images.mjs && node scripts/core/verify-auth-retry.mjs && node scripts/core/verify-resilience.mjs"
     ```
 
 ## Cập nhật tài liệu
@@ -216,3 +235,4 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 | Thay đổi cơ chế parse tool_calls hoặc reasoning | Mục "Tool Calling Protocol", "Reasoning & Thinking Stream", `verify-tools.mjs` |
 | Phát hiện lỗi/gotcha mới từ Qwen | Mục "Điểm dễ vỡ (Learned the hard way)" |
 | Đổi logic observer hoặc session sync | Mục "CDP Observer & Session Sync", `sessionHook.js` |
+| Đổi retry network error hoặc xử lý captcha | Mục "Network retry & Captcha notification", `resilience.js`, `notify.js`, `verify-resilience.mjs` |

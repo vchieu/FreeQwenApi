@@ -35,6 +35,10 @@ export const TASK_POLL_MAX_ATTEMPTS = Number(process.env.TASK_POLL_MAX_ATTEMPTS)
 export const TASK_POLL_INTERVAL = Number(process.env.TASK_POLL_INTERVAL) || 2_000;
 // Fallback long-duration rate-limit token block (hours), when Qwen did not send a concrete value in the response.
 export const RATE_LIMIT_HOURS = Number(process.env.QWEN_RATELIMIT_HOURS) || 24;
+// Captcha watcher: poll Qwen tab state while a request is in flight, then wait
+// this long for the user to solve the slider before giving up on the request.
+export const CAPTCHA_POLL_INTERVAL_MS = Number(process.env.CAPTCHA_POLL_INTERVAL_MS) || 1_000;
+export const CAPTCHA_WAIT_TIMEOUT_MS = Number(process.env.CAPTCHA_WAIT_TIMEOUT_MS) || 300_000;
 
 // --- Paths (relative to project root) --------------------------------------
 export const SESSION_DIR = process.env.SESSION_DIR || 'session';

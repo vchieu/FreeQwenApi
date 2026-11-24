@@ -1,6 +1,5 @@
-import { getBrowserContext, getAuthenticationStatus, setAuthenticationStatus, ensureBrowserConnection } from '../browser/browser.js';
+import { getBrowserContext, getAuthenticationStatus, ensureBrowserConnection } from '../browser/browser.js';
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
-import { shutdownBrowser, initBrowser } from '../browser/browser.js';
 import { saveAuthToken } from '../browser/session.js';
 import { getAvailableToken, markRateLimited, removeInvalidToken, markInvalid, markValid, markValidForToken, decodeTokenInfo } from './tokenManager.js';
 import fs from 'fs';
@@ -18,13 +17,18 @@ import {
 import {
     isUnauthorizedResult, isUsableRefreshedToken, pickProxyOwnedQwenPage
 } from './authRecovery.js';
+import {
+    CAPTCHA_NOTICE, detectCaptchaSignal, isCaptchaResponse, isChatInProgress,
+    isVisibleBox, shouldRetryNetworkError
+} from './resilience.js';
+import { sendDesktopNotification } from '../utils/notify.js';
 import crypto from 'crypto';
 import {
     CHAT_API_URL, CREATE_CHAT_URL, CHAT_PAGE_URL, TASK_STATUS_URL,
     PAGE_TIMEOUT, RETRY_DELAY, PAGE_POOL_SIZE,
     DEFAULT_MODEL, MAX_RETRY_COUNT,
     TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL,
-    RATE_LIMIT_HOURS
+    RATE_LIMIT_HOURS, CAPTCHA_POLL_INTERVAL_MS, CAPTCHA_WAIT_TIMEOUT_MS
 } from '../config.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -39,6 +43,165 @@ let authKeys = null;
 let browserTokenRateLimited = false;
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+function withTimeout(promise, ms, fallback = null) {
+    return Promise.race([
+        Promise.resolve(promise).catch(() => fallback),
+        delay(ms).then(() => fallback)
+    ]);
+}
+
+function notifyCaptcha(signal = 'verification') {
+    logWarn(`Captcha requires user action (${signal})`);
+    try {
+        sendDesktopNotification('FreeQwenApi - captcha needs solving', CAPTCHA_NOTICE);
+    } catch (e) {
+        logWarn(`Could not send desktop notification: ${e.message}`);
+    }
+}
+
+// Qwen keeps a 0x0 `baxia-dialog-content` iframe (_____tmd_____/punish) in the
+// DOM even AFTER the slider is solved. A hidden frame must never count as an
+// active captcha, otherwise waitForCaptchaClear() spins until timeout and the
+// client hangs despite the user having solved it.
+async function isVisibleFrame(frame) {
+    if (typeof frame?.frameElement !== 'function') return true;
+    const timedOut = Symbol('timeout');
+    try {
+        const element = await Promise.race([
+            frame.frameElement().catch(() => null),
+            delay(1200).then(() => timedOut)
+        ]);
+        if (element === timedOut) return true; // inconclusive - stay conservative
+        if (!element) return false; // detached / already removed
+        const box = await Promise.race([
+            element.boundingBox().catch(() => null),
+            delay(1200).then(() => timedOut)
+        ]);
+        if (box === timedOut) return true;
+        if (!box) return false; // 0x0 / hidden - stale WAF dialog
+        return isVisibleBox(box);
+    } catch {
+        return true; // cannot inspect it - keep the old, conservative behaviour
+    }
+}
+
+async function readCaptchaSignal(page) {
+    if (!page) return null;
+
+    // Slider captchas normally live in an iframe; check the page AND *visible*
+    // frames only (URLs first - cheap and works even when frame JS is blocked).
+    let frames = [];
+    try {
+        frames = typeof page.frames === 'function' ? page.frames() : [];
+    } catch { /* page closing */ }
+    const visibleFrames = [];
+    for (const frame of frames) {
+        if (frame === page.mainFrame?.()) continue;
+        if (await isVisibleFrame(frame)) visibleFrames.push(frame);
+    }
+    for (const frame of visibleFrames) {
+        const frameUrl = typeof frame.url === 'function' ? (frame.url() || '') : '';
+        const fromUrl = detectCaptchaSignal({ url: frameUrl });
+        if (fromUrl) return fromUrl;
+    }
+    const pageUrl = typeof page.url === 'function' ? (page.url() || '') : '';
+    const fromPageUrl = detectCaptchaSignal({ url: pageUrl });
+    if (fromPageUrl) return fromPageUrl;
+
+    const title = await withTimeout(typeof page.title === 'function' ? page.title() : null, 1500);
+    const fromTitle = detectCaptchaSignal({ title: title || '' });
+    if (fromTitle) return fromTitle;
+
+    // Markers like `nc_1_nocaptcha` are id/class names, never innerText. Query
+    // *visible* elements so preloaded/hidden captcha SDK containers don't fire.
+    let text = '';
+    try {
+        text = await withTimeout(page.evaluate(() => {
+            const out = [];
+            const visible = (el) => {
+                try {
+                    const r = el.getBoundingClientRect();
+                    return r.width > 1 && r.height > 1;
+                } catch { return false; }
+            };
+            const marker = /captcha|baxia|nc_1_|_____tmd_____|slider|安全验证|滑块|拖动滑块|向右滑动|按住滑块/i;
+            for (const el of document.querySelectorAll('iframe,div,span,section')) {
+                if (!visible(el)) continue;
+                const attrs = [el.id, typeof el.className === 'string' ? el.className : '', el.getAttribute('src') || '']
+                    .filter(Boolean).join(' ');
+                if (marker.test(attrs)) out.push(attrs.slice(0, 300));
+            }
+            if (document.body) out.push(document.body.innerText.slice(0, 4000));
+            return out.join('\n');
+        }), 1500, '');
+    } catch { /* page may be navigating */ }
+    const fromDom = detectCaptchaSignal({ text: text || '' });
+    if (fromDom) return fromDom;
+
+    // Finally inspect *visible* iframe documents (cross-origin is fine via CDP).
+    for (const frame of visibleFrames) {
+        let frameText = '';
+        try {
+            frameText = await withTimeout(frame.evaluate(() => {
+                const html = document.documentElement?.outerHTML || '';
+                return html.slice(0, 100000);
+            }), 1200, '');
+        } catch { /* frame gone or blocked */ }
+        const fromFrame = detectCaptchaSignal({ text: frameText });
+        if (fromFrame) return fromFrame;
+    }
+    return null;
+}
+
+// Poll the Qwen tab while a request is in flight. A captcha normally kills the
+// browser fetch silently; detecting it here lets us alert the user immediately
+// instead of letting the client hit a 120s protocol timeout.
+function startCaptchaWatcher(page, onDetected) {
+    let timer = null;
+    let stopped = false;
+    let resolveDetected = null;
+    const detected = new Promise(resolve => { resolveDetected = resolve; });
+
+    const tick = async () => {
+        if (stopped) return;
+        const signal = await readCaptchaSignal(page);
+        if (stopped || !signal) return;
+        stopped = true;
+        if (timer) clearInterval(timer);
+        notifyCaptcha(signal);
+        if (typeof onDetected === 'function') {
+            try {
+                onDetected(signal);
+            } catch (e) {
+                logWarn(`Captcha client notice failed: ${e.message}`);
+            }
+        }
+        resolveDetected(signal);
+    };
+
+    timer = setInterval(() => { tick(); }, CAPTCHA_POLL_INTERVAL_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+    return {
+        promise: detected,
+        stop: () => { stopped = true; if (timer) clearInterval(timer); }
+    };
+}
+
+async function waitForCaptchaClear(page, timeoutMs = CAPTCHA_WAIT_TIMEOUT_MS) {
+    logInfo(`Waiting for captcha to be solved (max ${Math.round(timeoutMs / 1000)}s)`);
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+        const signal = await readCaptchaSignal(page);
+        if (!signal) {
+            logInfo('Captcha cleared; resuming request');
+            return true;
+        }
+        await delay(CAPTCHA_POLL_INTERVAL_MS);
+    }
+    logWarn(`Captcha still present after ${Math.round(timeoutMs / 1000)}s`);
+    return false;
+}
 
 // --- Page helpers ----------------------------------------------------------
 
@@ -804,7 +967,9 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
             data: resultData
         };
     } catch (error) {
-        return { success: false, error: error.toString() };
+        // Preserve this flag: retrying after partial SSE output would duplicate
+        // already-delivered text in the client.
+        return { success: false, error: error.toString(), hasStreamedChunks };
     }
 }
 
@@ -939,7 +1104,15 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
     logDebug(`Using token: ${token ? 'Session token' : 'No token'}`);
     logDebug(`API URL: ${apiUrl}`);
 
-    return page.evaluate(async (data) => {
+    const captchaWatcher = startCaptchaWatcher(page, () => {
+        const notify = typeof options.onCaptcha === 'function'
+            ? options.onCaptcha
+            : (typeof onChunk === 'function' ? onChunk : null);
+        if (notify) notify(CAPTCHA_NOTICE);
+    });
+    let rawPromise;
+    try {
+        rawPromise = page.evaluate(async (data) => {
         try {
             // Mirrors src/api/reasoning.js: page.evaluate cannot import ES modules.
             const partsText = (v) => {
@@ -1239,22 +1412,80 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
         } catch (error) {
             return { success: false, error: error.toString() };
         }
-    }, requestBody);
+        }, requestBody);
+    } catch (e) {
+        captchaWatcher.stop();
+        return { success: false, error: String(e) };
+    }
+
+    let outcome;
+    try {
+        outcome = await Promise.race([
+            rawPromise.then(value => ({ type: 'response', value })),
+            captchaWatcher.promise.then(signal => ({ type: 'captcha', signal }))
+        ]);
+    } finally {
+        captchaWatcher.stop();
+    }
+
+    if (outcome.type === 'captcha') {
+        // Let the abandoned evaluate settle before the page goes back to the pool.
+        await Promise.race([rawPromise.catch(() => {}), delay(10_000)]);
+        const cleared = await waitForCaptchaClear(page);
+        return {
+            success: false,
+            captcha: true,
+            retryable: cleared,
+            error: CAPTCHA_NOTICE
+        };
+    }
+    return outcome.value;
 }
 
-async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null, options = {}) {
+async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null, options = {}, tools = null, toolChoice = null, systemMessage = null) {
     logRaw(JSON.stringify(response));
-    logError(`Error getting response: ${response.error || response.statusText}`);
+    const errorDetail = response.error || response.statusText
+        || (typeof response.errorBody === 'string' ? response.errorBody.slice(0, 300) : 'unknown error');
+    if (response.captcha || isCaptchaResponse(response)) logWarn(`Captcha flow: ${errorDetail}`);
+    else logError(`Error getting response: ${errorDetail}`);
     if (response.errorBody) logDebug(`Error response body: ${response.errorBody}`);
 
-    if (response.html && response.html.includes('Verification')) {
-        setAuthenticationStatus(false);
-        logInfo('Verification required, restarting browser in visible mode...');
-        await pagePool.clear();
-        authToken = null;
-        await shutdownBrowser();
-        await initBrowser(true);
-        return { error: 'Verification required. Browser restarted in visible mode.', verification: true, chatId };
+    // Captcha: the watcher already notified the user and waited for the slider
+    // to be solved. The original browser fetch died when the WAF challenged it,
+    // but Qwen's server-side generation may still be running in this chat.
+    // Retrying the SAME chat then gets 500 CHAT_IN_PROGRESS, so start a fresh
+    // chat (full history is resent in `messages`). A captcha seen only in the
+    // response body can't be waited on, so return an actionable message.
+    if (response.captcha || isCaptchaResponse(response)) {
+        if (response.captcha && response.retryable && retryCount < MAX_RETRY_COUNT) {
+            logInfo('Captcha solved; retrying request on a fresh chat');
+            if (chatId) deleteChatV2(chatId).catch(() => {});
+            await delay(RETRY_DELAY);
+            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
+        }
+        if (!response.captcha) notifyCaptcha('response-body');
+        return { error: CAPTCHA_NOTICE, verification: true, captcha: true, chatId };
+    }
+
+    // Qwen still generating the previous answer (commonly the request that the
+    // captcha interrupted). Never replay into that chat - switch to a new one.
+    if (isChatInProgress(response)) {
+        if (retryCount < MAX_RETRY_COUNT) {
+            logWarn(`Qwen chat still in progress; retrying on a fresh chat (${retryCount + 1}/${MAX_RETRY_COUNT})`);
+            if (chatId) deleteChatV2(chatId).catch(() => {});
+            await delay(RETRY_DELAY);
+            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
+        }
+        return { error: 'Qwen is still generating the previous answer. Please retry shortly.', chatId };
+    }
+
+    // Transient browser/network failures (WAF reset, socket hang up, tab
+    // navigation) previously went straight to the client. Retry the same chat
+    // a bounded number of times; never replay an already-streamed answer.
+    if (shouldRetryNetworkError(response, retryCount, MAX_RETRY_COUNT)) {
+        logWarn(`Transient network error; retrying same chat (${retryCount + 1}/${MAX_RETRY_COUNT}) in ${RETRY_DELAY}ms`);
+        await delay(RETRY_DELAY);
+        return sendMessage(message, model, chatId, parentId, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
     }
 
     if (response.status === 401 || (response.errorBody && (response.errorBody.includes('Unauthorized') || response.errorBody.includes('Token has expired')))) {
@@ -1278,7 +1509,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
                 saveAuthToken(fresh);
                 markValidForToken(fresh);
                 logInfo('Retrying with freshly rotated browser token');
-                return sendMessage(message, model, chatId, parentId, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
+                return sendMessage(message, model, chatId, parentId, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
             }
         }
 
@@ -1286,7 +1517,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
             // chatId/parentId are reset: when switching accounts the old chat
             // belongs to the previous token and under the new one "does not exist".
-            return sendMessage(message, model, null, null, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
+            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
         }
         logError('No valid tokens left or retries exhausted.');
         return { error: 'All tokens are invalid (401). Re-authentication required.', chatId };
@@ -1312,7 +1543,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
             // chatId/parentId are reset: when switching accounts the old chat
             // belongs to the previous token and under the new one "does not exist".
-            return sendMessage(message, model, null, null, files, null, null, null, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
+            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
         }
         return { error: `All tokens are rate limited (${hours}h)`, chatId };
     }
@@ -1407,8 +1638,19 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         page = await pagePool.getPage(browserContext);
         if (!chatAuthRetried) await syncTokenFromPage(page, tokenObj);
 
-        const verificationNeeded = await checkVerification(page);
-        if (verificationNeeded) {
+        // Detect a captcha BEFORE firing the request. The old checkVerification()
+        // blocked on stdin (which hangs under NON_INTERACTIVE) and only looked at
+        // the page title, so slider/WAF captchas were missed entirely.
+        const preflightSignal = await readCaptchaSignal(page);
+        if (preflightSignal) {
+            notifyCaptcha(preflightSignal);
+            const notify = typeof options.onCaptcha === 'function' ? options.onCaptcha : onChunk;
+            if (typeof notify === 'function') notify(CAPTCHA_NOTICE);
+            const cleared = await waitForCaptchaClear(page);
+            if (!cleared) return { error: CAPTCHA_NOTICE, verification: true, captcha: true, chatId };
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
+        } else if (process.stdin.isTTY && await checkVerification(page)) {
+            // Interactive mode only: a human may be mid-login on this tab.
             await page.reload({ waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
         }
 
@@ -1429,7 +1671,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         logDebug(`Sending message to chat ${chatId} with parent_id: ${parentId || 'null'}`);
 
         const apiUrl = `${CHAT_API_URL}?chat_id=${chatId}`;
-        let response = await executeApiRequest(page, apiUrl, payload, authToken, onChunk, options.onReasoning || null, { allowedToolNames });
+        let response = await executeApiRequest(page, apiUrl, payload, authToken, onChunk, options.onReasoning || null, { allowedToolNames, onCaptcha: options.onCaptcha });
 
         // One nudge retry max per request when tools were declared and model missed/broke tool call format.
         if (response.success && !response.isTask && allowedToolNames && !options._toolRetryDone) {
@@ -1440,7 +1682,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
                 const nudge = `\n\nIMPORTANT: Use a tool call now.${reason} Respond ONLY with a tool_call block using one of these tools: ${names}.`;
                 const retryPayload = buildPayloadV2(messageContent, model, chatId, parentId, files, `${systemMessage || ''}${nudge}`.trim(), tools, toolChoice, chatType, size, reasoningMode);
                 logWarn(`Tool call missing/broken; retrying once with nudge. dropped=${first.dropped.length}`);
-                response = await executeApiRequest(page, apiUrl, retryPayload, authToken, onChunk, options.onReasoning || null, { allowedToolNames });
+                response = await executeApiRequest(page, apiUrl, retryPayload, authToken, onChunk, options.onReasoning || null, { allowedToolNames, onCaptcha: options.onCaptcha });
                 if (response?.data) response.data._toolRetryDone = true;
                 // Parse the retry too — otherwise its tool call stays as text.
                 finalizeToolCallsInResponse(response, allowedToolNames, requiredToolParams);
@@ -1550,7 +1792,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
             return response.data;
         }
 
-        return handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk, options);
+        return handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk, options, tools, toolChoice, systemMessage);
     } catch (error) {
         logError('Error sending message', error);
         return { error: error.toString(), chatId };

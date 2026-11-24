@@ -965,7 +965,19 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         true,
                         0,
                         streamingCallback,
-                        { ...reasoningOptions, onReasoning: reasoningCallback }
+                        {
+                            ...reasoningOptions,
+                            onReasoning: reasoningCallback,
+                            // Captcha notice must reach the client immediately,
+                            // even when tools suppress the regular content callback.
+                            onCaptcha: (text) => writeSse({
+                                id: 'chatcmpl-stream',
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: mappedModel || DEFAULT_MODEL,
+                                choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+                            })
+                        }
                     );
 
                     if (!hasStreamedReasoning && result?.choices?.[0]?.message?.reasoning_content) {
@@ -1593,7 +1605,19 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         true,
                         0,
                         streamingCallback,
-                        { ...reasoningOptions, onReasoning: reasoningCallback }
+                        {
+                            ...reasoningOptions,
+                            onReasoning: reasoningCallback,
+                            // Captcha notice must reach the client immediately,
+                            // even when tools suppress the regular content callback.
+                            onCaptcha: (text) => writeSse({
+                                id: 'chatcmpl-stream',
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: mappedModel || DEFAULT_MODEL,
+                                choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+                            })
+                        }
                     );
 
                     // Cleanup chat by configured policy (default all).
@@ -1999,7 +2023,19 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         true,
                         0,
                         streamingCallback,
-                        { ...reasoningOptions, onReasoning: reasoningCallback }
+                        {
+                            ...reasoningOptions,
+                            onReasoning: reasoningCallback,
+                            // Captcha notice must reach the client immediately,
+                            // even when tools suppress the regular content callback.
+                            onCaptcha: (text) => writeSse({
+                                id: 'chatcmpl-stream',
+                                object: 'chat.completion.chunk',
+                                created: Math.floor(Date.now() / 1000),
+                                model: mappedModel || DEFAULT_MODEL,
+                                choices: [{ index: 0, delta: { content: text }, finish_reason: null }]
+                            })
+                        }
                     );
 
                     let _captureCleanText = '';
