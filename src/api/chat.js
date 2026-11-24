@@ -809,7 +809,10 @@ function parseNonSseCompletionBody(body) {
     return { success: false, error: 'Unexpected non-SSE 200 response', errorBody: body };
 }
 
-async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk, onReasoning = null, options = {}) {
+export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk, onReasoning = null, options = {}) {
+    // Declared outside try: the catch below must be able to report whether any
+    // answer chunk was already delivered, even when fetch/parse throws early.
+    let hasStreamedChunks = false;
     try {
         if (!token) return { success: false, error: 'Auth token not found' };
         if (typeof fetch !== 'function') return { success: false, error: 'Fetch API is unavailable' };
@@ -891,7 +894,6 @@ async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChun
         let usage = null;
         let finished = false;
         let streamError = null;
-        let hasStreamedChunks = false;
 
         while (!finished) {
             const { done, value } = await reader.read();

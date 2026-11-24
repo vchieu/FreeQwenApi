@@ -34,6 +34,35 @@ function writeProxyNotice(writeSse, model, text, kind = 'notice', finishReason =
     });
 }
 
+// Terminal upstream errors need to be visible even in clients that ignore
+// custom SSE fields. Emit the structured error + out-of-band notice, and only
+// when the model has not produced any answer yet a short prefixed content line.
+// Partial answers are never touched — injecting text there would duplicate or
+// corrupt what the client already received. Captcha notices keep using
+// writeProxyNotice() alone because the request will continue and produce an
+// answer; putting them in `content` used to glue them onto that answer.
+function writeProxyError(writeSse, model, text, hasContent = false) {
+    const message = String(text);
+    writeProxyNotice(writeSse, model, message, 'error');
+    writeSse({
+        id: 'chatcmpl-stream',
+        object: 'chat.completion.chunk',
+        created: Math.floor(Date.now() / 1000),
+        model: model || DEFAULT_MODEL,
+        error: { message, type: 'server_error' },
+        choices: [{ index: 0, delta: {}, finish_reason: null }]
+    });
+    if (!hasContent) {
+        writeSse({
+            id: 'chatcmpl-stream',
+            object: 'chat.completion.chunk',
+            created: Math.floor(Date.now() / 1000),
+            model: model || DEFAULT_MODEL,
+            choices: [{ index: 0, delta: { content: `⚠️ ${message}` }, finish_reason: null }]
+        });
+    }
+}
+
 // Function for generating a deterministic chatId based on history
 function generateChatIdFromHistory(messages) {
     if (!Array.isArray(messages) || messages.length === 0) {
@@ -816,7 +845,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
             const result = await sendMessage(messageContent, mappedModel, chatId, parentId, null, combinedTools, toolChoice, systemMessage);
 
             if (result.error) {
-                writeProxyNotice(writeSse, mappedModel, `Error: ${result.error}`, 'error');
+                writeProxyError(writeSse, mappedModel, `Error: ${result.error}`, false);
             } else if (result.choices?.[0]?.message) {
                 const content = String(result.choices[0].message.content || '');
                 const codePoints = Array.from(content);
@@ -992,7 +1021,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
 
                     if (result.error) {
-                        writeProxyNotice(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, 'error', 'stop');
+                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks);
                     } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                         // Qwen returned JSON/normal response instead of SSE - send final as single chunk
                         const content = result.choices[0].message.content;
@@ -1651,7 +1680,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
 
                     if (result.error) {
-                        writeProxyNotice(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, 'error');
+                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks);
                     } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                         // Qwen returned JSON/normal response instead of SSE - send final as single chunk
                         // When captureToolCalls is active, use cleanText (fence blocks stripped)
@@ -2052,7 +2081,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
 
                     if (result.error) {
-                        writeProxyNotice(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, 'error', 'stop');
+                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks);
                     } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                         // Qwen returned JSON/normal response instead of SSE - send final as single chunk
                         // When captureToolCalls is active, use cleanText (fence blocks stripped)

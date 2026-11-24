@@ -137,7 +137,29 @@ check('unsupported platform is a no-op', () => {
     assert.equal(notificationCommand('freebsd', 'title', 'message'), null);
 });
 
-const TOTAL = 7 + 8 + 2 + 3 + 2 + 5;
+console.log('Node stream early failure:');
+const { executeApiRequestWithNodeStreaming } = await import('../../src/api/chat.js');
+const savedFetch = globalThis.fetch;
+let earlyFailure;
+try {
+    globalThis.fetch = async () => { throw new TypeError('network error'); };
+    earlyFailure = await executeApiRequestWithNodeStreaming(
+        'https://example.invalid/api/v2/chat/completions',
+        { stream: true, model: 'test' },
+        'test-token',
+        null
+    );
+} finally {
+    globalThis.fetch = savedFetch;
+}
+check('early fetch failure returns a structured result (no ReferenceError)', () => {
+    assert.equal(earlyFailure.success, false);
+    assert.equal(earlyFailure.hasStreamedChunks, false);
+    assert.equal(earlyFailure.nodeTimeout, false);
+    assert.match(earlyFailure.error, /network error/);
+});
+
+const TOTAL = 7 + 8 + 2 + 3 + 2 + 5 + 1;
 console.log(`\nchecks: ${checks}`);
 console.log(checks === TOTAL ? 'PASS' : `FAIL (expected ${TOTAL} checks, got ${checks})`);
 process.exit(checks === TOTAL ? 0 : 1);
