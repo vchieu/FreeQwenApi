@@ -32,15 +32,16 @@ Kiểm tra cú pháp & kiểm tra offline (không cần browser, không cần ne
 
 ```bash
 # Cú pháp (Windows CMD)
-node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js
+node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node --check src/api/authRecovery.js
 
 # Hoặc PowerShell
-node --check index.js; node --check src/api/chat.js; node --check src/api/routes.js; node --check src/api/reasoning.js; node --check src/api/toolCalls.js
+node --check index.js; node --check src/api/chat.js; node --check src/api/routes.js; node --check src/api/reasoning.js; node --check src/api/toolCalls.js; node --check src/api/authRecovery.js
 
 # Chạy bộ verify offline
 node scripts/core/verify-parser.mjs            # Kiểm tra parser SSE câu trả lời
 node scripts/core/verify-reasoning.mjs         # Kiểm tra mapping reasoning_effort & thinking stream
-node scripts/core/verify-tools.mjs             # Kiểm tra parser tool_calls, format prompt, recovery JSON
+node scripts/core/verify-tools.mjs             # Kiểm tra parser tool_calls, format prompt, recovery JSON, text tool call
+node scripts/core/verify-auth-retry.mjs        # Kiểm tra nhận diện 401, chọn token xoay, chọn tab proxy-owned
 ```
 
 Kiểm tra trực tiếp endpoint khi proxy đang chạy:
@@ -61,7 +62,8 @@ curl -X POST http://127.0.0.1:3264/api/chat/completions \
 | `index.js` | Express server entrypoint; nạp `src/env.js`, mount `/api`, dashboard UI, graceful shutdown | Khởi động server, cấu hình CORS, middleware parse JSON, port bind |
 | `src/api/routes.js` | Toàn bộ router HTTP: `/chat/completions`, `/v1/chat/completions`, `/models`, images, videos, tasks | Xử lý request, resolve chat_id/parent_id, map model, stream SSE, route API |
 | `src/api/chat.js` | Giao tiếp core với Qwen: build payload, header Baxia, `sendMessage()`, `executeApiRequest()`, page pool, delete chat | Lỗi kết nối Qwen, request header WAF, gọi browser evaluate, vòng đời chat |
-| `src/api/toolCalls.js` | Pure module: `messagesToQwenPrompt()` (chèn `# Tool Use`), `parseToolCalls()` (fence/XML), lenient JSON parser | Sửa cách gọi tool, định dạng tool_call fences, recovery lỗi JSON arguments |
+| `src/api/toolCalls.js` | Pure module: `messagesToQwenPrompt()` (chèn `# Tool Use`), `parseToolCalls()` (fence/XML + JSON trần/prose/nhiều call), lenient JSON parser | Sửa cách gọi tool, định dạng tool_call fences, recovery lỗi JSON arguments |
+| `src/api/authRecovery.js` | Pure module: nhận diện 401, chọn token xoay hợp lệ, chọn tab proxy-owned để reload | Sửa luồng retry 401, chờ/xoay token |
 | `src/api/reasoning.js` | Pure module: map `reasoning_effort` → Qwen `feature_config`, accumulator stream thinking | Chỉnh chế độ suy nghĩ (Fast/Auto/Thinking), xử lý stream suy nghĩ |
 | `src/api/sessionSync.js` | Nhận & validate token/Baxia headers từ CDP observer; ghi file atomic `baxia.json`, update `tokens.json` | Cập nhật WAF headers, logic lọc header, lưu trữ token tự động |
 | `src/api/tokenManager.js` | Quản lý danh sách tài khoản, trạng thái rate-limit, đánh dấu invalid / phục hồi | Đọc/ghi `session/tokens.json`, giải mã JWT, xoay vòng tài khoản |
@@ -137,9 +139,9 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 
 ### 3. Token Management & Rotation
 - Qwen sử dụng token ngắn hạn trong trình duyệt (`localStorage.getItem('token')`).
-- File `session/tokens.json` có thể chứa token dài hạn cũ hoặc đã hết hạn. Hàm `readTokenFromQwenTab()` luôn ưu tiên đọc token sống trực tiếp từ tab Chrome.
-- Bỏ qua các token JWT có thời gian hết hạn dưới 30 giây.
-- Khi gặp lỗi `401 Unauthorized` với browser token, chờ token xoay vòng và retry một lần trước khi đánh dấu tài khoản invalid.
+- File `session/tokens.json` có thể chứa token dài hạn cũ hoặc đã hết hạn. Hàm `readTokenFromQwenTab()` luôn ưu tiên đọc token sống trực tiếp từ tab Chrome (tuỳ chọn `includeOwned` để đọc cả tab proxy-owned sau khi ép refresh).
+- Bỏ qua các token JWT có thời gian hết hạn dưới 30 giây và không bao giờ retry lại đúng token vừa bị từ chối (`isUsableRefreshedToken()`).
+- Khi gặp lỗi `401 Unauthorized` với browser token: chờ ngắn token xoay tự nhiên, nếu không có thì `recoverBrowserToken()` reload **tab do proxy sở hữu** (`pickProxyOwnedQwenPage()`, không đụng tab người dùng) sau khi xoá `token` trong `localStorage` để ép SPA cấp token mới, rồi retry (tối đa `MAX_RETRY_COUNT`) trước khi đánh dấu tài khoản invalid. Dùng chung cho 401 lúc tạo chat và lúc gửi message.
 - `markValidForToken()` phục hồi cờ invalid dựa trên decoded payload ID.
 
 ### 4. WAF / Baxia & Request ID
@@ -187,10 +189,11 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 5. **Slider Captcha (`nc_1_nocaptcha`)**: Nếu xuất hiện slider captcha hoặc trang chuyển hướng về `_____tmd_____/report`, **dừng tự động ngay lập tức** và thông báo cho người dùng kéo captcha trên giao diện trình duyệt. Không cố giải captcha bằng code.
 6. **Chat biến mất trên web Qwen**: Khi `AUTO_DELETE_CHATS=all` (mặc định), proxy tự động gọi `deleteChatV2()` để dọn dẹp các chat tạm sinh ra. Đây là hành vi bình thường, không phải lỗi.
 7. **OpenWebUI Meta Request**: Các request kiểm tra tiêu đề/tags từ Open WebUI (`isOpenWebUiMetaRequest`) được tách ra xử lý riêng để không làm hỏng context hội thoại chính.
-8. **401 khi tạo chat cũng có dạng HTTP 200**: `createChatV2()` có thể nhận `200` với body `{success:false, data:{code:"unauthorized", details:"401 Unauthorized"}}`. Phải coi như 401, đợi token xoay trong tab Qwen (loại trừ token vừa bị từ chối) rồi retry tối đa `MAX_RETRY_COUNT`; không trả lỗi ngay cho client. Token dùng cho retry cũng phải được giữ nguyên khi gửi message.
+8. **401 khi tạo chat cũng có dạng HTTP 200**: `createChatV2()` có thể nhận `200` với body `{success:false, data:{code:"unauthorized", details:"401 Unauthorized"}}`. Phải coi như 401, dùng `recoverBrowserToken()` (chờ xoay ngắn → reload tab proxy-owned để ép token mới, loại trừ token vừa bị từ chối) rồi retry tối đa `MAX_RETRY_COUNT`; không trả lỗi ngay cho client. Token dùng cho retry cũng phải được giữ nguyên khi gửi message. Test regression: `verify-auth-retry.mjs`.
 9. **STS upload đã chuyển sang `/api/v2/files/getstsToken`**: URL v1 trả `405`. Response có dạng `{success:true, request_id, data:{...}}` — `getStsToken()` phải unwrap lấy `data` thì `uploadFile()` mới thấy `file_path`/`file_id`. Ảnh sau khi upload phải nằm ở `messages[].files` (type `image`, `file_class: vision`, `url` là signed OSS URL), không được nhét vào `content`.
 10. **`messages[].content` của Qwen Web phải là string**: Sau khi tách các part `image_url` ra khỏi content của OpenAI, nếu còn lại mảng part (`[{type:'text',...}]`) thì Qwen trả `internal_error` ngay. `prepareOpenAIImages()` phải gom các part text còn lại thành một string trước khi gọi `sendMessage()`.
 11. **Chỉ upload ảnh của lượt hiện tại**: Client OpenAI (OpenWebUI...) gửi lại toàn bộ history, trong đó có cả ảnh của các lượt trước. `collectImageParts()` chỉ chọn ảnh trong user message cuối; ảnh cũ được thay bằng placeholder `[image]` và không upload lại, nếu không mỗi request sẽ đính lại toàn bộ ảnh cũ vào chat Qwen. Test regression: `verify-images.mjs`.
+12. **Tool call có thể là text trần**: Qwen đôi khi trả `{"name":"...","arguments":{...}}` không có fence, kèm prose hoặc nhiều call liên tiếp. `parseToolCalls()` phải quét mọi object có shape tool, cắt khỏi `content` (fence hợp lệ đứng riêng vẫn được parse như cũ; fence có prose cùng dòng là mô tả và giữ nguyên). `finalizeToolCallsInResponse()` phải chạy lại sau nudge retry (`_toolRetryDone`) nếu không tool call sẽ sót lại thành text như đã thấy với `todowrite`. Test regression: `verify-tools.mjs`.
 
 ## Quy ước code & test
 
@@ -199,9 +202,9 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 - **Pure Modules**: Các module xử lý logic (như `toolCalls.js`, `reasoning.js`, `sessionSync.js`) phải giữ tính chất pure (không gắn chặt vào DOM hay I/O nặng) để có thể chạy test offline qua `scripts/core/verify-*.mjs`.
 - **Bảo mật**: Tuyệt đối không commit thư mục `session/`, `.env`, `logs/`, `.opencode/`.
 - **Chạy kiểm tra trước khi hoàn thành**:
-  - Chạy cú pháp và 4 script verify offline:
+  - Chạy cú pháp và 5 script verify offline:
     ```bash
-    cmd /c "node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/fileUpload.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node scripts/core/verify-parser.mjs && node scripts/core/verify-reasoning.mjs && node scripts/core/verify-tools.mjs && node scripts/core/verify-images.mjs"
+    cmd /c "node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/fileUpload.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node --check src/api/authRecovery.js && node scripts/core/verify-parser.mjs && node scripts/core/verify-reasoning.mjs && node scripts/core/verify-tools.mjs && node scripts/core/verify-images.mjs && node scripts/core/verify-auth-retry.mjs"
     ```
 
 ## Cập nhật tài liệu

@@ -15,6 +15,9 @@ import {
     createNativeToolCallAccumulator, collectNativeCall, flushNativeToolCalls,
     parseToolCalls, mergeToolCalls, toolNames, toolRequiredParams
 } from './toolCalls.js';
+import {
+    isUnauthorizedResult, isUsableRefreshedToken, pickProxyOwnedQwenPage
+} from './authRecovery.js';
 import crypto from 'crypto';
 import {
     CHAT_API_URL, CREATE_CHAT_URL, CHAT_PAGE_URL, TASK_STATUS_URL,
@@ -398,7 +401,7 @@ function validateAndPrepareMessage(message) {
 // Qwen rotates the short-lived access token in localStorage roughly every
 // 15 minutes. A fresh automation tab can be served a stale/long-lived token,
 // so always prefer the token from the existing human Qwen tab.
-async function readTokenFromQwenTab(browserContext) {
+async function readTokenFromQwenTab(browserContext, { includeOwned = false } = {}) {
     try {
         const base = getBrowserContext() || browserContext;
         const browser = (base && typeof base.browser === 'function') ? base.browser() : null;
@@ -409,7 +412,10 @@ async function readTokenFromQwenTab(browserContext) {
             if (!page || (typeof page.isClosed === 'function' && page.isClosed())) return false;
             const url = page.url();
             if (!url.includes('chat.qwen.ai')) return false;
-            if (page === base || pooled.has(page)) return false;
+            // Default: prefer a human tab, which is where Qwen's own UI rotates
+            // the token. After a forced reload the proxy-owned tab is also a
+            // valid source (localStorage is shared per origin).
+            if (!includeOwned && (page === base || pooled.has(page))) return false;
             return true;
         });
         candidates.sort((a, b) => Number(b.url().includes('/c/')) - Number(a.url().includes('/c/')));
@@ -432,23 +438,60 @@ async function readTokenFromQwenTab(browserContext) {
 }
 
 function tokenIsFresh(token, skewMs = 30_000) {
-    const { exp } = decodeTokenInfo(token);
-    return !exp || exp > Date.now() + skewMs;
+    return isUsableRefreshedToken(token, null, Date.now(), skewMs);
 }
 
 // Qwen rotates the short-lived token in the tab. When we catch the old one
 // just before rotation, wait briefly for the page to install the replacement
 // instead of firing a request that is guaranteed to return 401.
-async function waitForFreshToken(browserContext, timeoutMs = 12_000, excludeToken = null) {
+async function pollForFreshToken(browserContext, timeoutMs = 12_000, excludeToken = null, includeOwned = false) {
     const deadline = Date.now() + timeoutMs;
     while (Date.now() < deadline) {
-        const token = await readTokenFromQwenTab(browserContext);
+        const token = await readTokenFromQwenTab(browserContext, { includeOwned });
         // excludeToken prevents an immediate retry with the very token that
         // was just rejected (JWT can still be unexpired after a server-side rotation).
-        if (token && token !== excludeToken && tokenIsFresh(token)) return token;
+        if (isUsableRefreshedToken(token, excludeToken)) return token;
         await delay(400);
     }
     return null;
+}
+
+async function waitForFreshToken(browserContext, timeoutMs = 12_000, excludeToken = null) {
+    return pollForFreshToken(browserContext, timeoutMs, excludeToken);
+}
+
+// Qwen often installs the replacement token several MINUTES after the old JWT
+// expires. Waiting 12s is then guaranteed to fail. Force it: reload a tab the
+// proxy owns (never the human's tab) with the token removed so the SPA asks the
+// session cookie for a new one, then poll all tabs on the same origin.
+async function forceFreshTokenByReload(browserContext, excludeToken = null, timeoutMs = 30_000) {
+    const base = getBrowserContext() || browserContext;
+    const browser = (base && typeof base.browser === 'function') ? base.browser() : null;
+    if (!browser || typeof browser.pages !== 'function') return null;
+
+    const target = pickProxyOwnedQwenPage(await browser.pages(), base, pagePool.pages);
+    if (!target) {
+        logWarn('No proxy-owned Qwen tab available for token refresh');
+        return null;
+    }
+    try {
+        await target.evaluate(() => {
+            try { localStorage.removeItem('token'); } catch { /* storage blocked */ }
+        });
+        await target.reload({ waitUntil: 'domcontentloaded', timeout: PAGE_TIMEOUT });
+        logInfo('Reloaded proxy-owned Qwen tab to refresh token after 401');
+    } catch (e) {
+        logWarn(`Could not reload Qwen tab for token refresh: ${String(e.message).slice(0, 100)}`);
+        return null;
+    }
+    return pollForFreshToken(browserContext, timeoutMs, excludeToken, true);
+}
+
+// Shared 401 recovery: give natural rotation a short chance, then force it.
+async function recoverBrowserToken(browserContext, failedToken) {
+    const natural = await pollForFreshToken(browserContext, 3_000, failedToken);
+    if (natural) return natural;
+    return forceFreshTokenByReload(browserContext, failedToken, 30_000);
 }
 
 async function resolveAuthToken(browserContext) {
@@ -1229,7 +1272,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         // second before our request. Do not burn the account in that case:
         // wait for the rotation and retry the SAME chat once.
         if (isBrowserToken && retryCount < MAX_RETRY_COUNT) {
-            const fresh = await waitForFreshToken(getBrowserContext(), 12_000, tokenObj?.token);
+            const fresh = await recoverBrowserToken(getBrowserContext(), tokenObj?.token);
             if (fresh) {
                 authToken = fresh;
                 saveAuthToken(fresh);
@@ -1606,26 +1649,13 @@ export function getAuthToken() {
     return authToken;
 }
 
-// Qwen sometimes answers with HTTP 200 and a body like
-// { success: false, data: { code: "unauthorized", details: "401 Unauthorized" } }
-// - handle it exactly like an HTTP 401.
-function isUnauthorizedResult(result = {}) {
-    if (result.status === 401) return true;
-    const candidates = [result.errorBody, result.error];
-    if (result.data) candidates.push(JSON.stringify(result.data));
-    return candidates.some(value => {
-        if (!value) return false;
-        return /401\s+unauthorized|\bunauthorized\b|token has expired/i.test(String(value));
-    });
-}
-
 // Recover from a 401 while creating a chat: first wait for the rotated token
 // in the live Qwen tab, then fall back to another stored account.
 // Returns the token object to use for the retry, or null when nothing is left.
 async function refreshTokenAfter401(browserContext, failedToken, tokenObj) {
     browserTokenRateLimited = false;
 
-    const fresh = await waitForFreshToken(browserContext, 12_000, failedToken || null);
+    const fresh = await recoverBrowserToken(browserContext, failedToken || null);
     if (fresh) {
         authToken = fresh;
         saveAuthToken(fresh);
