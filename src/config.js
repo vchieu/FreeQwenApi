@@ -26,7 +26,8 @@ export const NAVIGATION_TIMEOUT = Number(process.env.NAVIGATION_TIMEOUT) || 60_0
 export const RETRY_DELAY = Number(process.env.RETRY_DELAY) || 2_000;
 export const STREAMING_CHUNK_DELAY = Number(process.env.STREAMING_CHUNK_DELAY) || 20;
 // A stalled Node fetch used to hang forever (no protocolTimeout to rescue it).
-// Bound it so the retry/fallback path can take over instead of blocking the client.
+// This is an IDLE timeout (re-armed by every received chunk), so long answers
+// are never cut off while data is still flowing.
 export const NODE_STREAM_TIMEOUT_MS = Number(process.env.NODE_STREAM_TIMEOUT_MS) || 180_000;
 
 // --- Limits ----------------------------------------------------------------

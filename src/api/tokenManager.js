@@ -93,6 +93,16 @@ export function markValid(id, newToken) {
     }
 }
 
+export function findAccountIdForToken(token) {
+    if (!token) return null;
+    const { accountId } = decodeTokenInfo(token);
+    const match = loadTokens().find(t =>
+        t.token === token ||
+        (accountId && decodeTokenInfo(t.token).accountId === accountId)
+    );
+    return match?.id || null;
+}
+
 // A fresh token read from the Qwen tab must clear `invalid` on the matching
 // account even when getAvailableToken() had no usable token at all.
 export function markValidForToken(token) {

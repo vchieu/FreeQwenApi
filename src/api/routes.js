@@ -209,30 +209,18 @@ function getChatIdFromMap(generatedId) {
     return generatedId ? chatIdMap.get(generatedId) : null;
 }
 
-async function resolveQwenChatId(effectiveChatId, mappedModel) {
-    let qwenChatId = effectiveChatId;
-    const mapped = getChatIdFromMap(effectiveChatId);
+// A "chat_..." value is an internal conversation key, not a Qwen chat. Return
+// null so sendMessage creates the chat under the same account it sends with.
+// (A live conversation is restored from the session with its real id + parent.)
+function resolveQwenChatId(effectiveChatId) {
+    if (effectiveChatId && effectiveChatId.startsWith('chat_')) return null;
+    return effectiveChatId;
+}
 
-    if (mapped) {
-        qwenChatId = mapped;
-        logInfo(`ðŸ”„ Using cached Qwen chatId: ${qwenChatId} (from ${effectiveChatId})`);
-        return qwenChatId;
-    }
-
-    if (effectiveChatId && effectiveChatId.startsWith('chat_')) {
-        try {
-            const created = await createChatV2(mappedModel, 'OpenWebUI session');
-            if (created && created.chatId) {
-                mapChatId(effectiveChatId, created.chatId);
-                qwenChatId = created.chatId;
-                logInfo(`ðŸ”„ Created Qwen chat ${qwenChatId} and linked to ${effectiveChatId}`);
-            }
-        } catch (error) {
-            logDebug(`Failed to create Qwen chat for ${effectiveChatId}: ${error.message}`);
-        }
-    }
-
-    return qwenChatId;
+// After a failed turn the saved chat may be unusable: the next request then
+// starts a new chat and resends the full history.
+function forgetSessionChat(req, scope = null) {
+    sessionToChatMap.delete(getScopedSessionKey(req, scope));
 }
 import { testToken } from './chat.js';
 
@@ -268,7 +256,7 @@ const sessionToChatMap = new Map(); // session-key -> {chatId, parentId, timesta
 // One-shot chats (without conversation_id) are deleted from Qwen history:
 // failed/empty - always (mode "failed"), successful - only with AUTO_DELETE_CHATS=all.
 function cleanupEphemeralChat(result, requestContext = {}) {
-    const { explicitChatId = null, effectiveChatId = null, isMeta = false, model = null } = requestContext;
+    const { explicitChatId = null, effectiveChatId = null, isMeta = false, model = null, keepChat = false } = requestContext;
     const qwenChatId = result?.chatId;
     const failed = Boolean(result?.error) || !Array.isArray(result?.choices) || result.choices.length === 0;
     const mode = AUTO_DELETE_CHATS ? 'all' : (DELETE_FAILED_CHATS ? 'failed' : 'off');
@@ -280,6 +268,12 @@ function cleanupEphemeralChat(result, requestContext = {}) {
     }
     if (isMeta) {
         logDebug(`[chat-cleanup] skip ${JSON.stringify({ ...base, reason: 'meta_request' })}`);
+        return;
+    }
+
+    // The next turn continues this chat (or it belongs to the client).
+    if (keepChat) {
+        logDebug(`[chat-cleanup] skip ${JSON.stringify({ ...base, reason: 'conversation_chat' })}`);
         return;
     }
 
@@ -357,6 +351,27 @@ setInterval(() => {
 
 const router = express.Router();
 
+// SSE comment lines keep clients/proxies from timing out while Qwen is working.
+const SSE_HEARTBEAT_MS = Number(process.env.SSE_HEARTBEAT_MS) || 15_000;
+
+// Aborts when the client goes away before the response is finished.
+function clientAbortSignal(res) {
+    const controller = new AbortController();
+    res.on('close', () => {
+        if (!res.writableEnded) controller.abort();
+    });
+    return controller.signal;
+}
+
+function startSseHeartbeat(res) {
+    const beat = () => {
+        if (!res.writableEnded && !res.destroyed) res.write(': keep-alive\n\n');
+    };
+    beat();
+    const timer = setInterval(beat, SSE_HEARTBEAT_MS);
+    res.on('close', () => clearInterval(timer));
+}
+
 // --- Multer for file uploads ------------------------------------------------
 
 const storage = multer.diskStorage({
@@ -432,9 +447,21 @@ router.use((req, res, next) => {
 
 // --- Helpers: message parsing -----------------------------------------------
 
+function isSystemRole(msg) {
+    return msg?.role === 'system' || msg?.role === 'developer';
+}
+
+// Qwen needs plain strings; OpenAI clients may send arrays of parts and may use
+// the `developer` role instead of `system`.
+function extractSystemMessage(messages) {
+    return messages.filter(isSystemRole)
+        .map(msg => stringifyOpenAIContent(msg.content))
+        .filter(Boolean)
+        .join('\n\n') || null;
+}
+
 function parseOpenAIMessages(messages) {
-    const systemMsg = messages.find(msg => msg.role === 'system');
-    const systemMessage = systemMsg ? systemMsg.content : null;
+    const systemMessage = extractSystemMessage(messages);
     const lastUserMessage = messages.filter(msg => msg.role === 'user').pop();
 
     if (!lastUserMessage) {
@@ -457,6 +484,9 @@ function parseOpenAIMessages(messages) {
             }
             return item;
         });
+        if (messageContent.every(item => item?.type === 'text')) {
+            messageContent = messageContent.map(item => item.text || '').join('\n');
+        }
     }
 
     return { messageContent, systemMessage };
@@ -487,7 +517,7 @@ function stringifyOpenAIContent(content) {
 function buildStatelessTranscript(messages) {
     const parts = [];
     for (const msg of messages || []) {
-        if (!msg || msg.role === 'system') continue;
+        if (!msg || isSystemRole(msg)) continue;
         if (msg.role === 'user') {
             parts.push(`User: ${stringifyOpenAIContent(msg.content)}`);
         } else if (msg.role === 'assistant') {
@@ -517,7 +547,7 @@ function hasOpenAIToolState(messages) {
 }
 
 function shouldFoldOpenAITranscript(messages, combinedTools, effectiveChatId) {
-    const nonSystemMessages = (messages || []).filter(msg => msg && msg.role !== 'system');
+    const nonSystemMessages = (messages || []).filter(msg => msg && !isSystemRole(msg));
     if (nonSystemMessages.length === 0) return false;
 
     // Hermes/OpenAI agents send the full state every request. After a tool call the
@@ -1476,11 +1506,22 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
             }
 
             // Extract system message if present
-            const systemMsg = messages.find(msg => msg.role === 'system');
-            const systemMessage = systemMsg ? systemMsg.content : null;
+            const systemMessage = extractSystemMessage(messages);
             const { combinedTools } = buildCombinedTools(tools, functions, tool_choice);
 
             const hasTools = Array.isArray(combinedTools) && combinedTools.length > 0;
+
+            // A prompt carrying the whole transcript needs no Qwen-side memory:
+            // reusing a chat would duplicate the context on every turn.
+            const selfContained = hasTools || hasOpenAIToolState(messages);
+            if (selfContained && !explicitChatId) {
+                effectiveChatId = null;
+                effectiveParentId = null;
+            }
+            // Only chats that a later turn continues survive the cleanup.
+            const keepChat = !isMeta && Boolean(explicitChatId
+                ? !explicitChatId.startsWith('chat_')
+                : effectiveChatId && (conversationScope || ALLOW_UNSCOPED_SESSION_CHAT_RESTORE));
 
             // Upload OpenAI image_url parts to Qwen OSS and move them into
             // messages[].files - the shape Qwen Web actually understands.
@@ -1505,7 +1546,10 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                 messageContent = messagesToQwenPrompt(messages, combinedTools, tool_choice);
                 logInfo('Tool-aware prompt built via messagesToQwenPrompt (tool_call fence format)');
             } else {
-                const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, effectiveChatId);
+                // A brand-new Qwen chat has no memory: send the whole history.
+                const historyChatId = resolveQwenChatId(effectiveChatId);
+                const preparedInput = prepareOpenAIMessageInput(messages, combinedTools, historyChatId);
+
                 if (preparedInput.missingUser) {
                     logError('No user messages in request');
                     return res.status(400).json({ error: 'No user messages in request' });
@@ -1517,18 +1561,9 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                 }
                 promptSystemMessage = systemMessage;
 
-                // Convert OpenAI format content array to internal format
+                // Images already moved to files[]; Qwen requires string content.
                 if (Array.isArray(messageContent)) {
-                    messageContent = messageContent.map(item => {
-                        if (item.type === 'text') {
-                            return { type: 'text', text: item.text };
-                        } else if (item.type === 'image_url' && item.image_url) {
-                            return { type: 'image', image: item.image_url.url };
-                        } else if (item.type === 'image') {
-                            return { type: 'image', image: item.image };
-                        }
-                        return item;
-                    });
+                    messageContent = stringifyOpenAIContent(messageContent);
                 }
             }
 
@@ -1591,8 +1626,11 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     ]
                 });
 
+                const signal = clientAbortSignal(res);
+                startSseHeartbeat(res);
+
                 try {
-                    const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
+                    const qwenChatId = resolveQwenChatId(effectiveChatId);
 
                     let hasStreamedReasoning = false;
                     const reasoningCallback = (text) => {
@@ -1640,6 +1678,8 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                             // parsing: stream it through Node with an internal
                             // sink instead of one long page.evaluate.
                             collectOnly: captureToolCalls,
+                            signal,
+                            keepChat,
                             // Captcha notice must reach the client immediately,
                             // but as an out-of-band chunk — never as delta.content,
                             // which clients would glue onto the model's answer.
@@ -1648,7 +1688,8 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     );
 
                     // Cleanup chat by configured policy (default all).
-                    cleanupEphemeralChat(result, { explicitChatId, effectiveChatId, isMeta, model: mappedModel });
+                    cleanupEphemeralChat(result, { explicitChatId, effectiveChatId, isMeta, model: mappedModel, keepChat });
+                    if (result.error) forgetSessionChat(req, conversationScope);
 
                     let _captureCleanText = '';
                     if (captureToolCalls) {
@@ -1668,12 +1709,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
 
                     // Save chatId to session for subsequent requests
-                    if (!isMeta && result.chatId) {
-                        // If we used a generated effectiveChatId - save the mapping
-                        if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
-                            mapChatId(effectiveChatId, result.chatId);
-                            logDebug(`Mapping saved: ${effectiveChatId} -> ${result.chatId}`);
-                        }
+                    if (keepChat && !result.error && result.chatId) {
                         if (shouldPersistSessionContext(conversationScope)) {
                             saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
                         }
@@ -1734,18 +1770,16 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     res.end();
                 }
             } else {
-                const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
-                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, reasoningOptions);
+                const qwenChatId = resolveQwenChatId(effectiveChatId);
+                const signal = clientAbortSignal(res);
+                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, { ...reasoningOptions, signal, keepChat });
 
                 // Cleanup chat by configured policy (default all).
-                cleanupEphemeralChat(result, { explicitChatId, effectiveChatId, isMeta, model: mappedModel });
+                cleanupEphemeralChat(result, { explicitChatId, effectiveChatId, isMeta, model: mappedModel, keepChat });
+                if (result.error) forgetSessionChat(req, conversationScope);
 
                 // Save chatId to session for subsequent requests
-                if (!isMeta && result.chatId) {
-                    if (effectiveChatId && effectiveChatId.startsWith('chat_') && result.chatId) {
-                        mapChatId(effectiveChatId, result.chatId);
-                        logDebug(`Mapping saved: ${effectiveChatId} -> ${result.chatId}`);
-                    }
+                if (keepChat && !result.error && result.chatId) {
                     if (shouldPersistSessionContext(conversationScope)) {
                         saveChatIdForSession(req, result.chatId, result.parentId, conversationScope);
                     }

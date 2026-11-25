@@ -88,8 +88,66 @@ export function missingRequiredParams(toolCalls, requiredByName) {
     return missing;
 }
 
+// Qwen often writes real newlines/tabs inside JSON strings (typical for
+// write/edit tool arguments), which JSON.parse rejects.
+function escapeControlCharsInStrings(text) {
+    let out = '';
+    let inStr = false;
+    let esc = false;
+    for (const c of text) {
+        if (inStr && c < ' ') {
+            const code = JSON.stringify(c).slice(1, -1);
+            // A backslash right before a raw control char already opened an escape.
+            out += esc ? code.slice(1) : code;
+            esc = false;
+            continue;
+        }
+        if (esc) esc = false;
+        else if (inStr && c === '\\') esc = true;
+        else if (c === '"') inStr = !inStr;
+        out += c;
+    }
+    return out;
+}
+
+// Index just past the balanced {...} / [...] starting at `start`, or -1.
+function balancedJsonEnd(text, start) {
+    let depth = 0, inStr = false, esc = false;
+    for (let j = start; j < text.length; j++) {
+        const c = text[j];
+        if (inStr) {
+            if (esc) esc = false;
+            else if (c === '\\') esc = true;
+            else if (c === '"') inStr = false;
+            continue;
+        }
+        if (c === '"') inStr = true;
+        else if (c === '{' || c === '[') depth++;
+        else if (c === '}' || c === ']') {
+            depth--;
+            if (depth === 0) return j + 1;
+        }
+    }
+    return -1;
+}
+
+// Where to start looking for the closing fence: past the JSON payload, so that
+// ``` inside an argument value (README, markdown...) does not close it early.
+function fenceCloseSearchStart(text, from) {
+    let pos = from;
+    for (;;) {
+        let j = pos;
+        while (j < text.length && /[\s,]/.test(text[j])) j++;
+        if (text[j] !== '{' && text[j] !== '[') break;
+        const end = balancedJsonEnd(text, j);
+        if (end === -1) return from;
+        pos = end;
+    }
+    return /^\s*(?:```|$)/.test(text.slice(pos)) ? pos : from;
+}
+
 function parseLenientJson(raw) {
-    const text = String(raw || '').trim();
+    const text = escapeControlCharsInStrings(String(raw || '').trim());
     if (!text) return NOTHING;
     try { return JSON.parse(text); } catch { /* fall through */ }
 
@@ -216,7 +274,7 @@ function collectJsonObjects(text) {
         if (end === -1) break;
         const slice = text.slice(start, end);
         try {
-            objs.push({ value: JSON.parse(slice), start, end });
+            objs.push({ value: JSON.parse(escapeControlCharsInStrings(slice)), start, end });
             i = end;
         } catch {
             i++;
@@ -280,7 +338,7 @@ function* iterBlocks(text) {
         }
 
         // Fence block: find closing ``` after endOpen
-        FENCE_CLOSE.lastIndex = cand.endOpen;
+        FENCE_CLOSE.lastIndex = fenceCloseSearchStart(text, cand.endOpen);
         let close = null;
         let cm;
         while ((cm = FENCE_CLOSE.exec(text)) !== null) {
@@ -331,6 +389,17 @@ function looksLikeToolCallObject(value) {
     if (value.function && typeof value.function === 'object' && value.function.name) return true;
     if (!value.name && !value.tool && !value.tool_name && !value.action) return false;
     return ARGUMENT_KEYS.some(k => Object.prototype.hasOwnProperty.call(value, k));
+}
+
+// A ```json fence is ordinary answer content unless it clearly calls a declared
+// tool; otherwise config examples / package.json get cut out of the reply.
+function isJsonFenceToolCall(data, allowed) {
+    const items = Array.isArray(data) ? data
+        : Array.isArray(data?.tool_calls) ? data.tool_calls
+            : [data?.function_call || data?.tool_call || data];
+    return items.some(item => looksLikeToolCallObject(item) && (!allowed || allowed.has(
+        normalizeToolName(item.name || item.tool || item.tool_name || item.action || item.function?.name)
+    )));
 }
 
 // Qwen sometimes answers with the JSON call un-fenced, mixed with prose or
@@ -384,7 +453,7 @@ export function parseToolCalls(text, allowedNames = null, requiredByName = null)
     // same line immediately before the block opening, the model is explaining the
     // call rather than making it (mirrors Python tools.py lines 732-737).
     const validBlocks = blocks.filter(block => {
-        if (block.kind === 'json') return true; // bare JSON: allow through
+        if (block.kind === 'json') return isJsonFenceToolCall(block.data, allowed);
         const lineStart = text.lastIndexOf('\n', block.start) + 1;
         // Strip XML tags from prefix before checking (use fresh regex to avoid lastIndex issues)
         const prefix = text.slice(lineStart, block.start).replace(/<\/?[\w][\w:.-]*(?:\s[^>]*)?>|<\/tool_call>/gi, '').trim();
@@ -393,7 +462,9 @@ export function parseToolCalls(text, allowedNames = null, requiredByName = null)
 
     if (validBlocks.length > 0) {
         // Remove valid blocks from cleanText in reverse order (preserve positions).
-        const sorted = [...validBlocks].sort((a, b) => b.start - a.start);
+        // Several objects in one fence share a span: cut each span only once.
+        const sorted = [...new Map(validBlocks.map(b => [b.start, b])).values()]
+            .sort((a, b) => b.start - a.start);
         for (const b of sorted) {
             cleanText = cleanText.slice(0, b.start) + cleanText.slice(b.end);
         }

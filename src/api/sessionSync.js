@@ -106,7 +106,12 @@ function updateTokenFile(token) {
         t?.token === token ||
         (accountId && decodeId(t?.token || '') === accountId)
     );
-    const target = idx >= 0 ? idx : 0;
+    // An unknown account is appended; never overwrite another account's token.
+    let target = idx >= 0 ? idx : 0;
+    if (idx < 0 && accountId) {
+        const placeholder = tokens.findIndex(t => !decodeId(t?.token || ''));
+        target = placeholder >= 0 ? placeholder : tokens.length;
+    }
     const existing = tokens[target] || {};
     tokens[target] = {
         ...existing,

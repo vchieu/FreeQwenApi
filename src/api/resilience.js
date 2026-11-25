@@ -4,7 +4,7 @@
 export const CAPTCHA_NOTICE =
     'Please resolve captcha to continue. Check the Qwen browser tab (a desktop alert was triggered); this request will resume automatically once verification is solved.';
 
-const NETWORK_ERROR_RE = /network error|fetch failed|failed to fetch|econnreset|econnrefused|enotfound|ehostunreach|socket hang up|err_network|networkerror|network timeout|request timeout|aborted|the operation was aborted|timeout of \d+ms exceeded/i;
+const NETWORK_ERROR_RE = /network error|fetch failed|failed to fetch|econnreset|econnrefused|enotfound|ehostunreach|socket hang up|err_network|networkerror|network timeout|request timeout|aborted|the operation was aborted|timeout of \d+ms exceeded|\bterminated\b/i;
 
 // Puppeteer cancels any CDP command (including a long page.evaluate) after
 // `protocolTimeout`. Unlike a network fetch failure, the browser fetch may still

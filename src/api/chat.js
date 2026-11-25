@@ -1,7 +1,7 @@
 import { getBrowserContext, getAuthenticationStatus, ensureBrowserConnection } from '../browser/browser.js';
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
 import { saveAuthToken } from '../browser/session.js';
-import { getAvailableToken, markRateLimited, removeInvalidToken, markInvalid, markValid, markValidForToken, decodeTokenInfo } from './tokenManager.js';
+import { getAvailableToken, markRateLimited, removeInvalidToken, markInvalid, markValidForToken, findAccountIdForToken, decodeTokenInfo } from './tokenManager.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -132,7 +132,11 @@ async function readCaptchaSignal(page) {
                     .filter(Boolean).join(' ');
                 if (marker.test(attrs)) out.push(attrs.slice(0, 300));
             }
-            if (document.body) out.push(document.body.innerText.slice(0, 4000));
+            // Body text only counts on a sparse page (a real challenge screen).
+            // A chat tab is full of conversation text that may legitimately
+            // mention captcha / baxia / "security check".
+            const bodyText = (document.body?.innerText || '').trim();
+            if (bodyText.length < 600) out.push(bodyText);
             return out.join('\n');
         }), 1500, '');
     } catch { /* page may be navigating */ }
@@ -280,7 +284,7 @@ async function findHealthyQwenPage(context, excludePages) {
 
 export const pagePool = {
     pages: [],
-    borrowed: new Set(),
+    borrowed: new Map(), // shared tab -> number of requests currently using it
     maxSize: PAGE_POOL_SIZE,
 
     async getPage(context) {
@@ -312,7 +316,7 @@ export const pagePool = {
         // target - new targets are what Qwen's WAF challenges with a captcha.
         const shared = await findHealthyQwenPage(baseContext, this.pages);
         if (shared) {
-            this.borrowed.add(shared);
+            this.borrowed.set(shared, (this.borrowed.get(shared) || 0) + 1);
             logInfo('Reusing existing healthy Qwen tab for API requests');
             return shared;
         }
@@ -342,7 +346,9 @@ export const pagePool = {
 
         if (this.borrowed.has(page)) {
             // Owned by the UI - never close it or push it into the worker pool.
-            this.borrowed.delete(page);
+            const remaining = this.borrowed.get(page) - 1;
+            if (remaining > 0) this.borrowed.set(page, remaining);
+            else this.borrowed.delete(page);
             return;
         }
 
@@ -676,10 +682,12 @@ async function resolveAuthToken(browserContext) {
     if (browserToken) {
         authToken = browserToken;
         saveAuthToken(browserToken);
-        if (tokenObj?.id) markValid(tokenObj.id, browserToken);
-        else markValidForToken(browserToken);
-        logInfo(`Using fresh browser token${tokenObj ? ` for ${tokenObj.id}` : ''}`);
-        return { ...(tokenObj || {}), id: tokenObj?.id || 'browser', token: browserToken, source: 'browser' };
+        // The tab may be logged into a different account than the round-robin
+        // pick: only ever update the account that actually owns this token.
+        markValidForToken(browserToken);
+        const ownerId = findAccountIdForToken(browserToken);
+        logInfo(`Using fresh browser token${ownerId ? ` for ${ownerId}` : ''}`);
+        return { id: ownerId || 'browser', token: browserToken, source: 'browser' };
     }
 
     if (tokenObj && tokenObj.token) {
@@ -813,6 +821,20 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
     // Declared outside try: the catch below must be able to report whether any
     // answer chunk was already delivered, even when fetch/parse throws early.
     let hasStreamedChunks = false;
+    // Idle timeout + client-disconnect cancellation share one controller.
+    const controller = new AbortController();
+    let idleTimer = null;
+    let idleTimedOut = false;
+    const armIdleTimer = () => {
+        clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+            idleTimedOut = true;
+            controller.abort();
+        }, NODE_STREAM_TIMEOUT_MS);
+    };
+    const onClientAbort = () => controller.abort();
+    options.signal?.addEventListener('abort', onClientAbort, { once: true });
+    if (options.signal?.aborted) controller.abort();
     try {
         if (!token) return { success: false, error: 'Auth token not found' };
         if (typeof fetch !== 'function') return { success: false, error: 'Fetch API is unavailable' };
@@ -848,14 +870,15 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
             : String(Date.now()) + Math.random().toString(16).slice(2);
         headers['Authorization'] = `Bearer ${token}`;
 
+        armIdleTimer();
         const response = await fetch(apiUrl, {
             method: 'POST',
             headers,
             body: JSON.stringify(payload),
             // Without this a stalled connection hangs forever (seen as a 6.5 min
-            // dead request with no log line). The resulting TimeoutError is
-            // flagged below and retried on a fresh chat by isNodeStreamTimeout.
-            signal: AbortSignal.timeout(NODE_STREAM_TIMEOUT_MS)
+            // dead request with no log line). An idle timeout is flagged below
+            // and retried on a fresh chat by isNodeStreamTimeout.
+            signal: controller.signal
         });
 
         if (!response.ok) {
@@ -898,6 +921,7 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
         while (!finished) {
             const { done, value } = await reader.read();
             if (done) break;
+            armIdleTimer();
 
             buffer += decoder.decode(value, { stream: true });
             const lines = buffer.split('\n');
@@ -971,6 +995,9 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
             }
         }
 
+        // We may stop at status:"finished" before EOF; release the connection.
+        reader.cancel().catch(() => {});
+
         if (streamError) {
             return { success: false, ...streamError, hasStreamedChunks };
         }
@@ -1004,10 +1031,14 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
         };
     } catch (error) {
         const text = error?.toString ? error.toString() : String(error);
-        const nodeTimeout = error?.name === 'TimeoutError' || /aborted due to timeout|operation timed out/i.test(text);
+        const nodeTimeout = idleTimedOut || error?.name === 'TimeoutError' || /aborted due to timeout|operation timed out/i.test(text);
+        const message = idleTimedOut ? `TimeoutError: no data from Qwen for ${NODE_STREAM_TIMEOUT_MS}ms` : text;
         // Preserve this flag: retrying after partial SSE output would duplicate
         // already-delivered text in the client.
-        return { success: false, error: text, nodeTimeout, hasStreamedChunks };
+        return { success: false, error: message, nodeTimeout, hasStreamedChunks };
+    } finally {
+        clearTimeout(idleTimer);
+        options.signal?.removeEventListener('abort', onClientAbort);
     }
 }
 
@@ -1063,14 +1094,13 @@ async function qwenCookieHeader(page) {
 
 // Qwen web tokens live ~15 minutes; the page keeps refreshing them. Take the
 // freshest token straight from the tab before each request.
-async function syncTokenFromPage(page, tokenObj = null) {
+async function syncTokenFromPage(page) {
     try {
         const fresh = await readTokenFromQwenTab(getBrowserContext())
             || await page.evaluate(() => localStorage.getItem('token'));
         if (!fresh || fresh === authToken) return;
         authToken = fresh;
         saveAuthToken(fresh);
-        if (tokenObj?.id) markValid(tokenObj.id, fresh);
         markValidForToken(fresh);
         logInfo('Token updated from browser');
     } catch (e) {
@@ -1133,13 +1163,11 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
     const allowedToolNames = options.allowedToolNames instanceof Set ? Array.from(options.allowedToolNames) : null;
     const collectOnly = options.collectOnly === true;
     const wantsStreaming = payload?.stream !== false && (typeof onChunk === 'function' || collectOnly);
-    // Tools callers collect the answer in Node instead of emitting client chunks.
-    // With the captured Baxia headers + real UA that fetch passes Qwen's WAF, so
-    // it no longer needs a single page.evaluate that can run past protocolTimeout.
-    const useNodeStreaming = wantsStreaming && (!baxiaHeaders || collectOnly);
-    if (baxiaHeaders && wantsStreaming && !useNodeStreaming) {
-        logInfo('Baxia headers found: request will go through browser (node-streaming skipped)');
-    }
+    // With the captured Baxia headers + real UA + tab cookies a Node fetch passes
+    // Qwen's WAF, so every streaming request uses it: the client gets real
+    // incremental output and no single page.evaluate can hit protocolTimeout.
+    // A WAF challenge still falls back to the browser fetch below.
+    const useNodeStreaming = wantsStreaming;
 
     // Watch the tab from the start: a captcha can appear during the Node fetch
     // too, and the browser fallback below needs the same watcher instance.
@@ -1166,8 +1194,9 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
             streamedResponse.success !== true &&
             /Unexpected non-SSE 200/i.test(String(streamedResponse.error || ''));
 
-        const canReturnDirectly = !wafBlockedNodeStream && (
+        const canReturnDirectly = options.signal?.aborted || !wafBlockedNodeStream && (
             streamedResponse.success ||
+            streamedResponse.nodeTimeout === true ||
             Boolean(streamedResponse.status) ||
             Boolean(streamedResponse.errorBody) ||
             streamedResponse.hasStreamedChunks === true
@@ -1175,6 +1204,11 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
 
         if (canReturnDirectly) {
             captchaWatcher.stop();
+            // Collect-only output went to an internal sink: the client has seen
+            // nothing, so a broken stream is safe to retry (on a fresh chat).
+            if (collectOnly && streamedResponse.success !== true && streamedResponse.hasStreamedChunks) {
+                return { ...streamedResponse, hasStreamedChunks: false, interrupted: !streamedResponse.status };
+            }
             return streamedResponse;
         }
 
@@ -1526,6 +1560,9 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
     else logError(`Error getting response: ${errorDetail}`);
     if (response.errorBody) logDebug(`Error response body: ${response.errorBody}`);
 
+    // Nobody is listening any more: do not burn quota on retries.
+    if (options.signal?.aborted) return { error: 'Client disconnected', aborted: true, chatId };
+
     // Captcha: the watcher already notified the user and waited for the slider
     // to be solved. The original browser fetch died when the WAF challenged it,
     // but Qwen's server-side generation may still be running in this chat.
@@ -1535,7 +1572,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
     if (response.captcha || isCaptchaResponse(response)) {
         if (response.captcha && response.retryable && retryCount < MAX_RETRY_COUNT) {
             logInfo('Captcha solved; retrying request on a fresh chat');
-            if (chatId) deleteChatV2(chatId).catch(() => {});
+            if (chatId && !options.keepChat) deleteChatV2(chatId).catch(() => {});
             await delay(RETRY_DELAY);
             return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
         }
@@ -1548,7 +1585,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
     if (isChatInProgress(response)) {
         if (retryCount < MAX_RETRY_COUNT) {
             logWarn(`Qwen chat still in progress; retrying on a fresh chat (${retryCount + 1}/${MAX_RETRY_COUNT})`);
-            if (chatId) deleteChatV2(chatId).catch(() => {});
+            if (chatId && !options.keepChat) deleteChatV2(chatId).catch(() => {});
             await delay(RETRY_DELAY);
             return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
         }
@@ -1560,10 +1597,10 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
     // server-side, so retry on a NEW chat like CHAT_IN_PROGRESS instead of
     // replaying into the abandoned one. Never surface the raw
     // `Error: ProtocolError...` / `TimeoutError...` string to the client.
-    if (response.protocolTimeout || isProtocolTimeoutError(response) || isNodeStreamTimeout(response)) {
+    if (response.protocolTimeout || response.interrupted || isProtocolTimeoutError(response) || isNodeStreamTimeout(response)) {
         if (retryCount < MAX_RETRY_COUNT) {
-            logWarn(`Stream timeout; retrying on a fresh chat (${retryCount + 1}/${MAX_RETRY_COUNT})`);
-            if (chatId) deleteChatV2(chatId).catch(() => {});
+            logWarn(`Stream timeout/interruption; retrying on a fresh chat (${retryCount + 1}/${MAX_RETRY_COUNT})`);
+            if (chatId && !options.keepChat) deleteChatV2(chatId).catch(() => {});
             await delay(RETRY_DELAY);
             return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
         }
@@ -1631,7 +1668,8 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
 
         authToken = null;
         const { hasValidTokens } = await import('./tokenManager.js');
-        if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
+        // Never replay an answer the client has partially received.
+        if (hasValidTokens() && retryCount < MAX_RETRY_COUNT && response.hasStreamedChunks !== true) {
             // chatId/parentId are reset: when switching accounts the old chat
             // belongs to the previous token and under the new one "does not exist".
             return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
@@ -1681,6 +1719,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
 
     const browserContext = getBrowserContext();
     if (!browserContext) return { error: 'Browser is not initialized', chatId };
+    if (options.signal?.aborted) return { error: 'Client disconnected', aborted: true, chatId };
 
     // Resolve account ONCE: with the same token create the chat and
     // send the message - otherwise round-robin picks different
@@ -1765,13 +1804,14 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         // Tool routes pass no client callback (they need the whole answer to
         // parse tool calls). Give them an internal sink so the request streams
         // through Node instead of waiting on one 5-minute page.evaluate.
-        const collectOnly = options.collectOnly === true && typeof onChunk !== 'function';
+        // Non-stream text requests are collected through Node as well.
+        const collectOnly = typeof onChunk !== 'function' && (options.collectOnly === true || chatType === 't2t');
         const streamChunk = collectOnly ? () => {} : onChunk;
         // Tool routes write reasoning once from the completed response (inside
         // writeToolCallsSse / the final fallback). Suppress live reasoning here
         // to avoid emitting the same block twice.
         const streamReasoning = collectOnly ? null : (options.onReasoning || null);
-        const apiOptions = { allowedToolNames, onCaptcha: options.onCaptcha, collectOnly };
+        const apiOptions = { allowedToolNames, onCaptcha: options.onCaptcha, collectOnly, signal: options.signal };
         let response = await executeApiRequest(page, apiUrl, payload, authToken, streamChunk, streamReasoning, apiOptions);
 
         // One nudge retry max per request when tools were declared and model missed/broke tool call format.
