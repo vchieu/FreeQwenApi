@@ -121,15 +121,12 @@ function writeModelsFile(file, models) {
 
 function writeDocFile(file, discoveredModels, mergedIds, previousIds) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const now = new Date().toISOString();
   const discoveredIds = discoveredModels.map(model => model.id);
   const added = discoveredIds.filter(id => !previousIds.includes(id));
   const missingFromChat = previousIds.filter(id => !discoveredIds.includes(id));
 
   const lines = [];
   lines.push('# Qwen Chat Model Synchronization');
-  lines.push('');
-  lines.push(`Generated: ${now}`);
   lines.push('');
   lines.push('Source: prerendered model metadata from https://chat.qwen.ai/.');
   lines.push('');

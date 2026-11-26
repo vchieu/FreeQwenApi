@@ -1,7 +1,5 @@
 # Qwen Chat Model Synchronization
 
-Generated: 2026-11-26T13:43:17.696Z
-
 Source: prerendered model metadata from https://chat.qwen.ai/.
 
 ## Models Currently Visible in Qwen Chat
