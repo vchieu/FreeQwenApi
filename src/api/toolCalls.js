@@ -283,6 +283,14 @@ function collectJsonObjects(text) {
     return objs;
 }
 
+const TOOL_KEYS = ['name', 'tool', 'tool_name', 'action', 'function_call', 'tool_call', 'tool_calls'];
+function hasToolKey(value) {
+    if (Array.isArray(value)) return value.some(hasToolKey);
+    if (!value || typeof value !== 'object') return false;
+    if (value.function && typeof value.function === 'object' && value.function.name) return true;
+    return TOOL_KEYS.some(k => Object.prototype.hasOwnProperty.call(value, k));
+}
+
 function* iterBlocks(text) {
     const candidates = [];
     FENCE_OPEN.lastIndex = 0;
@@ -331,7 +339,11 @@ function* iterBlocks(text) {
             }
             if (!anyDecoded) {
                 const lenient = parseLenientJson(rawBlock);
-                if (lenient !== NOTHING) yield { start: cand.start, end: blockEnd, data: lenient, kind: cand.kind };
+                if (lenient !== NOTHING && hasToolKey(lenient)) {
+                    yield { start: cand.start, end: blockEnd, data: lenient, kind: cand.kind };
+                } else {
+                    yield { start: cand.start, end: blockEnd, data: null, kind: cand.kind, malformed: true };
+                }
             }
             consumedUpTo = blockEnd;
             continue;
@@ -354,18 +366,20 @@ function* iterBlocks(text) {
         // Check whether any collected objects look like tool calls (have a name/tool key).
         // If not, also try parseLenientJson which can recover malformed patterns like
         // {"name":"foo",{"key":"val"}} where the arguments object is bare (no "arguments" key).
-        const TOOL_KEYS = ['name', 'tool', 'tool_name', 'action', 'function_call', 'tool_call', 'tool_calls'];
-        const hasToolShape = objs.some(o => o.value && typeof o.value === 'object' &&
-            TOOL_KEYS.some(k => Object.prototype.hasOwnProperty.call(o.value, k)));
+        const hasToolShape = objs.some(o => hasToolKey(o.value));
         if (objs.length > 0 && hasToolShape) {
             for (const obj of objs) yield { start: cand.start, end: blockEnd, data: obj.value, kind: cand.kind };
         } else {
             const lenient = parseLenientJson(rawBlock);
-            if (lenient !== NOTHING) {
+            if (lenient !== NOTHING && hasToolKey(lenient)) {
                 yield { start: cand.start, end: blockEnd, data: lenient, kind: cand.kind };
-            } else if (objs.length > 0) {
-                // parseLenientJson found nothing better; fall back to collected objects
+            } else if (cand.kind === 'json' && objs.length > 0) {
+                // Ordinary ```json block without tool shape stays eligible for isJsonFenceToolCall() -> false
                 for (const obj of objs) yield { start: cand.start, end: blockEnd, data: obj.value, kind: cand.kind };
+            } else if (cand.kind !== 'json') {
+                // Explicit tool fence with broken JSON or no tool-shaped payload:
+                // mark malformed so parseToolCalls records a drop reason for nudge retry.
+                yield { start: cand.start, end: blockEnd, data: null, kind: cand.kind, malformed: true };
             }
         }
         consumedUpTo = blockEnd;
@@ -453,7 +467,7 @@ export function parseToolCalls(text, allowedNames = null, requiredByName = null)
     // same line immediately before the block opening, the model is explaining the
     // call rather than making it (mirrors Python tools.py lines 732-737).
     const validBlocks = blocks.filter(block => {
-        if (block.kind === 'json') return isJsonFenceToolCall(block.data, allowed);
+        if (block.kind === 'json') return !block.malformed && isJsonFenceToolCall(block.data, allowed);
         const lineStart = text.lastIndexOf('\n', block.start) + 1;
         // Strip XML tags from prefix before checking (use fresh regex to avoid lastIndex issues)
         const prefix = text.slice(lineStart, block.start).replace(/<\/?[\w][\w:.-]*(?:\s[^>]*)?>|<\/tool_call>/gi, '').trim();
@@ -468,7 +482,16 @@ export function parseToolCalls(text, allowedNames = null, requiredByName = null)
         for (const b of sorted) {
             cleanText = cleanText.slice(0, b.start) + cleanText.slice(b.end);
         }
-        for (const block of validBlocks) addNormalizedCalls(extractCallsFromData(block.data), ctx);
+        for (const block of validBlocks) {
+            if (block.malformed) {
+                dropped.push(`malformed ${block.kind} block (invalid JSON or missing tool call)`);
+                continue;
+            }
+            addNormalizedCalls(extractCallsFromData(block.data), ctx);
+        }
+        if (calls.length === 0 && dropped.length === 0) {
+            dropped.push('malformed tool_call block (no usable tool call)');
+        }
     }
 
     // 2) Bare JSON sweep. Runs when structured parsing produced nothing usable:
@@ -792,4 +815,22 @@ export function mergeToolCalls(nativeCalls = [], textCalls = []) {
         });
     }
     return merged;
+}
+
+/**
+ * Decide whether sendMessage should issue a one-shot nudge retry when tools were
+ * declared. Plain-text replies under tool_choice="auto" are left alone; only
+ * rejected/broken tool calls or explicit tool requirements trigger a retry.
+ */
+export function shouldRetryToolCall({ merged = [], dropped = [], toolChoice = null } = {}) {
+    if (Array.isArray(merged) && merged.length > 0) return false;
+    if (toolChoice === 'none') return false;
+    if (Array.isArray(dropped) && dropped.length > 0) return true;
+    if (toolChoice === 'required') return true;
+    if (toolChoice && typeof toolChoice === 'object') {
+        const fn = toolChoice.function;
+        const name = (fn && typeof fn === 'object') ? fn.name : toolChoice.name;
+        return Boolean(name);
+    }
+    return false;
 }

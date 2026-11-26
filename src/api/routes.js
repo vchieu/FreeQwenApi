@@ -1678,6 +1678,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                             // parsing: stream it through Node with an internal
                             // sink instead of one long page.evaluate.
                             collectOnly: captureToolCalls,
+                            declaredTools: combinedTools,
                             signal,
                             keepChat,
                             // Captcha notice must reach the client immediately,
@@ -1772,7 +1773,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
             } else {
                 const qwenChatId = resolveQwenChatId(effectiveChatId);
                 const signal = clientAbortSignal(res);
-                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, { ...reasoningOptions, signal, keepChat });
+                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, { ...reasoningOptions, declaredTools: combinedTools, signal, keepChat });
 
                 // Cleanup chat by configured policy (default all).
                 cleanupEphemeralChat(result, { explicitChatId, effectiveChatId, isMeta, model: mappedModel, keepChat });
@@ -2083,6 +2084,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                             // parsing: stream it through Node with an internal
                             // sink instead of one long page.evaluate.
                             collectOnly: captureToolCalls,
+                            declaredTools: combinedTools,
                             // Captcha notice must reach the client immediately,
                             // but as an out-of-band chunk — never as delta.content,
                             // which clients would glue onto the model's answer.
@@ -2171,7 +2173,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
             } else {
                 const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
 
-                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, reasoningOptions);
+                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, { ...reasoningOptions, declaredTools: combinedTools });
 
                 // Save chatId to session for subsequent requests
                 if (!isMeta && result.chatId) {

@@ -12,7 +12,7 @@ import {
 } from './reasoning.js';
 import {
     createNativeToolCallAccumulator, collectNativeCall, flushNativeToolCalls,
-    parseToolCalls, mergeToolCalls, toolNames, toolRequiredParams
+    parseToolCalls, mergeToolCalls, toolNames, toolRequiredParams, shouldRetryToolCall
 } from './toolCalls.js';
 import {
     isUnauthorizedResult, isUsableRefreshedToken, pickProxyOwnedQwenPage
@@ -1793,8 +1793,11 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
 
         logInfo('Sending request to API v2...');
 
-        const allowedToolNames = Array.isArray(tools) && tools.length > 0 ? toolNames(tools) : null;
-        const requiredToolParams = allowedToolNames ? toolRequiredParams(tools) : null;
+        const validationTools = Array.isArray(options.declaredTools) && options.declaredTools.length > 0
+            ? options.declaredTools
+            : (Array.isArray(tools) && tools.length > 0 ? tools : null);
+        const allowedToolNames = validationTools ? toolNames(validationTools) : null;
+        const requiredToolParams = allowedToolNames ? toolRequiredParams(validationTools) : null;
 
         const payload = buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType, size, reasoningMode);
         logDebug('=== PAYLOAD V2 ===\n' + JSON.stringify(payload, null, 2));
@@ -1814,15 +1817,20 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         const apiOptions = { allowedToolNames, onCaptcha: options.onCaptcha, collectOnly, signal: options.signal };
         let response = await executeApiRequest(page, apiUrl, payload, authToken, streamChunk, streamReasoning, apiOptions);
 
-        // One nudge retry max per request when tools were declared and model missed/broke tool call format.
+        // One nudge retry max per request when tools were declared and model broke tool call format (or toolChoice requires one).
+        // Only retry when the client has not already received live chunks.
+        const canNudgeRetry = collectOnly || typeof onChunk !== 'function';
         if (response.success && !response.isTask && allowedToolNames && !options._toolRetryDone) {
             const first = finalizeToolCallsInResponse(response, allowedToolNames, requiredToolParams);
-            if (first.merged.length === 0) {
+            if (canNudgeRetry && shouldRetryToolCall({ merged: first.merged, dropped: first.dropped, toolChoice })) {
                 const names = Array.from(allowedToolNames).join(', ');
                 const reason = first.dropped.length > 0 ? ` Previous attempt was rejected: ${first.dropped.join('; ')}.` : '';
-                const nudge = `\n\nIMPORTANT: Use a tool call now.${reason} Respond ONLY with a tool_call block using one of these tools: ${names}.`;
-                const retryPayload = buildPayloadV2(messageContent, model, chatId, parentId, files, `${systemMessage || ''}${nudge}`.trim(), tools, toolChoice, chatType, size, reasoningMode);
-                logWarn(`Tool call missing/broken; retrying once with nudge. dropped=${first.dropped.length}`);
+                const nudge = `\n\nIMPORTANT: Use a tool call now.${reason} Respond ONLY with a valid \`\`\`tool_call JSON block using one of these tools: ${names}.`;
+                const retryMessage = `${messageContent}${nudge}`;
+                const retrySystem = systemMessage ? `${systemMessage}${nudge}`.trim() : null;
+                const retryPayload = buildPayloadV2(retryMessage, model, chatId, parentId, files, retrySystem, tools, toolChoice, chatType, size, reasoningMode);
+                logWarn(`Tool call missing/broken; retrying once with nudge. dropped=${first.dropped.join('; ') || 'none'}`);
+                options = { ...options, _toolRetryDone: true };
                 response = await executeApiRequest(page, apiUrl, retryPayload, authToken, streamChunk, streamReasoning, apiOptions);
                 if (response?.data) response.data._toolRetryDone = true;
                 // Parse the retry too — otherwise its tool call stays as text.

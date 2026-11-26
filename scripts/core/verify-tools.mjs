@@ -9,7 +9,8 @@ import {
     missingRequiredParams,
     toolRequiredParams,
     messagesToQwenPrompt,
-    toolNames
+    toolNames,
+    shouldRetryToolCall
 } from '../../src/api/toolCalls.js';
 
 let checks = 0;
@@ -315,7 +316,50 @@ check('{"name":"foo",{...}} missing arguments key recovered', () => {
     assert.deepEqual(JSON.parse(r.calls[0].function.arguments), { path: 'x.js' });
 });
 
-const TOTAL = 10 + 16 + 4 + 4 + 1;
+console.log('\nMalformed tool_call blocks & nudge-retry decision:');
+check('nested bracket mismatch inside tool_call fence (question regression) records dropped', () => {
+    const text = '```tool_call\n{"name":"question","arguments":{"questions":[{"question":"Q1","header":"H1","options":[{"label":"A","description":"desc"}]},{"question":"Q2","header":"H2","options":[{"label":"B","description":"desc2"}]}]}}\n```'.replace('"options":[{"label":"A","description":"desc"}]}', '"options":[{"label":"A","description":"desc"]}]');
+    const r = parseToolCalls(text, new Set(['question']), { question: new Set(['questions']) });
+    assert.equal(r.calls.length, 0, 'broken JSON must not emit bogus call');
+    assert.ok(r.dropped.length > 0, 'broken tool_call fence must record dropped reason for retry');
+});
+
+check('completely invalid JSON inside tool_call fence records dropped', () => {
+    const r = parseToolCalls('```tool_call\n{bad json\n```', allowed, required);
+    assert.equal(r.calls.length, 0);
+    assert.ok(r.dropped.length > 0, 'invalid JSON in tool_call fence must record dropped');
+});
+
+check('malformed XML <tool_call> block records dropped', () => {
+    const r = parseToolCalls('<tool_call>{bad json</tool_call>', allowed, required);
+    assert.equal(r.calls.length, 0);
+    assert.ok(r.dropped.length > 0, 'invalid XML tool_call must record dropped');
+});
+
+check('ordinary ```json fence without tool shape stays text with no dropped', () => {
+    const r = parseToolCalls('```json\n{"label":"Big Pickle","description":"coding"}\n```', allowed, required);
+    assert.equal(r.calls.length, 0);
+    assert.equal(r.dropped.length, 0);
+    assert.ok(r.text.includes('Big Pickle'), 'ordinary json fence preserved as answer text');
+});
+
+check('shouldRetryToolCall retries when dropped non-empty', () => {
+    assert.equal(shouldRetryToolCall({ merged: [], dropped: ['malformed tool_call block'], toolChoice: 'auto' }), true);
+    assert.equal(shouldRetryToolCall({ merged: [{ id: '1' }], dropped: ['x'], toolChoice: 'auto' }), false);
+});
+
+check('shouldRetryToolCall skips plain-text answer under tool_choice=auto', () => {
+    assert.equal(shouldRetryToolCall({ merged: [], dropped: [], toolChoice: 'auto' }), false);
+    assert.equal(shouldRetryToolCall({ merged: [], dropped: [], toolChoice: null }), false);
+    assert.equal(shouldRetryToolCall({ merged: [], dropped: ['x'], toolChoice: 'none' }), false);
+});
+
+check('shouldRetryToolCall retries when tool_choice requires a tool', () => {
+    assert.equal(shouldRetryToolCall({ merged: [], dropped: [], toolChoice: 'required' }), true);
+    assert.equal(shouldRetryToolCall({ merged: [], dropped: [], toolChoice: { type: 'function', function: { name: 'question' } } }), true);
+});
+
+const TOTAL = 10 + 16 + 4 + 4 + 1 + 7;
 console.log(`\nchecks: ${checks}`);
 console.log(checks === TOTAL ? 'PASS' : `FAIL (expected ${TOTAL} checks, got ${checks})`);
 process.exit(checks === TOTAL ? 0 : 1);
