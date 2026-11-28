@@ -10,7 +10,7 @@ import {
     CHAT_PAGE_URL, NAVIGATION_TIMEOUT, RETRY_DELAY,
     VIEWPORT_WIDTH, VIEWPORT_HEIGHT, USER_AGENT,
     PUPPETEER_PROTOCOL_TIMEOUT_MS,
-    SESSION_DIR, ACCOUNTS_DIR, PORT
+    SESSION_DIR, PORT
 } from '../config.js';
 import { installSessionHook } from './sessionHook.js';
 
@@ -141,16 +141,12 @@ export async function initBrowser(visibleMode = true, skipManualRestart = false)
 async function saveSessionPuppeteer(page) {
     try {
         const cookies = await page.cookies();
-        const sessionDir = path.join(process.cwd(), SESSION_DIR, ACCOUNTS_DIR);
+        const sessionDir = path.join(process.cwd(), SESSION_DIR);
         if (!fs.existsSync(sessionDir)) fs.mkdirSync(sessionDir, { recursive: true });
 
-        const accountId = `acc_${Date.now()}`;
-        const accountDir = path.join(sessionDir, accountId);
-        if (!fs.existsSync(accountDir)) fs.mkdirSync(accountDir, { recursive: true });
-
-        fs.writeFileSync(path.join(accountDir, 'cookies.json'), JSON.stringify(cookies, null, 2));
-        logInfo(`Cookies saved for account ${accountId}`);
-        return accountId;
+        fs.writeFileSync(path.join(sessionDir, 'cookies.json'), JSON.stringify(cookies, null, 2));
+        logInfo('Cookies saved for browser session');
+        return 'browser';
     } catch (error) {
         logError('Error saving session', error);
         return null;

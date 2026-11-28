@@ -18,7 +18,6 @@
         "example:axios": "node examples/direct-api/axios-example.js",
         "example:file-upload": "node examples/file-upload/upload-example.js",
         "example:streaming-test": "node examples/streaming-test.js",
-        "auth": "node scripts/core/auth.js",
         "models:sync": "node scripts/core/sync_models.js",
         "smoke": "node scripts/inspect/smoke_test.js"
     },

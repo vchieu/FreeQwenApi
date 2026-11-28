@@ -1,5 +1,5 @@
 import express from 'express';
-import { sendMessage, getAllModels, getApiKeys, createChatV2, pollQwenTaskStatus, extractMediaUrl, pagePool, extractAuthToken, deleteChatV2 } from './chat.js';
+import { sendMessage, getAllModels, getApiKeys, createChatV2, pollQwenTaskStatus, extractMediaUrl, pagePool, extractAuthToken, deleteChatV2, getAuthToken } from './chat.js';
 import { getAuthenticationStatus, getBrowserContext } from '../browser/browser.js';
 import { checkAuthentication } from '../browser/auth.js';
 import { logInfo, logError, logDebug, logWarn } from '../logger/index.js';
@@ -12,7 +12,7 @@ import multer from 'multer';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
-import { listTokens, markInvalid, markRateLimited, markValid, addTokenFromString, deleteAccount, decodeTokenInfo, updateAccountToken, setLabel } from './tokenManager.js';
+
 import { FORGETMEAI_WATERMARK } from '../utils/branding.js';
 import { applySessionSync, getSessionSyncStatus } from './sessionSync.js';
 import { reasoningOptionsFromEffort } from './reasoning.js';
@@ -224,8 +224,6 @@ function resolveQwenChatId(effectiveChatId) {
 function forgetSessionChat(req, scope = null) {
     sessionToChatMap.delete(getScopedSessionKey(req, scope));
 }
-import { testToken } from './chat.js';
-
 function isOpenWebUiMetaRequest(messages) {
     if (!Array.isArray(messages) || messages.length === 0) return false;
     const lastUserMessage = messages.filter(m => m && m.role === 'user').pop();
@@ -893,7 +891,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
             let streamedContent = '';
 
             if (result.error) {
-                writeProxyError(writeSse, mappedModel, `Error: ${result.error}`, false);
+                writeProxyError(writeSse, mappedModel, `Error: ${result.error}`, Boolean(result.quotaLimited));
             } else if (result.choices?.[0]?.message) {
                 const content = String(result.choices[0].message.content || '');
                 streamedContent = content;
@@ -1087,7 +1085,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
 
                     if (result.error) {
-                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks);
+                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks || Boolean(result.quotaLimited));
                     } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                         // Qwen returned JSON/normal response instead of SSE - send final as single chunk
                         const content = result.choices[0].message.content;
@@ -1182,21 +1180,18 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
     router.get('/health', async (req, res) => {
         try {
             const modelData = getAllModels();
-            const tokens = listTokens();
-            const now = Date.now();
-            const availableAccounts = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid).length;
-
+            const session = getSessionSyncStatus();
+            const token = getAuthToken();
             res.json({
-                ok: availableAccounts > 0,
+                ok: Boolean(token) || session.ok,
                 service: 'FreeQwenApi',
                 watermark: FORGETMEAI_WATERMARK,
                 baseUrl: '/api',
                 models: modelData.models.length,
-                accounts: {
-                    total: tokens.length,
-                    available: availableAccounts,
-                    invalid: tokens.filter(t => t.invalid).length,
-                    waiting: tokens.filter(t => t.resetAt && new Date(t.resetAt).getTime() > now).length
+                session: {
+                    synced: session.ok,
+                    capturedAt: session.capturedAt || null,
+                    tokenExp: session.tokenExp || null
                 },
                 timestamp: new Date().toISOString()
             });
@@ -1292,166 +1287,23 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
     router.get('/status', async (req, res) => {
         try {
             logInfo('Auth status request');
-            const tokens = listTokens();
-            const accounts = await Promise.all(tokens.map(async t => {
-                const accInfo = { id: t.id, status: 'UNKNOWN', resetAt: t.resetAt || null };
-
-                if (t.resetAt) {
-                    const resetTime = new Date(t.resetAt).getTime();
-                    if (resetTime > Date.now()) { accInfo.status = 'WAIT'; return accInfo; }
-                }
-
-                const testResult = await testToken(t.token);
-                if (testResult === 'OK') { accInfo.status = 'OK'; if (t.invalid || t.resetAt) markValid(t.id); }
-                else if (testResult === 'RATELIMIT') { accInfo.status = 'WAIT'; markRateLimited(t.id, 24); }
-                else if (testResult === 'UNAUTHORIZED') { accInfo.status = 'INVALID'; if (!t.invalid) markInvalid(t.id); }
-                else { accInfo.status = 'ERROR'; }
-                return accInfo;
-            }));
-
+            const session = getSessionSyncStatus();
             const browserContext = getBrowserContext();
             if (!browserContext) {
                 logError('Browser is not initialized');
-                return res.json({ authenticated: false, message: 'Browser is not initialized', accounts });
+                return res.json({ authenticated: false, message: 'Browser is not initialized', session });
             }
 
-            if (getAuthenticationStatus()) return res.json({ accounts });
-
-            await checkAuthentication(browserContext);
+            if (!getAuthenticationStatus()) await checkAuthentication(browserContext);
             const isAuthenticated = getAuthenticationStatus();
             logInfo(`Auth status: ${isAuthenticated ? 'active' : 'authentication required'}`);
-            res.json({ authenticated: isAuthenticated, message: isAuthenticated ? 'Authentication is active' : 'Authentication required', accounts });
+            res.json({
+                authenticated: isAuthenticated,
+                message: isAuthenticated ? 'Authentication is active' : 'Authentication required',
+                session
+            });
         } catch (error) {
             logError('Error checking auth status', error);
-            res.status(500).json({ error: 'Internal server error' });
-        }
-    });
-
-    // --- Account management (for dashboard) -------------------------------------
-    // Account management is explicit (tokens), so it is available only from
-    // localhost - protection against LAN access (HOST=0.0.0.0 exposes to entire network).
-    function localOnly(req, res, next) {
-        const ip = req.socket?.remoteAddress || '';
-        if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') return next();
-        logWarn(`Blocked non-local access to /accounts from ${ip}`);
-        return res.status(403).json({ error: 'Account management is available only from localhost' });
-    }
-
-    // CSRF protection for mutating requests: ACAO:* allows cross-origin calls,
-    // so we reject requests whose Origin does not match the server origin.
-    function sameOriginOnly(req, res, next) {
-        const origin = req.get('origin');
-        if (origin) {
-            // Browser extensions (the account-import popup) are user-installed and
-            // declare an explicit host permission for this server. A web page cannot
-            // forge a *-extension:// Origin, so these are trusted, not a CSRF vector.
-            if (/^(chrome-extension|moz-extension|safari-web-extension):\/\//i.test(origin)) return next();
-            try {
-                if (new URL(origin).host !== req.get('host')) {
-                    return res.status(403).json({ error: 'Cross-origin request denied' });
-                }
-            } catch {
-                return res.status(403).json({ error: 'Invalid Origin' });
-            }
-        }
-        return next();
-    }
-
-    router.get('/accounts', localOnly, sameOriginOnly, (req, res) => {
-        try {
-            const now = Date.now();
-            const accounts = listTokens().map(t => {
-                const info = decodeTokenInfo(t.token);
-                let status = 'OK';
-                if (t.invalid) status = 'INVALID';
-                else if (t.resetAt && new Date(t.resetAt).getTime() > now) status = 'WAIT';
-                else if (info.exp && info.exp < now) status = 'EXPIRED';
-                return {
-                    id: t.id,
-                    label: t.label || '',
-                    status,
-                    exp: info.exp,
-                    resetAt: t.resetAt || null,
-                    preview: String(t.token).slice(0, 10) + '…' + String(t.token).slice(-4)
-                };
-            });
-            res.json({ accounts });
-        } catch (error) {
-            logError('Error getting account list', error);
-            res.status(500).json({ error: 'Internal server error' });
-        }
-    });
-
-    router.post('/accounts', localOnly, sameOriginOnly, (req, res) => {
-        try {
-            const token = req.body?.token;
-            if (!token) return res.status(400).json({ error: 'Token not provided' });
-            const result = addTokenFromString(token, req.body?.label);
-            if (result.error) return res.status(400).json(result);
-            logInfo(`Added account via dashboard: ${result.id}`);
-            res.json({ ok: true, id: result.id });
-        } catch (error) {
-            logError('Error adding account', error);
-            res.status(500).json({ error: 'Internal server error' });
-        }
-    });
-
-    router.delete('/accounts/:id', localOnly, sameOriginOnly, (req, res) => {
-        try {
-            const result = deleteAccount(req.params.id);
-            if (result.error) return res.status(400).json(result);
-            logInfo(`Deleted account via dashboard: ${req.params.id}`);
-            res.json({ ok: true });
-        } catch (error) {
-            logError('Error deleting account', error);
-            res.status(500).json({ error: 'Internal server error' });
-        }
-    });
-
-    // Check validity of a single account (real request to Qwen).
-    // POST, because it mutates state (mark*); sameOriginOnly - CSRF protection.
-    router.post('/accounts/:id/check', localOnly, sameOriginOnly, async (req, res) => {
-        try {
-            const id = req.params.id;
-            if (!/^acc_[a-zA-Z0-9]+$/.test(id)) return res.status(400).json({ error: 'Invalid account id' });
-            const t = listTokens().find(x => x.id === id);
-            if (!t) return res.status(404).json({ error: 'Account not found' });
-            const info = decodeTokenInfo(t.token);
-            const r = await testToken(t.token);
-            let status = 'ERROR';
-            if (r === 'OK') { status = 'OK'; if (t.invalid || t.resetAt) markValid(t.id); }
-            else if (r === 'RATELIMIT') { status = 'WAIT'; markRateLimited(t.id, 24); }
-            else if (r === 'UNAUTHORIZED') { status = 'INVALID'; if (!t.invalid) markInvalid(t.id); }
-            const resetAt = status === 'WAIT' ? new Date(Date.now() + 24 * 3600 * 1000).toISOString() : (t.resetAt || null);
-            res.json({ id, status, exp: info.exp, resetAt });
-        } catch (error) {
-            logError('Error checking account', error);
-            res.status(500).json({ error: 'Internal server error' });
-        }
-    });
-
-    // Update account token (relogin manually from dashboard).
-    router.post('/accounts/:id/update', localOnly, sameOriginOnly, (req, res) => {
-        try {
-            const result = updateAccountToken(req.params.id, req.body?.token);
-            if (result.error) return res.status(400).json(result);
-            logInfo(`Updated account token via dashboard: ${req.params.id}`);
-            res.json(result);
-        } catch (error) {
-            logError('Error updating account token', error);
-            res.status(500).json({ error: 'Internal server error' });
-        }
-    });
-
-    // Set/change human-readable account label (for distinction in pool).
-    router.post('/accounts/:id/label', localOnly, sameOriginOnly, (req, res) => {
-        try {
-            const result = setLabel(req.params.id, req.body?.label);
-            if (result.error) return res.status(400).json(result);
-            logInfo(`Changed account label via dashboard: ${req.params.id}`);
-            res.json(result);
-        } catch (error) {
-            logError('Error changing account label', error);
             res.status(500).json({ error: 'Internal server error' });
         }
     });
@@ -1787,7 +1639,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
 
                     if (result.error) {
-                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks);
+                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks || Boolean(result.quotaLimited));
                     } else if (captureToolCalls && _captureDropped.length > 0 && !_captureCleanText) {
                         // Tool-call blocks were broken/rejected even after retry and no prose remains.
                         // Never dump raw ```tool_call fences to the client as finish_reason:"stop".
@@ -2231,7 +2083,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
 
                     if (result.error) {
-                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks);
+                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks || Boolean(result.quotaLimited));
                     } else if (captureToolCalls && _captureDropped.length > 0 && !_captureCleanText) {
                         writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Invalid tool call: ${_captureDropped.join('; ')}`, hasStreamedChunks);
                     } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
@@ -2770,16 +2622,15 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
         try {
             const apiKey = process.env.DASHSCOPE_API_KEY;
             const dashScopeAvailable = await checkImageApiAvailability();
-            const tokens = listTokens();
-            const now = Date.now();
-            const qwenChatAvailable = tokens.some(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid);
+            const session = getSessionSyncStatus();
+            const qwenChatAvailable = Boolean(getAuthToken()) || session.ok;
 
             res.json({
                 watermark: FORGETMEAI_WATERMARK,
                 qwenChat: {
                     available: qwenChatAvailable,
                     model: CHAT_MEDIA_MODEL,
-                    message: qwenChatAvailable ? 'Qwen Chat image generation is available' : 'No active Qwen Chat accounts'
+                    message: qwenChatAvailable ? 'Qwen Chat image generation is available' : 'No active Qwen session'
                 },
                 dashscope: {
                     available: dashScopeAvailable,
@@ -2801,15 +2652,13 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
      * GET /api/videos/status - Check Qwen Chat video generation readiness.
      */
     router.get('/videos/status', async (req, res) => {
-        const tokens = listTokens();
-        const now = Date.now();
-        const availableAccounts = tokens.filter(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid).length;
+        const session = getSessionSyncStatus();
+        const available = Boolean(getAuthToken()) || session.ok;
         res.json({
             watermark: FORGETMEAI_WATERMARK,
-            available: availableAccounts > 0,
+            available,
             model: CHAT_MEDIA_MODEL,
-            accounts: { total: tokens.length, available: availableAccounts },
-            message: availableAccounts > 0 ? 'Qwen Chat video generation is available' : 'No active Qwen Chat accounts'
+            message: available ? 'Qwen Chat video generation is available' : 'No active Qwen session'
         });
     });
 

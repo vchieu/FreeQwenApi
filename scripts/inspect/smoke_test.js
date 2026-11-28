@@ -31,7 +31,7 @@ async function main() {
   const models = await requestJson('/models');
   const modelIds = models.data.map(model => model.id);
 
-  console.log(`Accounts in status: ${status.accounts?.length ?? 0}`);
+  console.log(`Authenticated: ${status.authenticated ?? false}`);
   console.log(`Models: ${modelIds.length}`);
 
   if (!modelIds.includes(MODEL)) {

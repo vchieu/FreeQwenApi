@@ -6,10 +6,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { logInfo, logWarn } from '../logger/index.js';
+import { saveAuthToken, loadAuthToken } from '../browser/session.js';
 
 const SESSION_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', '..', 'session');
 const BAXIA_FILE = path.join(SESSION_DIR, 'baxia.json');
-const TOKENS_FILE = path.join(SESSION_DIR, 'tokens.json');
 
 // loadBaxiaHeaders() in chat.js drops these itself; never persist them here so
 // the on-disk session keeps only the WAF headers it actually replays.
@@ -26,14 +26,6 @@ function writeJsonAtomic(file, value) {
         // Some Windows filesystems refuse an atomic replace over an open file.
         fs.copyFileSync(tmp, file);
         fs.unlinkSync(tmp);
-    }
-}
-
-function decodeId(token) {
-    try {
-        return JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8')).id;
-    } catch {
-        return null;
     }
 }
 
@@ -93,35 +85,9 @@ function validatePayload(body) {
 }
 
 function updateTokenFile(token) {
-    let tokens = [];
-    try {
-        const parsed = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'));
-        if (Array.isArray(parsed)) tokens = parsed;
-    } catch {
-        // Create a minimal account entry if the file is missing or corrupt.
-    }
-
-    const accountId = decodeId(token);
-    const idx = tokens.findIndex(t =>
-        t?.token === token ||
-        (accountId && decodeId(t?.token || '') === accountId)
-    );
-    // An unknown account is appended; never overwrite another account's token.
-    let target = idx >= 0 ? idx : 0;
-    if (idx < 0 && accountId) {
-        const placeholder = tokens.findIndex(t => !decodeId(t?.token || ''));
-        target = placeholder >= 0 ? placeholder : tokens.length;
-    }
-    const existing = tokens[target] || {};
-    tokens[target] = {
-        ...existing,
-        id: existing.id || `acc_${Date.now()}`,
-        token,
-        invalid: false,
-        resetAt: null
-    };
-    writeJsonAtomic(TOKENS_FILE, tokens);
-    return tokens[target].id;
+    // Single-account mode: just save to session/auth_token.txt
+    saveAuthToken(token);
+    return 'browser';
 }
 
 export function applySessionSync(body) {
@@ -146,7 +112,7 @@ export function applySessionSync(body) {
 export function getSessionSyncStatus() {
     try {
         const baxia = JSON.parse(fs.readFileSync(BAXIA_FILE, 'utf8'));
-        const token = JSON.parse(fs.readFileSync(TOKENS_FILE, 'utf8'))?.[0]?.token || '';
+        const token = loadAuthToken() || '';
         const exp = token ? JSON.parse(Buffer.from(token.split('.')[1], 'base64url').toString('utf8')).exp : null;
         return {
             ok: true,

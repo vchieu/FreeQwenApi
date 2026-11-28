@@ -1,7 +1,7 @@
 import { getBrowserContext } from '../browser/browser.js';
 import { logInfo, logError } from '../logger/index.js';
 import { getAuthToken, extractAuthToken, pagePool, loadBaxiaHeaders, resolveAuthToken } from './chat.js';
-import { decodeTokenInfo } from './tokenManager.js';
+import { decodeTokenInfo } from './authRecovery.js';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';

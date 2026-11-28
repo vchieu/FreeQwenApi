@@ -1,7 +1,7 @@
 import { getBrowserContext, getAuthenticationStatus, ensureBrowserConnection } from '../browser/browser.js';
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
-import { saveAuthToken } from '../browser/session.js';
-import { getAvailableToken, markRateLimited, removeInvalidToken, markInvalid, markValidForToken, findAccountIdForToken, decodeTokenInfo, isTokenRateLimited, getEarliestResetMs } from './tokenManager.js';
+import { saveAuthToken, loadAuthToken } from '../browser/session.js';
+import { isQuotaLimitDelta, quotaLimitMessage } from './quotaLimit.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -20,7 +20,7 @@ import {
 import {
     CAPTCHA_NOTICE, detectCaptchaSignal, isCaptchaResponse, isChatInProgress,
     isProtocolTimeoutError, isNodeStreamTimeout, isVisibleBox, shouldRetryNetworkError,
-    formatRateLimitCooldown, applyRetryReasoningSuppression
+    applyRetryReasoningSuppression
 } from './resilience.js';
 import { sendDesktopNotification } from '../utils/notify.js';
 import crypto from 'crypto';
@@ -29,7 +29,7 @@ import {
     PAGE_TIMEOUT, RETRY_DELAY, PAGE_POOL_SIZE, USER_AGENT, NODE_STREAM_TIMEOUT_MS,
     DEFAULT_MODEL, MAX_RETRY_COUNT,
     TASK_POLL_MAX_ATTEMPTS, TASK_POLL_INTERVAL,
-    RATE_LIMIT_HOURS, CAPTCHA_POLL_INTERVAL_MS, CAPTCHA_WAIT_TIMEOUT_MS
+    CAPTCHA_POLL_INTERVAL_MS, CAPTCHA_WAIT_TIMEOUT_MS
 } from '../config.js';
 
 const __filename = fileURLToPath(import.meta.url);
@@ -41,81 +41,9 @@ const AUTH_KEYS_FILE = path.join(__dirname, '..', 'Authorization.txt');
 let authToken = null;
 let availableModels = null;
 let authKeys = null;
-let browserTokenRateLimited = false;
-const rateLimitedBrowserTokens = new Map(); // token -> resetTimestampMs
 
-function isBrowserTokenRateLimited(token) {
-    if (!token) return false;
-    const until = rateLimitedBrowserTokens.get(token);
-    if (!until) return false;
-    if (Date.now() >= until) {
-        rateLimitedBrowserTokens.delete(token);
-        if (rateLimitedBrowserTokens.size === 0) browserTokenRateLimited = false;
-        return false;
-    }
-    return true;
-}
 
-// Return the earliest reset timestamp (ms) across ALL browser-tab tokens that are
-// still rate-limited (mirrors getEarliestResetMs from tokenManager but for the
-// in-memory browser-token map). Returns 0 when no browser tokens are rate-limited.
-export function getEarliestBrowserTokenResetMs() {
-    let earliest = 0;
-    const now = Date.now();
-    for (const [tok, until] of rateLimitedBrowserTokens) {
-        if (until <= now) {
-            rateLimitedBrowserTokens.delete(tok);
-            continue;
-        }
-        if (earliest === 0 || until < earliest) earliest = until;
-    }
-    if (rateLimitedBrowserTokens.size === 0) browserTokenRateLimited = false;
-    return earliest;
-}
 
-export function getRateLimitCooldownError(now = Date.now()) {
-    const storedResetMs = getEarliestResetMs();
-    const browserResetMs = getEarliestBrowserTokenResetMs();
-    const resetMs = storedResetMs && browserResetMs
-        ? Math.min(storedResetMs, browserResetMs)
-        : (storedResetMs || browserResetMs);
-    return formatRateLimitCooldown(resetMs, now);
-}
-
-export function recordBrowserTokenRateLimit(token, resetUntilMs) {
-    if (token && resetUntilMs > Date.now()) {
-        rateLimitedBrowserTokens.set(token, resetUntilMs);
-        browserTokenRateLimited = true;
-    }
-}
-
-export function clearBrowserTokenRateLimits() {
-    rateLimitedBrowserTokens.clear();
-    browserTokenRateLimited = false;
-}
-
-function applyRateLimitForToken(tokenObj, errorBody) {
-    let hours = RATE_LIMIT_HOURS;
-    try {
-        const rateInfo = JSON.parse(errorBody);
-        // Absent or zero `num` means Qwen didn't state a duration — use a short
-        // 30-minute cooldown instead of locking out accounts for 24h.
-        const parsedNum = Number(rateInfo.num);
-        hours = (parsedNum > 0) ? parsedNum : 0.5;
-    } catch { /* errorBody might not be valid JSON */ }
-
-    if (tokenObj?.token) {
-        recordBrowserTokenRateLimit(tokenObj.token, Date.now() + hours * 3600 * 1000);
-    }
-    if (tokenObj?.id === 'browser') {
-        browserTokenRateLimited = true;
-        logWarn(`Browser token reached rate limit. Pausing for ${hours}h.`);
-    } else if (tokenObj?.id) {
-        markRateLimited(tokenObj.id, hours);
-        logWarn(`Token ${tokenObj.id} reached rate limit. Pausing for ${hours}h and trying another token...`);
-    }
-    return hours;
-}
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -741,8 +669,11 @@ async function recoverBrowserToken(browserContext, failedToken) {
     return forceFreshTokenByReload(browserContext, failedToken, 30_000);
 }
 
+// Single-account mode: the live Qwen tab is the source of truth. Take its
+// freshest token; if it is expiring, wait for the natural rotation. Only fall
+// back to the last saved token while it is still fresh, then to a full auth
+// check. There is no round-robin / stored-account pool any more.
 export async function resolveAuthToken(browserContext) {
-    const tokenObj = await getAvailableToken();
     let browserToken = await readTokenFromQwenTab(browserContext);
 
     if (browserToken && !tokenIsFresh(browserToken)) {
@@ -754,33 +685,18 @@ export async function resolveAuthToken(browserContext) {
         }
     }
 
-    const browserRateLimited = browserToken && (isTokenRateLimited(browserToken) || isBrowserTokenRateLimited(browserToken));
-    if (browserRateLimited) {
-        logWarn('Browser token is currently rate limited; checking next available account');
-    }
-
-    if (browserToken && !browserRateLimited) {
+    if (browserToken) {
         authToken = browserToken;
         saveAuthToken(browserToken);
-        // The tab may be logged into a different account than the round-robin
-        // pick: only ever update the account that actually owns this token.
-        markValidForToken(browserToken);
-        const ownerId = findAccountIdForToken(browserToken);
-        logInfo(`Using fresh browser token${ownerId ? ` for ${ownerId}` : ''}`);
-        return { id: ownerId || 'browser', token: browserToken, source: 'browser' };
+        logInfo('Using fresh browser token');
+        return { id: 'browser', token: browserToken, source: 'browser' };
     }
 
-    if (tokenObj && tokenObj.token) {
-        authToken = tokenObj.token;
-        logInfo(`Using account: ${tokenObj.id}`);
-        return tokenObj;
-    }
-
-    // Both browser token and round-robin token are unavailable or rate-limited.
-    // Only block here if there is truly nothing left to try.
-    if (browserTokenRateLimited && browserRateLimited) {
-        logWarn('Browser token is rate limited, skipping fallback');
-        return null;
+    const stored = loadAuthToken();
+    if (stored && tokenIsFresh(stored)) {
+        authToken = stored;
+        logInfo('Using saved auth token');
+        return { id: 'browser', token: stored, source: 'file' };
     }
 
     if (!getAuthenticationStatus()) {
@@ -794,11 +710,7 @@ export async function resolveAuthToken(browserContext) {
         authToken = await extractAuthToken(browserContext);
     }
 
-    if (authToken && (isTokenRateLimited(authToken) || isBrowserTokenRateLimited(authToken))) {
-        return null;
-    }
-
-    return authToken ? { id: findAccountIdForToken(authToken) || 'browser', token: authToken, source: 'browser' } : null;
+    return authToken ? { id: 'browser', token: authToken, source: 'browser' } : null;
 }
 
 function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType = 't2t', size = null, reasoningMode = null, hasDeclaredTools = false) {
@@ -894,6 +806,11 @@ function parseNonSseCompletionBody(body) {
             };
         }
 
+        const quotaDelta = parsed?.choices?.[0]?.delta || parsed?.choices?.[0]?.message;
+        if (isQuotaLimitDelta(quotaDelta)) {
+            return { success: false, status: 429, quotaLimited: true, errorBody: body };
+        }
+
         if (parsed.choices || parsed.id || (parsed.success === true && parsed.data)) {
             return { success: true, isTask: false, data: parsed };
         }
@@ -976,6 +893,10 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
 
         if (payload.stream === false) {
             const jsonResponse = await response.json();
+            const quotaDelta = jsonResponse?.choices?.[0]?.delta || jsonResponse?.choices?.[0]?.message;
+            if (isQuotaLimitDelta(quotaDelta)) {
+                return { success: false, status: 429, quotaLimited: true, errorBody: JSON.stringify(jsonResponse) };
+            }
             if (jsonResponse.code === 'RateLimited' || jsonResponse.error) {
                 return { success: false, status: 429, errorBody: JSON.stringify(jsonResponse) };
             }
@@ -1048,6 +969,16 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
 
                 if (chunk.choices && chunk.choices[0]) {
                     const delta = chunk.choices[0].delta || chunk.choices[0].message;
+                    // Qwen signals daily quota with HTTP 200 + extra.update_member.
+                    // Detect BEFORE forwarding any content so the quota notice is
+                    // never streamed to the client as an answer (gotcha #35).
+                    if (isQuotaLimitDelta(delta)) {
+                        const errBody = JSON.stringify(chunk);
+                        logWarn(`[quota-limit] model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'}`);
+                        streamError = { status: 429, quotaLimited: true, errorBody: errBody };
+                        finished = true;
+                        return;
+                    }
                     if (nativeAcc && delta?.function_call) {
                         collectNativeCall(nativeAcc, delta.function_call, allowedToolNames);
                     }
@@ -1211,24 +1142,14 @@ async function qwenCookieHeader(page) {
 }
 
 // Qwen web tokens live ~15 minutes; the page keeps refreshing them. Take the
-// freshest token straight from the tab before each request — ONLY when using
-// the browser account (never overwrite a rotated/round-robin account token!).
+// freshest token straight from the tab before each request.
 async function syncTokenFromPage(page, tokenObj = null) {
     try {
-        if (tokenObj && tokenObj.source !== 'browser' && tokenObj.id !== 'browser') {
-            return;
-        }
         const fresh = await readTokenFromQwenTab(getBrowserContext())
             || await page.evaluate(() => localStorage.getItem('token'));
         if (!fresh || fresh === authToken) return;
-        if (isTokenRateLimited(fresh) || isBrowserTokenRateLimited(fresh)) return;
-        if (tokenObj?.id && tokenObj.id !== 'browser') {
-            const ownerId = findAccountIdForToken(fresh);
-            if (ownerId && ownerId !== tokenObj.id) return;
-        }
         authToken = fresh;
         saveAuthToken(fresh);
-        markValidForToken(fresh);
         logInfo('Token updated from browser');
     } catch (e) {
         logWarn(`Failed to update token from browser: ${e.message}`);
@@ -1497,6 +1418,19 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                 return out;
             };
 
+            // Mirror src/api/quotaLimit.js inside the page context (no ES module
+            // imports available here). Qwen signals daily quota with HTTP 200 +
+            // extra.update_member, not a RateLimited code (gotcha #35).
+            const isQuotaDelta = (delta) => {
+                if (!delta) return false;
+                if (delta.extra && 'update_member' in delta.extra) return delta.extra.update_member === true;
+                const content = delta.content || '';
+                if (typeof content !== 'string') return false;
+                if (delta.status !== 'finished') return false;
+                if (content.length > 300) return false;
+                return /you'?ve reached today'?s .+ limit|upgrade your membership|switch to another model/i.test(content);
+            };
+
             const t = data.token;
             if (!t) return { success: false, error: 'Auth token not found' };
 
@@ -1524,6 +1458,10 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
             if (response.ok) {
                 if (data.payload.stream === false) {
                     const jsonResponse = await response.json();
+                    const quotaDelta = jsonResponse?.choices?.[0]?.delta || jsonResponse?.choices?.[0]?.message;
+                    if (isQuotaDelta(quotaDelta)) {
+                        return { success: false, status: 429, quotaLimited: true, errorBody: JSON.stringify(jsonResponse) };
+                    }
                     if (jsonResponse.code === 'RateLimited' || jsonResponse.error) {
                         return { success: false, status: 429, errorBody: JSON.stringify(jsonResponse) };
                     }
@@ -1555,6 +1493,10 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                             };
                         }
                         // Valid JSON completion response (sometimes Qwen returns this way)
+                        const quotaDelta = parsed?.choices?.[0]?.delta || parsed?.choices?.[0]?.message;
+                        if (isQuotaDelta(quotaDelta)) {
+                            return { success: false, status: 429, quotaLimited: true, errorBody: body };
+                        }
                         if (parsed.choices || parsed.id || (parsed.success === true && parsed.data)) {
                             return { success: true, isTask: false, data: parsed };
                         }
@@ -1609,6 +1551,11 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                         if (chunk.choices && chunk.choices[0]) {
                             const choice = chunk.choices[0];
                             const delta = choice.delta || choice.message;
+                            if (isQuotaDelta(delta)) {
+                                streamError = { status: 429, quotaLimited: true, errorBody: JSON.stringify(chunk) };
+                                finished = true;
+                                return;
+                            }
                             if (delta && delta.function_call) collectNative(delta.function_call);
                             if (delta && Array.isArray(delta.tool_calls)) {
                                 for (const tc of delta.tool_calls) {
@@ -1779,53 +1726,33 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
     }
 
     if (response.status === 401 || (response.errorBody && (response.errorBody.includes('Unauthorized') || response.errorBody.includes('Token has expired')))) {
-        logWarn(`Token ${tokenObj?.id} is invalid (401). Removing and trying another.`);
+        logWarn('Browser token rejected (401); attempting refresh.');
         if (response.errorBody) logWarn(`401 response body: ${String(response.errorBody).slice(0, 300)}`);
         authToken = null;
-        browserTokenRateLimited = false;
-        const isBrowserToken = tokenObj?.source === 'browser' || tokenObj?.id === 'browser';
-        if (tokenObj?.id && !isBrowserToken) {
-            const { markInvalid } = await import('./tokenManager.js');
-            markInvalid(tokenObj.id);
-        }
 
         // A browser token can be rejected simply because Qwen rotated it a
-        // second before our request. Do not burn the account in that case:
-        // wait for the rotation and retry the SAME chat once.
-        if (isBrowserToken && retryCount < MAX_RETRY_COUNT) {
+        // second before our request. Wait for the natural rotation, or force a
+        // reload of the proxy-owned tab, then retry the SAME chat.
+        if (retryCount < MAX_RETRY_COUNT) {
             const fresh = await recoverBrowserToken(getBrowserContext(), tokenObj?.token);
             if (fresh) {
                 authToken = fresh;
                 saveAuthToken(fresh);
-                markValidForToken(fresh);
                 logInfo('Retrying with freshly rotated browser token');
                 return sendMessage(message, model, chatId, parentId, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, retryOpts);
             }
         }
-
-        const { hasValidTokens } = await import('./tokenManager.js');
-        if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-            // chatId/parentId are reset: when switching accounts the old chat
-            // belongs to the previous token and under the new one "does not exist".
-            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, { ...retryOpts, tokenObj: null });
-        }
-        logError('No valid tokens left or retries exhausted.');
-        return { error: 'All tokens are invalid (401). Re-authentication required.', chatId };
+        logError('No fresh token available; re-authentication required.');
+        return { error: 'Qwen session expired (401). Please log in again in the Chrome window.', status: 401, chatId };
     }
 
-    if (response.status === 429 || (response.errorBody && response.errorBody.includes('RateLimited'))) {
-        const hours = applyRateLimitForToken(tokenObj, response.errorBody);
-
-        authToken = null;
-        const { hasValidTokens } = await import('./tokenManager.js');
-        // Never replay an answer the client has partially received.
-        if (hasValidTokens() && retryCount < MAX_RETRY_COUNT && response.hasStreamedChunks !== true) {
-            // chatId/parentId are reset: when switching accounts the old chat
-            // belongs to the previous token and under the new one "does not exist".
-            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, { ...retryOpts, tokenObj: null });
+    // Quota / rate limit is terminal in single-account mode: no rotation, no
+    // retry. Surface a clean 429 so the client stops and keeps history clean.
+    if (response.quotaLimited || response.status === 429) {
+        if (response.quotaLimited) {
+            return { error: quotaLimitMessage(model), status: 429, quotaLimited: true, chatId };
         }
-        const cooldownMsg = getRateLimitCooldownError() || `All tokens are rate limited (${hours}h)`;
-        return { error: cooldownMsg, status: 429, chatId };
+        return { error: 'Qwen rate limit reached. Please wait before retrying.', status: 429, chatId };
     }
 
     let errorMessage = response.error || response.statusText;
@@ -1872,18 +1799,11 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     if (!browserContext) return { error: 'Browser is not initialized', chatId };
     if (options.signal?.aborted) return { error: 'Client disconnected', aborted: true, chatId };
 
-    // Resolve account ONCE: with the same token create the chat and
-    // send the message - otherwise round-robin picks different
-    // accounts and Qwen returns "chat is not exist".
+    // Resolve the token ONCE: the same token must create the chat and send the
+    // message, otherwise Qwen returns "chat is not exist".
     const tokenObj = options.tokenObj || await resolveAuthToken(browserContext);
     if (!tokenObj) {
-        // All accounts are unavailable: construct a helpful error with cooldown info
-        // across both stored accounts and browser-tab tokens.
-        const cooldownMsg = getRateLimitCooldownError();
-        if (cooldownMsg) {
-            return { error: cooldownMsg, status: 429, chatId };
-        }
-        return { error: 'Auth error: failed to get token', chatId };
+        return { error: 'Auth error: failed to get token. Make sure the Qwen tab is logged in.', chatId };
     }
     if (tokenObj.token) authToken = tokenObj.token;
 
@@ -2248,32 +2168,16 @@ export function getAuthToken() {
     return authToken;
 }
 
-// Recover from a 401 while creating a chat: first wait for the rotated token
-// in the live Qwen tab, then fall back to another stored account.
+// Recover from a 401 while creating a chat: wait for the rotated token
+// in the live Qwen tab, or force a refresh by reloading the proxy-owned tab.
 // Returns the token object to use for the retry, or null when nothing is left.
 async function refreshTokenAfter401(browserContext, failedToken, tokenObj) {
-    browserTokenRateLimited = false;
-
     const fresh = await recoverBrowserToken(browserContext, failedToken || null);
     if (fresh) {
         authToken = fresh;
         saveAuthToken(fresh);
-        markValidForToken(fresh);
         logInfo('Refreshed browser token after chat-creation 401');
-        return { ...(tokenObj || {}), id: tokenObj?.id || 'browser', token: fresh, source: 'browser' };
-    }
-
-    if (tokenObj?.id && tokenObj.source !== 'browser' && tokenObj.id !== 'browser') {
-        markInvalid(tokenObj.id);
-        logWarn(`Token ${tokenObj.id} invalid (401) during chat creation; trying another account.`);
-    }
-
-    authToken = null;
-    const next = await getAvailableToken();
-    if (next?.token && next.token !== failedToken) {
-        authToken = next.token;
-        logInfo(`Switching to account ${next.id} after chat-creation 401`);
-        return next;
+        return { ...(tokenObj || {}), id: 'browser', token: fresh, source: 'browser' };
     }
     return null;
 }
@@ -2293,13 +2197,11 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
     const browserContext = getBrowserContext();
     if (!browserContext) return { error: 'Browser is not initialized' };
 
-    // tokenObj may come from sendMessage - then chat creation and sending
-    // go under the SAME account (otherwise round-robin creates chat on one
-    // account, and message is sent under another - "chat is not exist").
-    if (!tokenObj) tokenObj = await getAvailableToken();
+    // Single-account mode: always use browser tab token.
+    if (!tokenObj) tokenObj = await resolveAuthToken(browserContext);
     if (tokenObj?.token) {
         authToken = tokenObj.token;
-        logInfo(`Using account for chat creation: ${tokenObj.id}`);
+        logInfo('Using browser tab token for chat creation');
     }
 
     if (!authToken) {
@@ -2367,20 +2269,9 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
             return createChatV2(model, title, retryCount + 1, chatType, tokenObj, true, true);
         }
 
-        if (result.status === 429 || (result.errorBody && result.errorBody.includes('RateLimited'))) {
-            const hours = applyRateLimitForToken(tokenObj, result.errorBody);
-            authToken = null;
-            const { hasValidTokens } = await import('./tokenManager.js');
-            if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-                // Same selection as sendMessage: skips rate-limited tabs and waits for
-                // an expiring tab token. No usable account => report the cooldown.
-                const next = await resolveAuthToken(browserContext);
-                if (next?.token && next.token !== requestToken) {
-                    return createChatV2(model, title, retryCount + 1, chatType, adoptToken(tokenObj, next), true, authRetried);
-                }
-            }
-            const cooldownMsg = getRateLimitCooldownError() || `All tokens are rate limited (${hours}h)`;
-            return { error: cooldownMsg, status: 429 };
+        // Quota limit is terminal — do not retry
+        if (result.quotaLimited) {
+            return { error: quotaLimitMessage(model), status: 429, quotaLimited: true };
         }
 
         const isTransient = result.status >= 500 && result.status < 600;
@@ -2417,48 +2308,4 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
     }
 }
 
-// --- testToken -------------------------------------------------------------
 
-export async function testToken(token) {
-    const browserContext = getBrowserContext();
-    if (!browserContext) return 'ERROR';
-
-    let page;
-    let shouldClosePage = false;
-    try {
-        page = await getPage(browserContext);
-        shouldClosePage = page !== browserContext;
-        await page.goto(CHAT_PAGE_URL, { waitUntil: 'domcontentloaded' });
-
-        const requestBody = {
-            apiUrl: CHAT_API_URL,
-            token,
-            payload: { chat_type: 't2t', messages: [{ role: 'user', content: 'ping', chat_type: 't2t' }], model: DEFAULT_MODEL, stream: false }
-        };
-
-        const result = await page.evaluate(async (data) => {
-            try {
-                const res = await fetch(data.apiUrl, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${data.token}` },
-                    body: JSON.stringify(data.payload)
-                });
-                return { ok: res.ok, status: res.status };
-            } catch (e) {
-                return { ok: false, status: 0, error: e.toString() };
-            }
-        }, requestBody);
-
-        if (result.ok || result.status === 400) return 'OK';
-        if (result.status === 401 || result.status === 403) return 'UNAUTHORIZED';
-        if (result.status === 429) return 'RATELIMIT';
-        return 'ERROR';
-    } catch (e) {
-        logError('testToken error', e);
-        return 'ERROR';
-    } finally {
-        if (page) {
-            try { if (shouldClosePage) await page.close(); } catch { }
-        }
-    }
-}

@@ -5,6 +5,9 @@ Proxy Qwen Chat (chat.qwen.ai) → API tương thích OpenAI. Chạy qua **Chrom
 bắt token và Baxia WAF headers từ traffic UI thật đẩy về `/api/session/sync`, không cần cài browser extension.
 Cung cấp API OpenAI-compatible tại port mặc định 3264 (`http://localhost:3264/api` hoặc `/api/v1/*`).
 
+**Single-account mode**: Proxy chỉ dùng 1 tài khoản Qwen từ tab Chrome đang mở. Token tự động refresh
+mỗi ~15 phút qua observer. Không có multi-account rotation hay dashboard.
+
 File này mô tả **cấu trúc, luồng hoạt động và trạng thái hiện tại của codebase**.
 Dành cho AI agents đọc để nhanh chóng nắm bắt source code và tránh lặp lại các lỗi đã fix.
 
@@ -23,8 +26,7 @@ Các lệnh tiện ích khác:
 
 | Lệnh | Mục đích |
 | --- | --- |
-| `npm start` | Chạy proxy tương tác thông thường (menu chọn/thêm account) |
-| `npm run auth` | Thêm, liệt kê, đăng nhập lại hoặc xoá tài khoản Qwen (`scripts/core/auth.js`) |
+| `npm start` | Chạy proxy thông thường (single-account mode) |
 | `npm run models:sync` | Đồng bộ danh sách model từ Qwen về `src/AvailableModels.txt` |
 | `npm run smoke` | Chạy smoke test API (`scripts/inspect/smoke_test.js`) |
 
@@ -32,10 +34,10 @@ Kiểm tra cú pháp & kiểm tra offline (không cần browser, không cần ne
 
 ```bash
 # Cú pháp (Windows CMD)
-node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/resilience.js && node --check src/utils/notify.js && node --check src/api/fileUpload.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node --check src/api/authRecovery.js
+node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/resilience.js && node --check src/utils/notify.js && node --check src/api/fileUpload.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node --check src/api/authRecovery.js && node --check src/api/quotaLimit.js && node --check src/api/sessionSync.js
 
 # Hoặc PowerShell
-node --check index.js; node --check src/api/chat.js; node --check src/api/routes.js; node --check src/api/resilience.js; node --check src/utils/notify.js; node --check src/api/fileUpload.js; node --check src/api/reasoning.js; node --check src/api/toolCalls.js; node --check src/api/authRecovery.js
+node --check index.js; node --check src/api/chat.js; node --check src/api/routes.js; node --check src/api/resilience.js; node --check src/utils/notify.js; node --check src/api/fileUpload.js; node --check src/api/reasoning.js; node --check src/api/toolCalls.js; node --check src/api/authRecovery.js; node --check src/api/quotaLimit.js; node --check src/api/sessionSync.js
 
 # Chạy bộ verify offline
 node scripts/core/verify-parser.mjs            # Kiểm tra parser SSE câu trả lời
@@ -44,6 +46,7 @@ node scripts/core/verify-tools.mjs             # Kiểm tra parser tool_calls, f
 node scripts/core/verify-auth-retry.mjs        # Kiểm tra nhận diện 401, chọn token xoay, chọn tab proxy-owned
 node scripts/core/verify-images.mjs            # Kiểm tra tách/chỉ upload ảnh lượt hiện tại
 node scripts/core/verify-resilience.mjs        # Kiểm tra retry network error, phát hiện captcha, lệnh notification
+node scripts/core/verify-quota.mjs             # Kiểm tra nhận diện quota limit (extra.update_member: true)
 ```
 
 Kiểm tra trực tiếp endpoint khi proxy đang chạy:
@@ -69,8 +72,8 @@ curl -X POST http://127.0.0.1:3264/api/chat/completions \
 | `src/api/resilience.js` | Pure module: phân loại lỗi mạng có thể retry, nhận diện tín hiệu captcha (WAF `_____tmd_____`, slider `nc_1_nocaptcha`, title `Verification`), text thông báo | Sửa retry network error, phát hiện/handle captcha |
 | `src/utils/notify.js` | Fire-and-forget desktop alert (Windows MessageBox, macOS `osascript`, Linux `notify-send`); `notificationCommand()` pure để test | Sửa cách notify user khi cần giải captcha |
 | `src/api/reasoning.js` | Pure module: map `reasoning_effort` → Qwen `feature_config`, accumulator stream thinking | Chỉnh chế độ suy nghĩ (Fast/Auto/Thinking), xử lý stream suy nghĩ |
-| `src/api/sessionSync.js` | Nhận & validate token/Baxia headers từ CDP observer; ghi file atomic `baxia.json`, update `tokens.json` | Cập nhật WAF headers, logic lọc header, lưu trữ token tự động |
-| `src/api/tokenManager.js` | Quản lý danh sách tài khoản, trạng thái rate-limit, đánh dấu invalid / phục hồi | Đọc/ghi `session/tokens.json`, giải mã JWT, xoay vòng tài khoản |
+| `src/api/sessionSync.js` | Nhận & validate token/Baxia headers từ CDP observer; ghi file atomic `baxia.json`, lưu token vào `auth_token.txt` | Cập nhật WAF headers, logic lọc header, lưu trữ token tự động |
+| `src/api/quotaLimit.js` | Pure module: nhận diện quota limit (`extra.update_member: true`), tạo thông báo lỗi | Xử lý khi account hit daily quota |
 | `src/api/modelMapping.js` | Chuẩn hoá tên model, resolve alias/custom model về canonical Qwen model | Thêm alias model, map model từ client bên thứ ba |
 | `src/api/fileUpload.js` | Upload file lên OSS của Qwen qua STS token; `collectImageParts()` / `prepareOpenAIImages()` chuyển ảnh OpenAI thành `messages[].files` | Upload file đính kèm, tài liệu, hình ảnh, xử lý ảnh OpenAI `image_url` |
 | `src/api/imageGeneration.js` | Sinh ảnh qua Qwen Chat (`chatType: t2i`) hoặc DashScope | Sửa prompt sinh ảnh, đổi tỷ lệ khung hình |
@@ -81,8 +84,8 @@ curl -X POST http://127.0.0.1:3264/api/chat/completions \
 | `src/config.js` | Điểm tập trung đọc biến môi trường và fallback default constants | Xem default timeout, kích thước pool, port, URL endpoints |
 | `src/env.js` | Autoload file `.env` trước khi khởi chạy các module khác | Nạp biến môi trường |
 | `scripts/core/start-cdp.mjs` | Script launcher mở Chrome có CDP port 9222 và chạy proxy | Chỉnh tham số khởi động Chrome, profile dir |
-| `scripts/core/verify-*.mjs` | Bộ 6 script test offline (parser, reasoning, tools, images, auth-retry, resilience) | Kiểm tra regression logic cốt lõi mà không cần mở trình duyệt |
-| `session/` | Thư mục runtime gitignored (`baxia.json`, `tokens.json`, `history/`) | Xem trạng thái token, header WAF thực tế |
+| `scripts/core/verify-*.mjs` | Bộ 7 script test offline (parser, reasoning, tools, images, auth-retry, resilience, quota) | Kiểm tra regression logic cốt lõi mà không cần mở trình duyệt |
+| `session/` | Thư mục runtime gitignored (`baxia.json`, `auth_token.txt`, `history/`) | Xem trạng thái token, header WAF thực tế |
 
 ### Luồng xử lý chat completion
 `POST /api/chat/completions` (hoặc `/v1/chat/completions`):
@@ -145,12 +148,12 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 - Bắt token và cặp WAF headers (`bx-umidtoken`, `bx-ua`), sau đó gửi POST tới `/api/session/sync` của proxy.
 - `src/api/sessionSync.js` xác thực JWT, kiểm tra headers, và ghi nguyên tử (`writeJsonAtomic`) vào `session/baxia.json` và cập nhật `session/tokens.json`. Không cần can thiệp thủ công hay extension.
 
-### 3. Token Management & Rotation
-- Qwen sử dụng token ngắn hạn trong trình duyệt (`localStorage.getItem('token')`).
-- File `session/tokens.json` có thể chứa token dài hạn cũ hoặc đã hết hạn. Hàm `readTokenFromQwenTab()` luôn ưu tiên đọc token sống trực tiếp từ tab Chrome (tuỳ chọn `includeOwned` để đọc cả tab proxy-owned sau khi ép refresh).
-- Bỏ qua các token JWT có thời gian hết hạn dưới 30 giây và không bao giờ retry lại đúng token vừa bị từ chối (`isUsableRefreshedToken()`).
-- Khi gặp lỗi `401 Unauthorized` với browser token: chờ ngắn token xoay tự nhiên, nếu không có thì `recoverBrowserToken()` reload **tab do proxy sở hữu** (`pickProxyOwnedQwenPage()`, không đụng tab người dùng) sau khi xoá `token` trong `localStorage` để ép SPA cấp token mới, rồi retry (tối đa `MAX_RETRY_COUNT`) trước khi đánh dấu tài khoản invalid. Dùng chung cho 401 lúc tạo chat và lúc gửi message.
-- `markValidForToken()` phục hồi cờ invalid dựa trên decoded payload ID.
+### 3. Token Management (Single Account)
+- Qwen sử dụng token ngắn hạn trong trình duyệt (`localStorage.getItem('token')`), sống ~15 phút.
+- Proxy chỉ dùng **1 tài khoản duy nhất** từ tab Chrome đang mở. Token được observer tự động sync về `session/auth_token.txt`.
+- Hàm `readTokenFromQwenTab()` đọc token sống trực tiếp từ tab Chrome. Nếu token sắp hết hạn (<30s), tự động chờ xoay tự nhiên hoặc force reload tab proxy-owned để ép SPA cấp token mới.
+- Khi gặp lỗi `401 Unauthorized`: `recoverBrowserToken()` reload **tab do proxy sở hữu** (`pickProxyOwnedQwenPage()`, không đụng tab người dùng) sau khi xoá `token` trong `localStorage` để ép SPA cấp token mới, rồi retry (tối đa `MAX_RETRY_COUNT`). Dùng chung cho 401 lúc tạo chat và lúc gửi message.
+- **Không có multi-account rotation hay dashboard**. Token tự động refresh mỗi ~15 phút qua observer.
 
 ### 4. WAF / Baxia & Request ID
 - Replay chính xác header set mà `loadBaxiaHeaders()` chuẩn bị từ `session/baxia.json`.
@@ -236,6 +239,8 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 32. **`parseLenientJson` phải đánh dấu khi dùng `escapeInvalidBackslashesInStrings` (R9)**: Hàm này double-escape backslash để fix Windows path, nhưng JSON.parse sau đó giải mã `\\n` → newline, `\\t` → tab, `\\b` → backspace — hỏng `content`/`command` mà không báo lỗi. Fix: đánh dấu kết quả với Symbol `SLASH_REPAIR_SYM`. `addNormalizedCalls` kiểm tra — nếu có param nào **không** nằm trong `PATH_PARAM_KEYS` thì drop call và retry. Test: `verify-tools.mjs` "Fix 1 (R9)".
 33. **Fence ` ```json ` chứa JSON hỏng có chữ ký tool call phải đặt `ctx.stopped` (R9)**: Block ` ```json ` bị `collectJsonObjects` extract được một phần dù JSON tổng thể không hợp lệ; nếu `rawBlock` fail `JSON.parse` **và** chứa cả `"name"` lẫn `"arguments"` → đánh dấu malformed và thêm vào `validBlocks`. Nhánh xử lý malformed trong vòng lặp sẽ set `ctx.stopped = true` ngăn fence kế tiếp (ví dụ `sh deploy.sh`) chạy. Block ` ```json ` không có `"arguments"` (config thường) không bị ảnh hưởng. Test: `verify-tools.mjs` "Fix 2 (R9)".
 34. **Chống lặp thinking ở cả `catch` timeout và retry lỗi mạng + không bỏ âm thầm ảnh gửi lại (`fullReasoning` / `fileUpload.js`)**: `executeApiRequestWithNodeStreaming()` khai báo `fullReasoning` **ngoài `try`** để nhánh `catch` không bị `ReferenceError` khi lỗi sớm và luôn trả `hasStreamedReasoning: fullReasoning.length > 0`; `handleApiError()` dùng `applyRetryReasoningSuppression()` để tắt `onReasoning` ở cả retry timeout lẫn network error. Ở `collectImageParts()`, khi ảnh lỗi trong history bị gửi lại ở lượt hiện tại với `includeHistory: true`, ownership được chuyển sang `currentMessage` thay vì splice bỏ âm thầm, để `prepareOpenAIImages()` giữ placeholder `[image upload failed]` và báo lỗi lượt hiện tại đúng chuẩn. Test regression: `verify-resilience.mjs`, `verify-images.mjs`, `verify-audit-fixes.mjs`.
+
+35. **Quota limit = HTTP 200 + `extra.update_member: true`, KHÔNG PHẢI `code: 'RateLimited'`**: Qwen web API không trả về HTTP 429 hay `code: 'RateLimited'` khi account hit daily quota. Thay vào đó nó trả về response thành công HTTP 200 với `choices[0].delta.extra.update_member === true` và content "You've reached today's Qwen4-Max limit...". Proxy detect pattern này qua `isQuotaLimitDelta()` trong `src/api/quotaLimit.js`, trả error terminal (không retry, không rotation) với `status: 429, quotaLimited: true`. Stream error dùng SSE `error` field + `proxy_notice`, **không inject vào `delta.content`** để history sạch. Test regression: `verify-quota.mjs`.
 
 ## Quy ước code & test
 

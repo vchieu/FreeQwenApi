@@ -12,7 +12,6 @@ import {
     isNodeStreamTimeout,
     isVisibleBox,
     nonStreamErrorBody,
-    formatRateLimitCooldown,
     applyRetryReasoningSuppression
 } from '../../src/api/resilience.js';
 import { notificationCommand } from '../../src/utils/notify.js';
@@ -142,10 +141,7 @@ check('unsupported platform is a no-op', () => {
 
 console.log('Node stream early failure:');
 const {
-    executeApiRequestWithNodeStreaming,
-    recordBrowserTokenRateLimit,
-    getRateLimitCooldownError,
-    clearBrowserTokenRateLimits
+    executeApiRequestWithNodeStreaming
 } = await import('../../src/api/chat.js');
 const savedFetch = globalThis.fetch;
 let earlyFailure;
@@ -213,19 +209,7 @@ check('nonStreamErrorBody propagates 429 status instead of defaulting to 500', (
     assert.equal(fallback.status, 500);
 });
 
-check('tab-only browser token 429 cooldown is reported instead of Auth error', () => {
-    clearBrowserTokenRateLimits();
-    try {
-        recordBrowserTokenRateLimit('browser-only-jwt', Date.now() + 30 * 60 * 1000);
-        const msg = getRateLimitCooldownError();
-        assert.ok(msg && /Rate limited:/i.test(msg), `expected Rate limited cooldown message, got: ${msg}`);
-        assert.equal(formatRateLimitCooldown(Date.now() - 1000), null);
-    } finally {
-        clearBrowserTokenRateLimits();
-    }
-});
-
-const TOTAL = 7 + 8 + 2 + 3 + 2 + 5 + 1 + 3;
+const TOTAL = 7 + 8 + 2 + 3 + 2 + 5 + 1 + 2;
 console.log(`\nchecks: ${checks}`);
 console.log(checks === TOTAL ? 'PASS' : `FAIL (expected ${TOTAL} checks, got ${checks})`);
 process.exit(checks === TOTAL ? 0 : 1);

@@ -47,3 +47,19 @@ export function pickProxyOwnedQwenPage(pages = [], basePage = null, pooledPages 
     // Prefer a disposable pooled tab; fall back to the base tab from initBrowser.
     return owned.find(page => pooled.has(page)) || owned.find(page => page === basePage) || null;
 }
+
+// Decode the Qwen JWT payload (no signature verification) for the account id
+// and expiry. `exp` is returned in milliseconds so callers can compare it
+// directly against Date.now(). Moved here from the removed tokenManager so
+// fileUpload.js / chat.js keep a single pure source for token introspection.
+export function decodeTokenInfo(token) {
+    try {
+        const payload = JSON.parse(Buffer.from(String(token).split('.')[1], 'base64url').toString('utf8'));
+        return {
+            accountId: payload.id ?? null,
+            exp: payload.exp ? payload.exp * 1000 : null
+        };
+    } catch {
+        return { accountId: null, exp: null };
+    }
+}

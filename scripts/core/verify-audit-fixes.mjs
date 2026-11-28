@@ -1,12 +1,11 @@
 // Offline checks for audit fixes: usage normalization, model mapping coverage,
-// tokenManager rate-limit preservation, and truncated SSE stream detection.
+// and truncated SSE stream detection.
 // Also covers R-series regression fixes: R1 (nudge), R3 (429), R4 (history image), R9 (file:// URL).
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { normalizeUsage } from '../../src/api/usage.js';
 import { resolveRequestedModel } from '../../src/api/modelMapping.js';
 import { executeApiRequestWithNodeStreaming } from '../../src/api/chat.js';
-import { loadTokens, saveTokens, markRateLimited, markValidForToken, isTokenRateLimited } from '../../src/api/tokenManager.js';
 import { attachmentSourceToBuffer, prepareOpenAIImages } from '../../src/api/fileUpload.js';
 
 let checks = 0;
@@ -112,32 +111,6 @@ console.log('Stream premature EOF detection:');
         assert.equal(res.success, true);
         assert.equal(res.data.choices[0].message.content, 'hello');
     });
-}
-
-console.log('TokenManager rate-limit preservation:');
-{
-    const tokensFileExisted = fs.existsSync('session/tokens.json');
-    const backup = tokensFileExisted ? fs.readFileSync('session/tokens.json', 'utf8') : null;
-    const makeJwt = (id) => {
-        const h = Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })).toString('base64url');
-        const p = Buffer.from(JSON.stringify({ id, exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url');
-        return `${h}.${p}.sig`;
-    };
-    const tok1 = makeJwt('user_a');
-    try {
-        saveTokens([{ id: 'acc_test1', token: tok1, resetAt: null, invalid: false }]);
-        markRateLimited('acc_test1', 2);
-        assert.equal(isTokenRateLimited(tok1), true);
-        markValidForToken(tok1);
-        check('markValidForToken does not clear active resetAt rate limit', () => {
-            assert.equal(isTokenRateLimited(tok1), true);
-            const loaded = loadTokens();
-            assert.ok(loaded[0].resetAt);
-        });
-    } finally {
-        if (tokensFileExisted) fs.writeFileSync('session/tokens.json', backup, 'utf8');
-        else if (fs.existsSync('session/tokens.json')) fs.unlinkSync('session/tokens.json');
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -332,7 +305,7 @@ await checkAsync('R4: history 404 image with includeHistory:true does not error 
     }
 });
 
-const TOTAL_NEW = 6 + 2 + 1 + 3 + 1 + 1; // +1 R4 history 404 check
+const TOTAL_NEW = 2 + 1 + 2 + 2 + 1 + 4 + 1; // usage, models, EOF, R3, R3b, R9, R4
 console.log(`\nchecks: ${checks}`);
 console.log(checks === TOTAL_NEW ? 'PASS' : `FAIL (expected ${TOTAL_NEW}, got ${checks})`);
 process.exit(checks === TOTAL_NEW ? 0 : 1);
