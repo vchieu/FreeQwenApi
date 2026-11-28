@@ -8,12 +8,14 @@ This fork is prepared for a practical scenario for videos and demonstrations:
 - local OpenAI-compatible endpoint for SDK, Hermes Agent, Open WebUI and LiteLLM;
 - quick smoke test to check if the proxy is alive before recording.
 
-## 1. Authorize Once
+## 1. Install
 
 ```bash
 npm install
-npm run auth
+npm run start:cdp
 ```
+
+Log in to Qwen Chat in the Chrome window that opens. The CDP observer will capture the token automatically.
 
 Do not publish `session/`, cookies, and token files.
 
@@ -29,13 +31,7 @@ The command reads public prerendered model metadata from `https://chat.qwen.ai/`
 docs/QWEN_CHAT_MODELS.md
 ```
 
-## 3. Start the Endpoint
-
-```bash
-SKIP_ACCOUNT_MENU=true npm start
-```
-
-Endpoint:
+## 3. Endpoint
 
 ```text
 http://localhost:3264/api

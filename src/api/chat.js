@@ -2186,15 +2186,6 @@ async function refreshTokenAfter401(browserContext, failedToken, tokenObj) {
     return null;
 }
 
-// Switch the caller's token object to another account in place: sendMessage keeps
-// this reference for error attribution. Every old field is dropped, so a previous
-// `source: 'browser'` cannot stick to a stored account.
-function adoptToken(target, next) {
-    if (!target || target === next) return next;
-    for (const key of Object.keys(target)) delete target[key];
-    return Object.assign(target, next);
-}
-
 // --- createChatV2 ----------------------------------------------------------
 
 export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', retryCount = 0, chatType = 't2t', tokenObj = null, skipPageTokenSync = false, authRetried = false) {
@@ -2256,7 +2247,7 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
         if (isUnauthorizedResult(result)) {
             logWarn(`Chat creation unauthorized (401), attempt ${retryCount + 1}`);
             if (result.errorBody) logWarn(`401 response body: ${String(result.errorBody).slice(0, 300)}`);
-            const unauthorizedError = { error: 'All tokens are invalid (401). Re-authentication required.', status: 401, unauthorized: true };
+            const unauthorizedError = { error: 'Qwen session expired (401). Re-authenticate in the Chrome tab.', status: 401, unauthorized: true };
             if (retryCount >= MAX_RETRY_COUNT) {
                 logError('Chat creation 401 retries exhausted.');
                 return unauthorizedError;

@@ -125,20 +125,6 @@ export function nonStreamErrorBody(result = {}) {
     };
 }
 
-/**
- * Format a 429 cooldown message from the earliest reset timestamp (ms).
- * Returns null if no active rate-limit timestamp is in the future.
- */
-export function formatRateLimitCooldown(resetMs, now = Date.now()) {
-    if (!resetMs || resetMs <= now) return null;
-    const remainMs = resetMs - now;
-    const total = Math.ceil(remainMs / 60000);
-    const h = Math.floor(total / 60);
-    const m = total % 60;
-    const cooldown = h > 0 ? `${h}h ${m}m` : `${m}m`;
-    return `Rate limited: all accounts are on cooldown. Earliest reset in ${cooldown}.`;
-}
-
 /** Suppress onReasoning on retries after reasoning chunks have already streamed. */
 export function applyRetryReasoningSuppression(options = {}, response = {}) {
     return response?.hasStreamedReasoning ? { ...options, onReasoning: null } : options;

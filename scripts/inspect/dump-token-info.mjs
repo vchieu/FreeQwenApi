@@ -8,8 +8,13 @@ function decode(token) {
     } catch (e) { return { error: e.message }; }
 }
 
-const stored = JSON.parse(fs.readFileSync('session/tokens.json', 'utf8'));
-console.log('STORED:', stored.map(t => ({ id: t.id, invalid: t.invalid, ...decode(t.token) })));
+const storedPath = 'session/auth_token.txt';
+if (fs.existsSync(storedPath)) {
+    const t = fs.readFileSync(storedPath, 'utf8').trim();
+    console.log('STORED auth_token.txt:', t ? decode(t) : '(empty)');
+} else {
+    console.log('STORED auth_token.txt: (missing)');
+}
 
 const browser = await puppeteer.connect({ browserURL: 'http://127.0.0.1:9222' });
 const page = (await browser.pages()).find(p => p.url().includes('chat.qwen.ai'));

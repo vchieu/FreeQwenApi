@@ -24,7 +24,7 @@ This is **not a local model running on your GPU** and **not the official Alibaba
 - **Current Qwen Chat models**: `qwen3.7-max`, `qwen3.7-plus`, `qwen3.6-plus` and other models from `src/AvailableModels.txt`.
 - **Image generation via Qwen Chat**: `POST /api/images/generations` without `DASHSCOPE_API_KEY`.
 - **Video generation via Qwen Chat**: `POST /api/videos/generations` + task polling via `GET /api/tasks/status/:taskId`.
-- **Multi-account**: add, re-login, remove, check `OK` / `WAIT` / `INVALID` status, automatic round-robin rotation on rate limits.
+- **Single-account with auto-refresh**: a CDP observer captures fresh tokens from the logged-in Qwen tab every ~15 minutes; no manual re-login needed.
 - **File uploads**: upload endpoint for Qwen files and attachments.
 - **Open WebUI**: can connect as OpenAI-compatible backend.
 - **Hermes Agent / LiteLLM / Claude Code**: ready configs for local AI agents.
@@ -42,7 +42,7 @@ npm install
 npm run start:cdp
 ```
 
-`start:cdp` opens (or reuses) a dedicated Chrome window with a persistent Qwen login and starts the proxy non-interactively — there is no account menu in this mode. On the first run, log in to Qwen Chat in that window, then retry the request. Plain `npm start` still shows the interactive account menu.
+`start:cdp` opens (or reuses) a dedicated Chrome window with a persistent Qwen login and starts the proxy. On the first run, log in to Qwen Chat in that window, then retry the request.
 
 While the proxy runs, a CDP observer watches the logged-in Qwen tab and pushes each fresh token/Baxia capture to `session/`. Sending any message in the Qwen UI keeps the session current; `GET /api/session/sync` reports the last capture. This is fully automatic — no browser extension or manual setup is needed.
 
@@ -73,30 +73,14 @@ Or via `environment:` block in `docker-compose.yml` / `-e` flags with `docker ru
 
 ## Qwen Chat authorization
 
-Add account:
-
-```bash
-npm run auth
-```
-
-Or specific action:
-
-```bash
-npm run auth -- --add
-npm run auth -- --list
-npm run auth -- --relogin
-npm run auth -- --remove
-```
-
-When adding an account, Chromium opens. Log in to Qwen Chat, then return to terminal — token will be saved in `session/`.
+Run `npm run start:cdp` and log in to Qwen Chat in the Chrome window that opens. The CDP observer captures the token automatically and refreshes it every ~15 minutes — no manual setup.
 
 **Do not commit or publish these files:**
 
 - `session/`
-- `session/tokens.json`
-- `session/accounts/**/token.txt`
+- `session/auth_token.txt`
+- `session/baxia.json`
 - `.env`
-- `Authorization.txt`
 - cookies / browser profile / real tokens
 
 ## Main endpoints
@@ -334,14 +318,6 @@ Ready example: [examples/litellm/qwen_litellm.yaml](examples/litellm/qwen_litell
 
 ## Docker
 
-First add account locally, because inside the container there's no GUI for login:
-
-```bash
-npm run auth
-```
-
-Then:
-
 ```bash
 docker compose up --build -d
 ```
@@ -353,7 +329,6 @@ services:
   qwen-proxy:
     build: .
     environment:
-      - SKIP_ACCOUNT_MENU=true
       - PORT=3264
     ports:
       - "3264:3264"
@@ -362,6 +337,8 @@ services:
       - ./logs:/app/logs
       - ./uploads:/app/uploads
 ```
+
+Open the browser (CDP port 9222) and log in to Qwen Chat once; the observer keeps the session alive.
 
 ## Recommended models
 
@@ -374,10 +351,9 @@ services:
 ## Useful commands
 
 ```bash
-npm run auth                  # account management
+npm run start:cdp             # start proxy with Chrome CDP
 npm run models:sync           # update model list
 npm run smoke                 # quick API check
-SKIP_ACCOUNT_MENU=true npm start
 ```
 
 Health checks:
@@ -404,8 +380,8 @@ curl http://localhost:3264/api/videos/status
 ## Limitations
 
 - This is unofficial browser-based proxy, Qwen may change external API.
-- Qwen Chat accounts may hit rate limits; use multiple accounts for round-robin.
-- Tokens rotate about every 15 minutes; the CDP observer refreshes them automatically. If no Qwen tab is logged in, use `npm run auth -- --relogin`.
+- Qwen Chat accounts may hit daily quota; when that happens the proxy returns a clean HTTP 429 so the client can switch models or wait.
+- Tokens rotate about every 15 minutes; the CDP observer refreshes them automatically. If the Qwen tab is closed, reopen it and log in again.
 - Image/video generation depends on availability and Qwen Chat limits on specific account.
 - Generated media URLs may be temporary.
 - For production use carefully: this is a tool for experimenters, demos, and local workflows.

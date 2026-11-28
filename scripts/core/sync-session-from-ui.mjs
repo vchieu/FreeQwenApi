@@ -24,13 +24,6 @@ const token = await page.evaluate(() => localStorage.getItem('token'));
 browser.disconnect();
 if (!token) throw new Error('No token in browser');
 
-const tokensPath = path.join(root, 'session', 'tokens.json');
-const tokens = JSON.parse(fs.readFileSync(tokensPath, 'utf8'));
-if (!tokens.length) tokens.push({ id: 'acc_1795263808256', token, resetAt: null, invalid: false });
-else {
-    tokens[0].token = token;
-    tokens[0].invalid = false;
-    tokens[0].resetAt = null;
-}
-fs.writeFileSync(tokensPath, JSON.stringify(tokens, null, 2));
-console.log('tokens.json updated');
+const tokenPath = path.join(root, 'session', 'auth_token.txt');
+fs.writeFileSync(tokenPath, token, 'utf8');
+console.log('auth_token.txt updated');
