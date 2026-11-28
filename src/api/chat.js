@@ -1,7 +1,7 @@
 import { getBrowserContext, getAuthenticationStatus, ensureBrowserConnection } from '../browser/browser.js';
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
 import { saveAuthToken } from '../browser/session.js';
-import { getAvailableToken, markRateLimited, removeInvalidToken, markInvalid, markValidForToken, findAccountIdForToken, decodeTokenInfo } from './tokenManager.js';
+import { getAvailableToken, markRateLimited, removeInvalidToken, markInvalid, markValidForToken, findAccountIdForToken, decodeTokenInfo, isTokenRateLimited, getEarliestResetMs } from './tokenManager.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -19,7 +19,8 @@ import {
 } from './authRecovery.js';
 import {
     CAPTCHA_NOTICE, detectCaptchaSignal, isCaptchaResponse, isChatInProgress,
-    isProtocolTimeoutError, isNodeStreamTimeout, isVisibleBox, shouldRetryNetworkError
+    isProtocolTimeoutError, isNodeStreamTimeout, isVisibleBox, shouldRetryNetworkError,
+    formatRateLimitCooldown, applyRetryReasoningSuppression
 } from './resilience.js';
 import { sendDesktopNotification } from '../utils/notify.js';
 import crypto from 'crypto';
@@ -41,6 +42,80 @@ let authToken = null;
 let availableModels = null;
 let authKeys = null;
 let browserTokenRateLimited = false;
+const rateLimitedBrowserTokens = new Map(); // token -> resetTimestampMs
+
+function isBrowserTokenRateLimited(token) {
+    if (!token) return false;
+    const until = rateLimitedBrowserTokens.get(token);
+    if (!until) return false;
+    if (Date.now() >= until) {
+        rateLimitedBrowserTokens.delete(token);
+        if (rateLimitedBrowserTokens.size === 0) browserTokenRateLimited = false;
+        return false;
+    }
+    return true;
+}
+
+// Return the earliest reset timestamp (ms) across ALL browser-tab tokens that are
+// still rate-limited (mirrors getEarliestResetMs from tokenManager but for the
+// in-memory browser-token map). Returns 0 when no browser tokens are rate-limited.
+export function getEarliestBrowserTokenResetMs() {
+    let earliest = 0;
+    const now = Date.now();
+    for (const [tok, until] of rateLimitedBrowserTokens) {
+        if (until <= now) {
+            rateLimitedBrowserTokens.delete(tok);
+            continue;
+        }
+        if (earliest === 0 || until < earliest) earliest = until;
+    }
+    if (rateLimitedBrowserTokens.size === 0) browserTokenRateLimited = false;
+    return earliest;
+}
+
+export function getRateLimitCooldownError(now = Date.now()) {
+    const storedResetMs = getEarliestResetMs();
+    const browserResetMs = getEarliestBrowserTokenResetMs();
+    const resetMs = storedResetMs && browserResetMs
+        ? Math.min(storedResetMs, browserResetMs)
+        : (storedResetMs || browserResetMs);
+    return formatRateLimitCooldown(resetMs, now);
+}
+
+export function recordBrowserTokenRateLimit(token, resetUntilMs) {
+    if (token && resetUntilMs > Date.now()) {
+        rateLimitedBrowserTokens.set(token, resetUntilMs);
+        browserTokenRateLimited = true;
+    }
+}
+
+export function clearBrowserTokenRateLimits() {
+    rateLimitedBrowserTokens.clear();
+    browserTokenRateLimited = false;
+}
+
+function applyRateLimitForToken(tokenObj, errorBody) {
+    let hours = RATE_LIMIT_HOURS;
+    try {
+        const rateInfo = JSON.parse(errorBody);
+        // Absent or zero `num` means Qwen didn't state a duration — use a short
+        // 30-minute cooldown instead of locking out accounts for 24h.
+        const parsedNum = Number(rateInfo.num);
+        hours = (parsedNum > 0) ? parsedNum : 0.5;
+    } catch { /* errorBody might not be valid JSON */ }
+
+    if (tokenObj?.token) {
+        recordBrowserTokenRateLimit(tokenObj.token, Date.now() + hours * 3600 * 1000);
+    }
+    if (tokenObj?.id === 'browser') {
+        browserTokenRateLimited = true;
+        logWarn(`Browser token reached rate limit. Pausing for ${hours}h.`);
+    } else if (tokenObj?.id) {
+        markRateLimited(tokenObj.id, hours);
+        logWarn(`Token ${tokenObj.id} reached rate limit. Pausing for ${hours}h and trying another token...`);
+    }
+    return hours;
+}
 
 const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -666,7 +741,7 @@ async function recoverBrowserToken(browserContext, failedToken) {
     return forceFreshTokenByReload(browserContext, failedToken, 30_000);
 }
 
-async function resolveAuthToken(browserContext) {
+export async function resolveAuthToken(browserContext) {
     const tokenObj = await getAvailableToken();
     let browserToken = await readTokenFromQwenTab(browserContext);
 
@@ -679,7 +754,12 @@ async function resolveAuthToken(browserContext) {
         }
     }
 
-    if (browserToken) {
+    const browserRateLimited = browserToken && (isTokenRateLimited(browserToken) || isBrowserTokenRateLimited(browserToken));
+    if (browserRateLimited) {
+        logWarn('Browser token is currently rate limited; checking next available account');
+    }
+
+    if (browserToken && !browserRateLimited) {
         authToken = browserToken;
         saveAuthToken(browserToken);
         // The tab may be logged into a different account than the round-robin
@@ -696,7 +776,9 @@ async function resolveAuthToken(browserContext) {
         return tokenObj;
     }
 
-    if (browserTokenRateLimited) {
+    // Both browser token and round-robin token are unavailable or rate-limited.
+    // Only block here if there is truly nothing left to try.
+    if (browserTokenRateLimited && browserRateLimited) {
         logWarn('Browser token is rate limited, skipping fallback');
         return null;
     }
@@ -712,14 +794,19 @@ async function resolveAuthToken(browserContext) {
         authToken = await extractAuthToken(browserContext);
     }
 
-    return authToken ? { id: 'browser', token: authToken } : null;
+    if (authToken && (isTokenRateLimited(authToken) || isBrowserTokenRateLimited(authToken))) {
+        return null;
+    }
+
+    return authToken ? { id: findAccountIdForToken(authToken) || 'browser', token: authToken, source: 'browser' } : null;
 }
 
-function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType = 't2t', size = null, reasoningMode = null) {
+function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType = 't2t', size = null, reasoningMode = null, hasDeclaredTools = false) {
     const userMessageId = crypto.randomUUID();
     const assistantChildId = crypto.randomUUID();
 
     const isVideo = chatType === 't2v';
+    const hasCustomTools = Boolean(hasDeclaredTools || (Array.isArray(tools) && tools.length > 0));
 
     // Mirror the shape of a real Qwen UI request. The web API rejects older
     // hand-built payloads with Internal_Server_Error when these fields are
@@ -731,7 +818,7 @@ function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMe
         auto_thinking: true,
         thinking_mode: 'Auto',
         thinking_format: 'summary',
-        auto_search: true
+        auto_search: hasCustomTools && !isVideo ? false : true
     };
     if (isVideo) {
         featureConfig.auto_search = true;
@@ -819,8 +906,9 @@ function parseNonSseCompletionBody(body) {
 
 export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token, onChunk, onReasoning = null, options = {}) {
     // Declared outside try: the catch below must be able to report whether any
-    // answer chunk was already delivered, even when fetch/parse throws early.
+    // answer chunk or reasoning chunk was already delivered, even when fetch/parse throws early.
     let hasStreamedChunks = false;
+    let fullReasoning = '';
     // Idle timeout + client-disconnect cancellation share one controller.
     const controller = new AbortController();
     let idleTimer = null;
@@ -912,11 +1000,86 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
         const nativeAcc = allowedToolNames ? createNativeToolCallAccumulator() : null;
         let buffer = '';
         let fullContent = '';
-        let fullReasoning = '';
         let responseId = null;
         let usage = null;
         let finished = false;
         let streamError = null;
+
+        const processSseLine = (rawLine) => {
+            const line = rawLine.trim();
+            if (!line || !line.startsWith('data:')) return;
+
+            const jsonStr = line.substring(5).trim();
+            if (!jsonStr) return;
+            if (jsonStr === '[DONE]') {
+                finished = true;
+                return;
+            }
+
+            try {
+                const chunk = JSON.parse(jsonStr);
+
+                if (chunk.code === 'RateLimited') {
+                    const errBody = JSON.stringify(chunk);
+                    logWarn(`[upstream-error] stream status=429 model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${errBody.slice(0, 500)}`);
+                    streamError = { status: 429, errorBody: errBody };
+                    finished = true;
+                    return;
+                }
+                // Other structured error chunks (ContentFiltered, quota, FAIL_SYS_USER_VALIDATE…)
+                // must surface immediately as 500, not fall through to network-error retry (R3).
+                if (chunk.code && !chunk.choices) {
+                    const errBody = JSON.stringify(chunk);
+                    logWarn(`[upstream-error] stream structured-error code=${chunk.code} model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${errBody.slice(0, 500)}`);
+                    streamError = { status: 500, errorBody: errBody };
+                    finished = true;
+                    return;
+                }
+                if (chunk.error && !chunk.choices) {
+                    const errBody = JSON.stringify(chunk);
+                    logWarn(`[upstream-error] stream status=500 model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${errBody.slice(0, 500)}`);
+                    streamError = { status: 500, errorBody: errBody };
+                    finished = true;
+                    return;
+                }
+
+                if (chunk['response.created']) responseId = chunk['response.created'].response_id;
+                if (chunk.response_id) responseId = chunk.response_id;
+
+                if (chunk.choices && chunk.choices[0]) {
+                    const delta = chunk.choices[0].delta || chunk.choices[0].message;
+                    if (nativeAcc && delta?.function_call) {
+                        collectNativeCall(nativeAcc, delta.function_call, allowedToolNames);
+                    }
+                    if (nativeAcc && Array.isArray(delta?.tool_calls)) {
+                        for (const tc of delta.tool_calls) {
+                            const fn = tc?.function || tc;
+                            collectNativeCall(nativeAcc, { id: tc?.id ?? tc?.index, name: fn?.name, arguments: fn?.arguments }, allowedToolNames);
+                        }
+                    }
+                    const { reasoning, content } = consumeThinkingDelta(thinkingState, delta);
+                    if (content) {
+                        fullContent += content;
+                        if (typeof onChunk === 'function') {
+                            onChunk(content);
+                            hasStreamedChunks = true;
+                        }
+                    }
+                    if (reasoning) {
+                        fullReasoning += reasoning;
+                        if (typeof onReasoning === 'function') onReasoning(reasoning);
+                    }
+                    // Qwen ends thinking_summary with status:"finished" before
+                    // it sends answer chunks; only a finished answer ends the stream.
+                    if (delta && delta.status === 'finished' && (!delta.phase || delta.phase === 'answer')) finished = true;
+                    if (chunk.choices[0].finish_reason) finished = true;
+                }
+
+                if (chunk.usage) usage = chunk.usage;
+            } catch {
+                // Ignore broken chunks, keep reading stream.
+            }
+        };
 
         while (!finished) {
             const { done, value } = await reader.read();
@@ -928,71 +1091,12 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
             buffer = lines.pop() || '';
 
             for (const rawLine of lines) {
-                const line = rawLine.trim();
-                if (!line || !line.startsWith('data:')) continue;
-
-                const jsonStr = line.substring(5).trim();
-                if (!jsonStr) continue;
-                if (jsonStr === '[DONE]') {
-                    finished = true;
-                    break;
-                }
-
-                try {
-                    const chunk = JSON.parse(jsonStr);
-
-                    if (chunk.code === 'RateLimited' || (chunk.code && chunk.detail)) {
-                        const errBody = JSON.stringify(chunk);
-                        logWarn(`[upstream-error] stream status=429 model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${errBody.slice(0, 500)}`);
-                        streamError = { status: 429, errorBody: errBody };
-                        finished = true;
-                        break;
-                    }
-                    if (chunk.error && !chunk.choices) {
-                        const errBody = JSON.stringify(chunk);
-                        logWarn(`[upstream-error] stream status=500 model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${errBody.slice(0, 500)}`);
-                        streamError = { status: 500, errorBody: errBody };
-                        finished = true;
-                        break;
-                    }
-
-                    if (chunk['response.created']) responseId = chunk['response.created'].response_id;
-                    if (chunk.response_id) responseId = chunk.response_id;
-
-                    if (chunk.choices && chunk.choices[0]) {
-                        const delta = chunk.choices[0].delta || chunk.choices[0].message;
-                        if (nativeAcc && delta?.function_call) {
-                            collectNativeCall(nativeAcc, delta.function_call, allowedToolNames);
-                        }
-                        if (nativeAcc && Array.isArray(delta?.tool_calls)) {
-                            for (const tc of delta.tool_calls) {
-                                const fn = tc?.function || tc;
-                                collectNativeCall(nativeAcc, { id: tc?.id ?? tc?.index, name: fn?.name, arguments: fn?.arguments }, allowedToolNames);
-                            }
-                        }
-                        const { reasoning, content } = consumeThinkingDelta(thinkingState, delta);
-                        if (content) {
-                            fullContent += content;
-                            if (typeof onChunk === 'function') {
-                                onChunk(content);
-                                hasStreamedChunks = true;
-                            }
-                        }
-                        if (reasoning) {
-                            fullReasoning += reasoning;
-                            if (typeof onReasoning === 'function') onReasoning(reasoning);
-                        }
-                        // Qwen ends thinking_summary with status:"finished" before
-                        // it sends answer chunks; only a finished answer ends the stream.
-                        if (delta && delta.status === 'finished' && (!delta.phase || delta.phase === 'answer')) finished = true;
-                        if (chunk.choices[0].finish_reason) finished = true;
-                    }
-
-                    if (chunk.usage) usage = chunk.usage;
-                } catch {
-                    // Ignore broken chunks, keep reading stream.
-                }
+                processSseLine(rawLine);
+                if (finished) break;
             }
+        }
+        if (!finished && buffer.trim()) {
+            processSseLine(buffer);
         }
 
         // We may stop at status:"finished" before EOF; release the connection.
@@ -1000,6 +1104,16 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
 
         if (streamError) {
             return { success: false, ...streamError, hasStreamedChunks };
+        }
+
+        if (!finished) {
+            return {
+                success: false,
+                error: 'Stream closed before completion',
+                interrupted: true,
+                hasStreamedChunks,
+                hasStreamedReasoning: fullReasoning.length > 0
+            };
         }
 
         const native = nativeAcc ? flushNativeToolCalls(nativeAcc, allowedToolNames) : { calls: [], dropped: [] };
@@ -1027,6 +1141,7 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
             success: true,
             isTask: false,
             hasStreamedChunks,
+            hasStreamedReasoning: fullReasoning.length > 0,
             data: resultData
         };
     } catch (error) {
@@ -1035,7 +1150,10 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
         const message = idleTimedOut ? `TimeoutError: no data from Qwen for ${NODE_STREAM_TIMEOUT_MS}ms` : text;
         // Preserve this flag: retrying after partial SSE output would duplicate
         // already-delivered text in the client.
-        return { success: false, error: message, nodeTimeout, hasStreamedChunks };
+        // Fix (R9): propagate hasStreamedReasoning from the catch path so the
+        // stream-timeout/interrupt retry (handleApiError) can suppress duplicate
+        // reasoning — fullReasoning is declared in the outer function scope.
+        return { success: false, error: message, nodeTimeout, hasStreamedChunks, hasStreamedReasoning: fullReasoning.length > 0 };
     } finally {
         clearTimeout(idleTimer);
         options.signal?.removeEventListener('abort', onClientAbort);
@@ -1093,12 +1211,21 @@ async function qwenCookieHeader(page) {
 }
 
 // Qwen web tokens live ~15 minutes; the page keeps refreshing them. Take the
-// freshest token straight from the tab before each request.
-async function syncTokenFromPage(page) {
+// freshest token straight from the tab before each request — ONLY when using
+// the browser account (never overwrite a rotated/round-robin account token!).
+async function syncTokenFromPage(page, tokenObj = null) {
     try {
+        if (tokenObj && tokenObj.source !== 'browser' && tokenObj.id !== 'browser') {
+            return;
+        }
         const fresh = await readTokenFromQwenTab(getBrowserContext())
             || await page.evaluate(() => localStorage.getItem('token'));
         if (!fresh || fresh === authToken) return;
+        if (isTokenRateLimited(fresh) || isBrowserTokenRateLimited(fresh)) return;
+        if (tokenObj?.id && tokenObj.id !== 'browser') {
+            const ownerId = findAccountIdForToken(fresh);
+            if (ownerId && ownerId !== tokenObj.id) return;
+        }
         authToken = fresh;
         saveAuthToken(fresh);
         markValidForToken(fresh);
@@ -1196,6 +1323,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
 
         const canReturnDirectly = options.signal?.aborted || !wafBlockedNodeStream && (
             streamedResponse.success ||
+            streamedResponse.interrupted === true ||
             streamedResponse.nodeTimeout === true ||
             Boolean(streamedResponse.status) ||
             Boolean(streamedResponse.errorBody) ||
@@ -1437,6 +1565,60 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                 let finished = false;
                 let streamError = null;
 
+                const processBrowserSseLine = (rawLine) => {
+                    const trimmedLine = rawLine.trim();
+                    if (!trimmedLine || !trimmedLine.startsWith('data:')) return;
+                    const jsonStr = trimmedLine.substring(5).trim();
+                    if (!jsonStr) return;
+                    if (jsonStr === '[DONE]') {
+                        finished = true;
+                        return;
+                    }
+                    try {
+                        const chunk = JSON.parse(jsonStr);
+
+                        if (chunk.code === 'RateLimited') {
+                            streamError = { status: 429, errorBody: JSON.stringify(chunk) };
+                            finished = true;
+                            return;
+                        }
+                        // Other structured error chunks (ContentFiltered, quota, FAIL_SYS_USER_VALIDATE…)
+                        // surface as 500 immediately — do NOT retry as network errors (R3).
+                        if (chunk.code && !chunk.choices) {
+                            const errBody = JSON.stringify(chunk);
+                            logWarn(`[upstream-error] stream structured-error code=${chunk.code} model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${errBody.slice(0, 500)}`);
+                            streamError = { status: 500, errorBody: errBody };
+                            finished = true;
+                            return;
+                        }
+                        if (chunk.error && !chunk.choices) {
+                            streamError = { status: 500, errorBody: JSON.stringify(chunk) };
+                            finished = true;
+                            return;
+                        }
+
+                        if (chunk['response.created']) responseId = chunk['response.created'].response_id;
+                        if (chunk.response_id) responseId = chunk.response_id;
+                        if (chunk.choices && chunk.choices[0]) {
+                            const choice = chunk.choices[0];
+                            const delta = choice.delta || choice.message;
+                            if (delta && delta.function_call) collectNative(delta.function_call);
+                            if (delta && Array.isArray(delta.tool_calls)) {
+                                for (const tc of delta.tool_calls) {
+                                    const fn = tc.function || tc;
+                                    collectNative({ id: tc.id ?? tc.index, name: fn.name, arguments: fn.arguments });
+                                }
+                            }
+                            const { reasoning, content } = consumeThinking(delta);
+                            fullReasoning += reasoning;
+                            fullContent += content;
+                            if (delta && delta.status === 'finished' && (!delta.phase || delta.phase === 'answer')) finished = true;
+                            if (choice.finish_reason) finished = true;
+                        }
+                        if (chunk.usage) usage = chunk.usage;
+                    } catch { /* ignore parse errors for individual chunks */ }
+                };
+
                 while (!finished) {
                     const { done, value } = await reader.read();
                     if (done) break;
@@ -1445,49 +1627,20 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                     buffer = lines.pop() || '';
 
                     for (const line of lines) {
-                        if (!line.trim() || !line.startsWith('data: ')) continue;
-                        const jsonStr = line.substring(6).trim();
-                        if (!jsonStr) continue;
-                        try {
-                            const chunk = JSON.parse(jsonStr);
-
-                            if (chunk.code === 'RateLimited' || (chunk.code && chunk.detail)) {
-                                streamError = { status: 429, errorBody: JSON.stringify(chunk) };
-                                finished = true;
-                                break;
-                            }
-                            if (chunk.error && !chunk.choices) {
-                                streamError = { status: 500, errorBody: JSON.stringify(chunk) };
-                                finished = true;
-                                break;
-                            }
-
-                            if (chunk['response.created']) responseId = chunk['response.created'].response_id;
-                            if (chunk.choices && chunk.choices[0]) {
-                                const choice = chunk.choices[0];
-                                const delta = choice.delta || choice.message;
-                                if (delta && delta.function_call) collectNative(delta.function_call);
-                                if (delta && Array.isArray(delta.tool_calls)) {
-                                    for (const tc of delta.tool_calls) {
-                                        const fn = tc.function || tc;
-                                        collectNative({ id: tc.id ?? tc.index, name: fn.name, arguments: fn.arguments });
-                                    }
-                                }
-                                // Thinking text goes to reasoning_content only;
-                                // answer phases go to content. Handles both
-                                // thinking_summary and full thinking phases.
-                                const { reasoning, content } = consumeThinking(delta);
-                                fullReasoning += reasoning;
-                                fullContent += content;
-                                if (choice.finish_reason) finished = true;
-                            }
-                            if (chunk.usage) usage = chunk.usage;
-                        } catch { /* ignore parse errors for individual chunks */ }
+                        processBrowserSseLine(line);
+                        if (finished) break;
                     }
+                }
+                if (!finished && buffer.trim()) {
+                    processBrowserSseLine(buffer);
                 }
 
                 if (streamError) {
                     return { success: false, ...streamError };
+                }
+
+                if (!finished) {
+                    return { success: false, error: 'Stream closed before completion', interrupted: true, hasStreamedReasoning: fullReasoning.length > 0 };
                 }
 
                 const native = flushNative();
@@ -1513,6 +1666,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                 return {
                     success: true,
                     isTask: false,
+                    hasStreamedReasoning: fullReasoning.length > 0,
                     data: resultData
                 };
             }
@@ -1569,12 +1723,13 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
     // Retrying the SAME chat then gets 500 CHAT_IN_PROGRESS, so start a fresh
     // chat (full history is resent in `messages`). A captcha seen only in the
     // response body can't be waited on, so return an actionable message.
+    const retryOpts = applyRetryReasoningSuppression(options, response);
     if (response.captcha || isCaptchaResponse(response)) {
         if (response.captcha && response.retryable && retryCount < MAX_RETRY_COUNT) {
             logInfo('Captcha solved; retrying request on a fresh chat');
             if (chatId && !options.keepChat) deleteChatV2(chatId).catch(() => {});
             await delay(RETRY_DELAY);
-            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
+            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, retryOpts);
         }
         if (!response.captcha) notifyCaptcha('response-body');
         return { error: CAPTCHA_NOTICE, verification: true, captcha: true, chatId };
@@ -1587,7 +1742,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
             logWarn(`Qwen chat still in progress; retrying on a fresh chat (${retryCount + 1}/${MAX_RETRY_COUNT})`);
             if (chatId && !options.keepChat) deleteChatV2(chatId).catch(() => {});
             await delay(RETRY_DELAY);
-            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
+            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, retryOpts);
         }
         return { error: 'Qwen is still generating the previous answer. Please retry shortly.', chatId };
     }
@@ -1597,12 +1752,12 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
     // server-side, so retry on a NEW chat like CHAT_IN_PROGRESS instead of
     // replaying into the abandoned one. Never surface the raw
     // `Error: ProtocolError...` / `TimeoutError...` string to the client.
-    if (response.protocolTimeout || response.interrupted || isProtocolTimeoutError(response) || isNodeStreamTimeout(response)) {
+    if ((response.protocolTimeout || response.interrupted || isProtocolTimeoutError(response) || isNodeStreamTimeout(response)) && response.hasStreamedChunks !== true) {
         if (retryCount < MAX_RETRY_COUNT) {
             logWarn(`Stream timeout/interruption; retrying on a fresh chat (${retryCount + 1}/${MAX_RETRY_COUNT})`);
             if (chatId && !options.keepChat) deleteChatV2(chatId).catch(() => {});
             await delay(RETRY_DELAY);
-            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
+            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, retryOpts);
         }
         return { error: 'Qwen did not respond in time. Please retry shortly.', chatId, timeout: true };
     }
@@ -1613,7 +1768,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
     if (shouldRetryNetworkError(response, retryCount, MAX_RETRY_COUNT)) {
         logWarn(`Transient network error; retrying same chat (${retryCount + 1}/${MAX_RETRY_COUNT}) in ${RETRY_DELAY}ms`);
         await delay(RETRY_DELAY);
-        return sendMessage(message, model, chatId, parentId, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
+        return sendMessage(message, model, chatId, parentId, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, retryOpts);
     }
 
     if (response.status === 401 || (response.errorBody && (response.errorBody.includes('Unauthorized') || response.errorBody.includes('Token has expired')))) {
@@ -1645,26 +1800,14 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
             // chatId/parentId are reset: when switching accounts the old chat
             // belongs to the previous token and under the new one "does not exist".
-            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
+            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, { ...options, tokenObj: null });
         }
         logError('No valid tokens left or retries exhausted.');
         return { error: 'All tokens are invalid (401). Re-authentication required.', chatId };
     }
 
     if (response.status === 429 || (response.errorBody && response.errorBody.includes('RateLimited'))) {
-        let hours = RATE_LIMIT_HOURS;
-        try {
-            const rateInfo = JSON.parse(response.errorBody);
-            hours = Number(rateInfo.num) || RATE_LIMIT_HOURS;
-        } catch { /* errorBody might not be valid JSON */ }
-
-        if (tokenObj?.id === 'browser') {
-            browserTokenRateLimited = true;
-            logWarn(`Browser token reached rate limit. Pausing for ${hours}h.`);
-        } else if (tokenObj?.id) {
-            markRateLimited(tokenObj.id, hours);
-            logWarn(`Token ${tokenObj.id} reached rate limit. Pausing for ${hours}h and trying another token...`);
-        }
+        const hours = applyRateLimitForToken(tokenObj, response.errorBody);
 
         authToken = null;
         const { hasValidTokens } = await import('./tokenManager.js');
@@ -1672,9 +1815,10 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT && response.hasStreamedChunks !== true) {
             // chatId/parentId are reset: when switching accounts the old chat
             // belongs to the previous token and under the new one "does not exist".
-            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
+            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, { ...options, tokenObj: null });
         }
-        return { error: `All tokens are rate limited (${hours}h)`, chatId };
+        const cooldownMsg = getRateLimitCooldownError() || `All tokens are rate limited (${hours}h)`;
+        return { error: cooldownMsg, status: 429, chatId };
     }
 
     let errorMessage = response.error || response.statusText;
@@ -1697,7 +1841,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
 // `todowrite` fence left as text in opencode session ses_df45b870...).
 function finalizeToolCallsInResponse(response, allowedToolNames, requiredToolParams) {
     if (!response?.success || response.isTask || !allowedToolNames || !response.data) {
-        return { merged: [], dropped: [], cleanText: '' };
+        return { merged: [], dropped: [], textDropped: [], cleanText: '' };
     }
     const content = response.data.choices?.[0]?.message?.content || '';
     const nativeCalls = Array.isArray(response.data.native_tool_calls) ? response.data.native_tool_calls : [];
@@ -1711,7 +1855,7 @@ function finalizeToolCallsInResponse(response, allowedToolNames, requiredToolPar
     if (dropped.length > 0) response.data.tool_calls_dropped = dropped;
     // Prose around the call must survive even when normalized calls are present.
     response.data.tool_calls_clean_text = parsed.text;
-    return { merged, dropped, cleanText: parsed.text };
+    return { merged, dropped, textDropped: parsed.dropped, cleanText: parsed.text };
 }
 
 export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null, parentId = null, files = null, tools = null, toolChoice = null, systemMessage = null, chatType = 't2t', size = null, waitForCompletion = true, retryCount = 0, onChunk = null, options = {}) {
@@ -1724,8 +1868,17 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     // Resolve account ONCE: with the same token create the chat and
     // send the message - otherwise round-robin picks different
     // accounts and Qwen returns "chat is not exist".
-    const tokenObj = await resolveAuthToken(browserContext);
-    if (!tokenObj) return { error: 'Auth error: failed to get token', chatId };
+    const tokenObj = options.tokenObj || await resolveAuthToken(browserContext);
+    if (!tokenObj) {
+        // All accounts are unavailable: construct a helpful error with cooldown info
+        // across both stored accounts and browser-tab tokens.
+        const cooldownMsg = getRateLimitCooldownError();
+        if (cooldownMsg) {
+            return { error: cooldownMsg, status: 429, chatId };
+        }
+        return { error: 'Auth error: failed to get token', chatId };
+    }
+    if (tokenObj.token) authToken = tokenObj.token;
 
     const reasoningEffort = options.reasoningEffort ?? null;
     const reasoningMode = options.reasoningMode ?? modeForReasoningEffort(reasoningEffort);
@@ -1793,13 +1946,16 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
 
         logInfo('Sending request to API v2...');
 
-        const validationTools = Array.isArray(options.declaredTools) && options.declaredTools.length > 0
-            ? options.declaredTools
-            : (Array.isArray(tools) && tools.length > 0 ? tools : null);
+        const validationTools = toolChoice === 'none'
+            ? null
+            : (Array.isArray(options.declaredTools) && options.declaredTools.length > 0
+                ? options.declaredTools
+                : (Array.isArray(tools) && tools.length > 0 ? tools : null));
         const allowedToolNames = validationTools ? toolNames(validationTools) : null;
         const requiredToolParams = allowedToolNames ? toolRequiredParams(validationTools) : null;
+        const hasDeclaredTools = Boolean(allowedToolNames && allowedToolNames.size > 0);
 
-        const payload = buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType, size, reasoningMode);
+        const payload = buildPayloadV2(messageContent, model, chatId, parentId, files, systemMessage, tools, toolChoice, chatType, size, reasoningMode, hasDeclaredTools);
         logDebug('=== PAYLOAD V2 ===\n' + JSON.stringify(payload, null, 2));
         logDebug(`Sending message to chat ${chatId} with parent_id: ${parentId || 'null'}`);
 
@@ -1810,31 +1966,66 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
         // Non-stream text requests are collected through Node as well.
         const collectOnly = typeof onChunk !== 'function' && (options.collectOnly === true || chatType === 't2t');
         const streamChunk = collectOnly ? () => {} : onChunk;
-        // Tool routes write reasoning once from the completed response (inside
-        // writeToolCallsSse / the final fallback). Suppress live reasoning here
-        // to avoid emitting the same block twice.
-        const streamReasoning = collectOnly ? null : (options.onReasoning || null);
+        // Suppress live reasoning only on the nudge retry (where _toolRetryDone is set),
+        // not on the first attempt — otherwise the user loses thinking output entirely.
+        const streamReasoning = (collectOnly && options._toolRetryDone) ? null : (options.onReasoning || null);
         const apiOptions = { allowedToolNames, onCaptcha: options.onCaptcha, collectOnly, signal: options.signal };
         let response = await executeApiRequest(page, apiUrl, payload, authToken, streamChunk, streamReasoning, apiOptions);
 
         // One nudge retry max per request when tools were declared and model broke tool call format (or toolChoice requires one).
-        // Only retry when the client has not already received live chunks.
+        // Undeclared built-in native calls (e.g. web_search) do NOT trigger a nudge
+        // retry when the model answered normally in text.
         const canNudgeRetry = collectOnly || typeof onChunk !== 'function';
         if (response.success && !response.isTask && allowedToolNames && !options._toolRetryDone) {
             const first = finalizeToolCallsInResponse(response, allowedToolNames, requiredToolParams);
-            if (canNudgeRetry && shouldRetryToolCall({ merged: first.merged, dropped: first.dropped, toolChoice })) {
+            const retryDecision = shouldRetryToolCall({ merged: first.merged, dropped: first.textDropped, toolChoice });
+            if (canNudgeRetry && retryDecision) {
                 const names = Array.from(allowedToolNames).join(', ');
-                const reason = first.dropped.length > 0 ? ` Previous attempt was rejected: ${first.dropped.join('; ')}.` : '';
-                const nudge = `\n\nIMPORTANT: Use a tool call now.${reason} Respond ONLY with a valid \`\`\`tool_call JSON block using one of these tools: ${names}.`;
+                const isSoft = retryDecision === 'soft';
+                let nudge;
+                if (isSoft) {
+                    // Neutral nudge: include a preview of the previous draft (same parent_id
+                    // means Qwen has no other way to know which example/snippet is referenced).
+                    // Do NOT command "Use a tool NOW" — that would turn examples into commands.
+                    const prevDraft = String(response.data?.choices?.[0]?.message?.content || '').trim();
+                    const draftSection = prevDraft
+                        ? `\n\n[Your previous draft response — not yet sent to the user]:\n${prevDraft.slice(0, 2000)}\n`
+                        : '\n';
+                    nudge = `${draftSection}\nIf you intended to call a tool, resend the response with the tool call JSON in a \`\`\`tool_call block on its own line. If this was only an example or explanation, reply normally without a tool call.`;
+                } else {
+                    const reason = first.textDropped.length > 0 ? ` Previous attempt was rejected: ${first.textDropped.join('; ')}.` : '';
+                    nudge = `\n\nIMPORTANT: Use a tool call now.${reason} Respond ONLY with a valid \`\`\`tool_call JSON block using one of these tools: ${names}.`;
+                }
                 const retryMessage = `${messageContent}${nudge}`;
-                const retrySystem = systemMessage ? `${systemMessage}${nudge}`.trim() : null;
-                const retryPayload = buildPayloadV2(retryMessage, model, chatId, parentId, files, retrySystem, tools, toolChoice, chatType, size, reasoningMode);
-                logWarn(`Tool call missing/broken; retrying once with nudge. dropped=${first.dropped.join('; ') || 'none'}`);
+                const retrySystem = (!isSoft && systemMessage) ? `${systemMessage}${nudge}`.trim() : systemMessage;
+                const retryPayload = buildPayloadV2(retryMessage, model, chatId, parentId, files, retrySystem, tools, toolChoice, chatType, size, reasoningMode, hasDeclaredTools);
+                logWarn(`Tool call missing/broken; retrying once with ${isSoft ? 'soft' : 'hard'} nudge. dropped=${first.textDropped.join('; ') || 'none'}`);
                 options = { ...options, _toolRetryDone: true };
-                response = await executeApiRequest(page, apiUrl, retryPayload, authToken, streamChunk, streamReasoning, apiOptions);
-                if (response?.data) response.data._toolRetryDone = true;
-                // Parse the retry too — otherwise its tool call stays as text.
-                finalizeToolCallsInResponse(response, allowedToolNames, requiredToolParams);
+                // Always suppress reasoning on nudge retry — the first attempt already streamed it.
+                const retryStreamReasoning = null;
+                const retryResponse = await executeApiRequest(page, apiUrl, retryPayload, authToken, streamChunk, retryStreamReasoning, apiOptions);
+                if (retryResponse?.data) retryResponse.data._toolRetryDone = true;
+                // Parse the retry — otherwise its tool call stays as text.
+                const retryResult = finalizeToolCallsInResponse(retryResponse, allowedToolNames, requiredToolParams);
+
+                // Fix C: for a soft-nudge retry, only adopt the new response if it produced
+                // a real tool call. If the retry failed (network/500) or returned no tool call
+                // (the model really was writing an explanation), keep the ORIGINAL response so
+                // the client sees the full first answer rather than a one-liner like
+                // "That was only an example." or a raw error message.
+                if (isSoft) {
+                    if (retryResponse.success && retryResult.merged.length > 0) {
+                        // Retry produced a tool call — use it.
+                        response = retryResponse;
+                    } else {
+                        // Retry produced no tool call or failed — restore original response.
+                        logWarn('Soft-nudge retry produced no tool call; keeping original response.');
+                        // first is already finalized into response; nothing to do.
+                    }
+                } else {
+                    // Hard nudge: always adopt the retry response (caller expects a tool call).
+                    response = retryResponse;
+                }
             }
         } else if (response?.success && !response?.isTask && allowedToolNames) {
             finalizeToolCallsInResponse(response, allowedToolNames, requiredToolParams);
@@ -2160,6 +2351,17 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
             return createChatV2(model, title, retryCount + 1, chatType, tokenObj, true, true);
         }
 
+        if (result.status === 429 || (result.errorBody && result.errorBody.includes('RateLimited'))) {
+            const hours = applyRateLimitForToken(tokenObj, result.errorBody);
+            authToken = null;
+            const { hasValidTokens } = await import('./tokenManager.js');
+            if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
+                return createChatV2(model, title, retryCount + 1, chatType, null, true, authRetried);
+            }
+            const cooldownMsg = getRateLimitCooldownError() || `All tokens are rate limited (${hours}h)`;
+            return { error: cooldownMsg, status: 429 };
+        }
+
         const isTransient = result.status >= 500 && result.status < 600;
         if (isTransient && retryCount < MAX_RETRY_COUNT) {
             logWarn(`Chat creation: ${result.status}, retry ${retryCount + 1}/${MAX_RETRY_COUNT} after ${RETRY_DELAY}ms...`);
@@ -2171,7 +2373,7 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
             ? `Qwen API unavailable (${result.status}). Please try again later.`
             : (result.errorBody || result.error || 'Unknown error');
         logError(`Error creating chat: ${result.status || 'unknown'} (attempt ${retryCount + 1})`);
-        return { error: cleanError };
+        return { error: cleanError, ...(result.status ? { status: result.status } : {}) };
     } catch (error) {
         logError('Error creating chat', error);
         const text = String(error);

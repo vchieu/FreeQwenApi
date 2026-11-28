@@ -1,7 +1,7 @@
 import { getBrowserContext } from '../browser/browser.js';
 import { logInfo, logError } from '../logger/index.js';
-import { getAuthToken, extractAuthToken, pagePool, loadBaxiaHeaders } from './chat.js';
-import { getAvailableToken, decodeTokenInfo } from './tokenManager.js';
+import { getAuthToken, extractAuthToken, pagePool, loadBaxiaHeaders, resolveAuthToken } from './chat.js';
+import { decodeTokenInfo } from './tokenManager.js';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
@@ -19,15 +19,25 @@ const MIME_EXTENSIONS = {
     'image/jpg': '.jpg',
     'image/gif': '.gif',
     'image/webp': '.webp',
-    'image/bmp': '.bmp'
+    'image/bmp': '.bmp',
+    'application/pdf': '.pdf',
+    'text/plain': '.txt',
+    'application/msword': '.doc',
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': '.docx'
 };
 const EXTENSION_MIMES = Object.fromEntries(
     Object.entries(MIME_EXTENSIONS).map(([mime, ext]) => [ext, mime])
 );
 const DATA_URL_RE = /^data:([^;,]+)?(;base64)?,([\s\S]*)$/;
+const UPLOAD_CACHE_MAX = 200;
+const UPLOAD_CACHE_TTL_MS = 15 * 60 * 1000;
+const uploadedAttachmentCache = new Map();
 
-function extFromMime(mime) {
-    return MIME_EXTENSIONS[String(mime || '').toLowerCase()] || '.png';
+function extFromMime(mime, fallbackName = '') {
+    const mapped = MIME_EXTENSIONS[String(mime || '').toLowerCase()];
+    if (mapped) return mapped;
+    const ext = fallbackName ? path.extname(fallbackName).toLowerCase() : '';
+    return ext || '.png';
 }
 
 function mimeFromUrl(url) {
@@ -38,53 +48,100 @@ function mimeFromUrl(url) {
     }
 }
 
-function imageSourceFromPart(part) {
+function attachmentFromPart(part) {
     if (!part || typeof part !== 'object') return null;
     if (part.type === 'image_url') {
-        if (typeof part.image_url === 'string') return part.image_url;
-        return part.image_url?.url || null;
+        const source = typeof part.image_url === 'string' ? part.image_url : (part.image_url?.url || null);
+        return source ? { kind: 'image', source, filename: null, mime: null } : null;
     }
     if (part.type === 'image') {
         const source = part.image || part.url || part.file;
-        return typeof source === 'string' ? source : null;
+        return typeof source === 'string' ? { kind: 'image', source, filename: null, mime: null } : null;
+    }
+    if (part.type === 'file' || part.type === 'input_file') {
+        const fileObj = (part.file && typeof part.file === 'object') ? part.file : part;
+        const rawSource = fileObj.file_data || fileObj.data || fileObj.url || fileObj.file_url
+            || (typeof part.file === 'string' && (part.file.startsWith('data:') || /^https?:\/\//i.test(part.file)) ? part.file : null);
+        const filename = fileObj.filename || fileObj.name || part.filename || part.name || 'document.pdf';
+        const mime = fileObj.mime_type || fileObj.content_type || EXTENSION_MIMES[path.extname(filename).toLowerCase()] || 'application/pdf';
+        return rawSource ? { kind: 'file', source: rawSource, filename, mime } : null;
     }
     return null;
 }
 
-async function imageSourceToBuffer(source) {
-    if (typeof source !== 'string' || !source.trim()) throw new Error('Empty image source');
+export async function attachmentSourceToBuffer(source, fallbackMime = 'image/png', fallbackName = '') {
+    if (typeof source !== 'string' || !source.trim()) throw new Error('Empty attachment source');
 
     if (source.startsWith('data:')) {
         const match = source.match(DATA_URL_RE);
-        if (!match) throw new Error('Invalid image data URL');
-        const mime = (match[1] || 'image/png').toLowerCase();
+        if (!match) throw new Error('Invalid attachment data URL');
+        const mime = (match[1] || fallbackMime || 'application/octet-stream').toLowerCase();
         const buffer = match[2]
             ? Buffer.from(match[3], 'base64')
             : Buffer.from(decodeURIComponent(match[3]), 'utf8');
-        if (!buffer.length) throw new Error('Empty image data');
-        return { buffer, mime, ext: extFromMime(mime), lastModified: Date.now() };
+        if (!buffer.length) throw new Error('Empty attachment data');
+        return { buffer, mime, ext: extFromMime(mime, fallbackName), lastModified: Date.now() };
     }
 
-    const response = await fetch(source);
-    if (!response.ok) throw new Error(`Failed to download image: HTTP ${response.status}`);
-    const buffer = Buffer.from(await response.arrayBuffer());
-    if (!buffer.length) throw new Error('Empty image data');
-    const mime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase()
-        || mimeFromUrl(source)
-        || 'image/png';
-    return { buffer, mime, ext: extFromMime(mime), lastModified: Date.now() };
+    if (/^https?:\/\//i.test(source)) {
+        const response = await fetch(source);
+        if (!response.ok) throw new Error(`Failed to download attachment: HTTP ${response.status}`);
+        const buffer = Buffer.from(await response.arrayBuffer());
+        if (!buffer.length) throw new Error('Empty attachment data');
+        const mime = (response.headers.get('content-type') || '').split(';')[0].trim().toLowerCase()
+            || mimeFromUrl(source)
+            || fallbackMime
+            || 'application/octet-stream';
+        return { buffer, mime, ext: extFromMime(mime, fallbackName), lastModified: Date.now() };
+    }
+
+    // Raw base64 (OpenAI file_data sometimes omits data: prefix).
+    // Reject any URL-like string first so that "file:///path/to/img.png" or
+    // other unknown schemes are not silently decoded as garbage base64 (R9).
+    // Reject any URL-like string (including single-slash file:/path) so it is not
+    // silently decoded as garbage base64. The regex catches both :// and :/ forms.
+    if (/^[a-z][a-z0-9+\-.]*:\//i.test(source)) {
+        throw new Error(`Unsupported URL scheme for attachment: ${source.split(':')[0]}`);
+    }
+    // Reject Windows absolute paths (C:\... or C:/...) that have no URL scheme.
+    // These cannot be base64 and would decode as garbage (Fix #7 / R9 extension).
+    // Do NOT reject Unix-style strings here: JPEG base64 starts with /9j/ which
+    // matches /^\/[a-zA-Z0-9]/ but is perfectly valid base64 — only reject strings
+    // that look like a real local path (contain path separators after the first char).
+    if (/^[a-zA-Z]:[\\\/]/.test(source)) {
+        throw new Error(`Local filesystem path is not a valid attachment source: ${source.slice(0, 60)}`);
+    }
+    // Reject strings that are clearly local paths (/home/user/..., /tmp/...) but NOT
+    // base64: a local path contains a '/' after a non-base64 character sequence or has
+    // multiple path segments. We detect this by checking for characters illegal in base64.
+    // Base64 alphabet: A-Z a-z 0-9 + / = and optional whitespace. A local path like
+    // /home/me/shot.png contains letters legal in base64 so we can't use alphabet alone;
+    // instead check for a path separator followed by more path text (second slash means
+    // it really is a path, not a one-character base64 prefix).
+    if (/^\/[^/]+\//.test(source) && !/^[A-Za-z0-9+/\s=]+$/.test(source)) {
+        throw new Error(`Local filesystem path is not a valid attachment source: ${source.slice(0, 60)}`);
+    }
+    if (fallbackMime) {
+        const buffer = Buffer.from(source, 'base64');
+        if (buffer.length > 0) {
+            return { buffer, mime: fallbackMime, ext: extFromMime(fallbackMime, fallbackName), lastModified: Date.now() };
+        }
+    }
+    throw new Error('Unsupported attachment source');
 }
 
-function buildQwenImageFile(stsData, uploadResult, { filename, size, mime, lastModified }) {
+function buildQwenAttachmentFile(stsData, uploadResult, { filename, size, mime, lastModified, kind = 'image' }, token = null) {
     const id = stsData.file_id || uploadResult.fileId;
     const now = Date.now();
-    const browserToken = getAuthToken();
-    const userId = browserToken ? decodeTokenInfo(browserToken).accountId : null;
+    const activeToken = token || getAuthToken();
+    const userId = activeToken ? decodeTokenInfo(activeToken).accountId : null;
+    const isImage = kind === 'image' || String(mime || '').startsWith('image/');
+    const ext = path.extname(filename || '').toLowerCase();
 
     // Mirror the shape the real Qwen UI sends in messages[].files so the web
-    // backend recognises the image as an uploaded vision attachment.
+    // backend recognises the image/document attachment.
     return {
-        type: 'image',
+        type: isImage ? 'image' : 'file',
         file: {
             created_at: now,
             data: {},
@@ -111,32 +168,78 @@ function buildQwenImageFile(stsData, uploadResult, { filename, size, mime, lastM
         error: '',
         itemId: crypto.randomUUID(),
         file_type: mime,
-        showType: 'image',
-        file_class: 'vision',
+        showType: isImage ? 'image' : 'file',
+        file_class: isImage ? 'vision' : (DOCUMENT_EXTENSIONS.includes(ext) ? 'document' : 'default'),
         uploadTaskId: crypto.randomUUID()
     };
 }
 
-async function uploadImageSource(source) {
-    const { buffer, mime, ext, lastModified } = await imageSourceToBuffer(source);
-    const filename = `image-${Date.now()}-${crypto.randomUUID().slice(0, 8)}${ext}`;
+function getCachedAttachment(cacheKey) {
+    const entry = uploadedAttachmentCache.get(cacheKey);
+    if (!entry) return null;
+    if (Date.now() > entry.expiresAt) {
+        uploadedAttachmentCache.delete(cacheKey);
+        return null;
+    }
+    return {
+        ...entry.value,
+        itemId: crypto.randomUUID(),
+        uploadTaskId: crypto.randomUUID()
+    };
+}
+
+function setCachedAttachment(cacheKey, value) {
+    if (uploadedAttachmentCache.size >= UPLOAD_CACHE_MAX) {
+        const oldestKey = uploadedAttachmentCache.keys().next().value;
+        if (oldestKey) uploadedAttachmentCache.delete(oldestKey);
+    }
+    uploadedAttachmentCache.set(cacheKey, {
+        value,
+        expiresAt: Date.now() + UPLOAD_CACHE_TTL_MS
+    });
+}
+
+async function uploadAttachmentSource({ source, kind = 'image', filename: hintName = null, mime: hintMime = null }, tokenObj = null) {
+    const { buffer, mime, ext, lastModified } = await attachmentSourceToBuffer(
+        source,
+        hintMime || (kind === 'image' ? 'image/png' : 'application/pdf'),
+        hintName || ''
+    );
+    const activeToken = tokenObj?.token || null;
+    const accountScope = tokenObj?.id || (activeToken ? decodeTokenInfo(activeToken).accountId : null) || 'default';
+    const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+    const cacheKey = `${accountScope}:${kind}:${mime}:${hash}`;
+    const cached = getCachedAttachment(cacheKey);
+    if (cached) {
+        logInfo(`[attachment] Cache hit for ${kind} (${hash.slice(0, 12)}, ${buffer.length} bytes)`);
+        return cached;
+    }
+
+    const filename = hintName || `${kind}-${Date.now()}-${crypto.randomUUID().slice(0, 8)}${ext}`;
+    const isImage = kind === 'image' || mime.startsWith('image/');
+    const stsFileType = isImage
+        ? IMAGE_FILE_TYPE
+        : (DOCUMENT_EXTENSIONS.includes(ext.toLowerCase()) ? DOCUMENT_FILE_TYPE : DEFAULT_FILE_TYPE);
+
     const tempDir = path.resolve(process.cwd(), UPLOADS_DIR);
     fs.mkdirSync(tempDir, { recursive: true });
     const tempPath = path.join(tempDir, `${crypto.randomUUID()}${ext}`);
     try {
         fs.writeFileSync(tempPath, buffer);
-        logInfo(`[image] Uploading ${filename} (${buffer.length} bytes, ${mime})`);
-        const stsData = await getStsToken({ filename, filesize: String(buffer.length), filetype: 'image' });
+        logInfo(`[attachment] Uploading ${filename} (${buffer.length} bytes, ${mime}, type=${stsFileType})`);
+        const stsData = await getStsToken({ filename, filesize: String(buffer.length), filetype: stsFileType }, tokenObj);
         const uploaded = await uploadFile(tempPath, stsData);
-        return buildQwenImageFile(stsData, uploaded, { filename, size: buffer.length, mime, lastModified });
+        const fileObj = buildQwenAttachmentFile(stsData, uploaded, { filename, size: buffer.length, mime, lastModified, kind }, activeToken);
+        setCachedAttachment(cacheKey, fileObj);
+        return fileObj;
     } finally {
         try { fs.unlinkSync(tempPath); } catch { /* already removed */ }
     }
 }
 
 // Qwen Web accepts a plain string for messages[].content. OpenAI clients send
-// arrays of parts; once images are moved into files[] we collapse what remains
-// back into a string so the payload matches a real UI request.
+// arrays of parts; once images/files are moved into files[] we collapse what
+// remains back into a string so the payload matches a real UI request.
 function collapseImageMessageContent(content) {
     if (!Array.isArray(content)) return content;
     const chunks = [];
@@ -144,22 +247,29 @@ function collapseImageMessageContent(content) {
         if (!part) continue;
         if (typeof part === 'string') {
             chunks.push(part);
-        } else if (part.type === 'text') {
+        } else if (part.type === 'text' || part.type === 'input_text' || part.type === 'output_text') {
             chunks.push(part.text || '');
+        } else if (part.type === 'file' || part.type === 'input_file') {
+            const name = part.file?.filename || part.file?.name || part.filename || part.name
+                || (typeof part.file === 'string' ? part.file : '') || part.file?.file_id || 'attachment';
+            chunks.push(`[file: ${name}]`);
         } else {
             // Preserve any uncommon non-image part in a readable text form.
-            const value = part.url || part.file || part.name || '';
+            const value = part.url || (typeof part.file === 'string' ? part.file : part.file?.filename) || part.name || '';
             chunks.push(`[${part.type}: ${value}]`);
         }
     }
     return chunks.filter(Boolean).join('\n');
 }
 
-// Pure selection step: only the CURRENT (last) user turn is uploaded. Earlier
-// turns already live in Qwen's server-side chat history, so re-uploading them
-// would attach every old image again on each follow-up request. Older image
-// parts become short placeholders so stale data URLs never reach a prompt.
-export function collectImageParts(messages) {
+// Pure selection step:
+// - When continuing an existing Qwen chat (`includeHistory: false`, default),
+//   only the CURRENT (last) user turn is uploaded because earlier turns already
+//   live in Qwen's server-side history.
+// - When creating a new Qwen chat (`includeHistory: true`, e.g. stateless or
+//   tool-calling requests), ALL user turns' attachments are collected so
+//   earlier images/files do not disappear on turn 2+.
+export function collectImageParts(messages, { includeHistory = false } = {}) {
     const result = { currentParts: [], touchedMessages: new Set(), currentMessage: null };
     if (!Array.isArray(messages)) return result;
 
@@ -168,78 +278,121 @@ export function collectImageParts(messages) {
     const currentMessage = userMessages[userMessages.length - 1];
     result.currentMessage = currentMessage;
 
-    const seenSources = new Set();
+    const seenBySource = new Map();
     for (const msg of userMessages) {
         if (!Array.isArray(msg.content)) continue;
-        // Snapshot - msg.content is mutated while image parts are stripped.
+        // Snapshot - msg.content is mutated while attachment parts are stripped.
         for (const part of [...msg.content]) {
-            const source = imageSourceFromPart(part);
-            if (!source) continue;
+            const attachment = attachmentFromPart(part);
+            if (!attachment) continue;
             result.touchedMessages.add(msg);
 
+            const placeholder = attachment.kind === 'image'
+                ? '[image]'
+                : `[file: ${attachment.filename || 'attachment'}]`;
+
+            let placeholderNode = null;
             const replace = (text) => {
                 const index = msg.content.indexOf(part);
-                if (index !== -1) msg.content.splice(index, 1, { type: 'text', text });
+                if (index !== -1) {
+                    placeholderNode = { type: 'text', text };
+                    msg.content.splice(index, 1, placeholderNode);
+                }
             };
 
             if (msg !== currentMessage) {
-                replace('[image]');
+                replace(placeholder);
+                if (!includeHistory) continue;
+            }
+            const existing = seenBySource.get(attachment.source);
+            if (existing) {
+                // Avoid uploading identical attachments multiple times in one request.
+                if (msg === currentMessage && existing.msg !== currentMessage) {
+                    // Promote ownership to currentMessage: if a previously failed
+                    // attachment is re-sent in the current turn with includeHistory:true,
+                    // failures must be treated as current-turn errors (with placeholder)
+                    // rather than silently spliced out of currentMessage.
+                    existing.msg = currentMessage;
+                    existing.part = part;
+                    existing.placeholderNode = null;
+                } else if (msg === currentMessage) {
+                    const index = msg.content.indexOf(part);
+                    if (index !== -1) msg.content.splice(index, 1);
+                }
                 continue;
             }
-            if (seenSources.has(source)) {
-                // Some clients duplicate the same part; upload it only once.
-                const index = msg.content.indexOf(part);
-                if (index !== -1) msg.content.splice(index, 1);
-                continue;
-            }
-            seenSources.add(source);
-            result.currentParts.push({ msg, part, source });
+            const entry = { msg, part, placeholderNode, ...attachment };
+            seenBySource.set(attachment.source, entry);
+            result.currentParts.push(entry);
         }
     }
     return result;
 }
 
-// Converts OpenAI `image_url` / internal `image` parts into Qwen OSS
-// attachments, then strips them from content - Qwen expects images in
-// messages[].files, not inside messages[].content.
-export async function prepareOpenAIImages(messages) {
-    if (!Array.isArray(messages)) return { files: [], error: null };
+// Converts OpenAI `image_url` / internal `image` / `file` / `input_file` parts
+// into Qwen OSS attachments, then strips them from content - Qwen expects
+// attachments in messages[].files, not inside messages[].content.
+export async function prepareOpenAIImages(messages, { includeHistory = false, tokenObj = null } = {}) {
+    if (!Array.isArray(messages)) return { files: [], error: null, tokenObj: null };
 
-    const { currentParts, touchedMessages, currentMessage } = collectImageParts(messages);
-    if (!touchedMessages.size) return { files: [], error: null };
+    const { currentParts, touchedMessages, currentMessage } = collectImageParts(messages, { includeHistory });
+    if (!touchedMessages.size) return { files: [], error: null, tokenObj: null };
 
-    const files = [];
-    const errors = [];
-    for (const { msg, part, source } of currentParts) {
-        try {
-            files.push(await uploadImageSource(source));
-            const index = msg.content.indexOf(part);
-            if (index !== -1) msg.content.splice(index, 1);
-        } catch (error) {
-            logError(`[image] Failed to upload image: ${error.message}`);
-            errors.push(error.message);
-            const index = msg.content.indexOf(part);
-            if (index !== -1) msg.content.splice(index, 1, { type: 'text', text: '[image upload failed]' });
+    let resolvedTokenObj = tokenObj;
+    if (!resolvedTokenObj && currentParts.length > 0) {
+        const browserContext = validateBrowserContext();
+        resolvedTokenObj = await resolveAuthToken(browserContext);
+        if (!resolvedTokenObj?.token) {
+            return { files: [], error: 'Failed to get auth token for attachment upload', tokenObj: null };
         }
     }
 
-    // Collapse only messages we changed, after every image part was removed.
+    const files = [];
+    const currentTurnErrors = [];
+    const allErrors = [];
+    for (const item of currentParts) {
+        const { msg, part, kind, placeholderNode } = item;
+        const isCurrentTurn = msg === currentMessage;
+        try {
+            files.push(await uploadAttachmentSource(item, resolvedTokenObj));
+            const index = msg.content.indexOf(part);
+            if (index !== -1) msg.content.splice(index, 1);
+        } catch (error) {
+            logError(`[attachment] Failed to upload ${kind}${isCurrentTurn ? '' : ' (history)'}: ${error.message}`);
+            allErrors.push(error.message);
+            if (isCurrentTurn) currentTurnErrors.push(error.message);
+            const failText = kind === 'image' ? '[image upload failed]' : '[file upload failed]';
+            const index = msg.content.indexOf(part);
+            if (index !== -1) {
+                msg.content.splice(index, 1, { type: 'text', text: failText });
+            } else if (placeholderNode) {
+                placeholderNode.text = failText;
+            }
+        }
+    }
+
+    // Collapse only messages we changed, after every attachment part was removed.
     for (const msg of touchedMessages) {
         msg.content = collapseImageMessageContent(msg.content);
     }
 
-    if (!files.length && errors.length) {
-        return { files: [], error: `Image upload failed: ${errors[0]}` };
+    // Only block the whole request when a *current-turn* attachment failed and
+    // nothing at all was uploaded. History failures leave a placeholder text in
+    // content and are silently degraded — an old 404 image must not freeze the
+    // entire conversation (R4 regression).
+    const currentTurnHadAttachments = currentParts.some(item => item.msg === currentMessage);
+    if (currentTurnHadAttachments && !files.length && currentTurnErrors.length) {
+        return { files: [], error: `Attachment upload failed: ${currentTurnErrors[0]}`, tokenObj: resolvedTokenObj };
     }
-    // A text-less image message still needs a prompt for Qwen to answer.
+    // A text-less attachment message still needs a prompt for Qwen to answer.
     for (const msg of touchedMessages) {
         if (!String(msg.content || '').trim()) {
             msg.content = msg === currentMessage
-                ? 'Please describe the attached image.'
-                : '[image]';
+                ? 'Please describe the attached content.'
+                : '[attachment]';
         }
     }
-    return { files, error: null };
+    return { files, error: null, tokenObj: resolvedTokenObj };
 }
 
 function validateBrowserContext() {
@@ -248,12 +401,11 @@ function validateBrowserContext() {
     return browserContext;
 }
 
-async function validateAuthToken(browserContext) {
-    const tokenObj = await getAvailableToken();
-    if (tokenObj?.token) {
-        logInfo(`Using token from tokenManager: ${tokenObj.id}`);
-        return tokenObj.token;
-    }
+async function validateAuthToken(browserContext, tokenObj = null) {
+    if (tokenObj?.token) return tokenObj.token;
+
+    const resolved = await resolveAuthToken(browserContext);
+    if (resolved?.token) return resolved.token;
 
     let token = getAuthToken();
     if (!token) {
@@ -264,9 +416,9 @@ async function validateAuthToken(browserContext) {
     return token;
 }
 
-export async function getStsToken(fileInfo) {
+export async function getStsToken(fileInfo, tokenObj = null) {
     const browserContext = validateBrowserContext();
-    const token = await validateAuthToken(browserContext);
+    const token = await validateAuthToken(browserContext, tokenObj);
     logInfo(`Requesting STS token for file: ${fileInfo.filename}`);
 
     let page = null;

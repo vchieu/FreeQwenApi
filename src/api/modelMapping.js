@@ -8,6 +8,7 @@ const CANONICAL_MODELS = Object.freeze([
     "qwen3.7-plus",
     "qwen3.6-plus",
     "qwen3.5-plus",
+    "qwen3.5-omni-plus",
     "qwen3.5-397b-a17b",
     "qwen3-max",
     "qwen3-vl-plus",
@@ -28,9 +29,7 @@ const CANONICAL_MODELS = Object.freeze([
     "qwen2.5-14b-instruct-1m",
     "qwen2.5-coder-32b-instruct",
     "qwen2.5-72b-instruct",
-    "qwen3.5-plus",
     "qwen3.5-flash",
-    "qwen3.5-397b-a17b",
     "qwen3.5-122b-a10b",
     "qwen3.5-27b",
     "qwen3.5-35b-a3b"
@@ -86,9 +85,15 @@ const ALIAS_GROUPS = Object.freeze({
         "Qwen3.5-Plus",
         "qwen3.5-plus-latest"
     ],
+    "qwen3.5-omni-plus": [
+        "Qwen3.5-Omni-Plus",
+        "qwen3.5-omni",
+        "qwen3.5-omni-plus-latest"
+    ],
     "qwen3.5-397b-a17b": [
         "qwen3.5-397b",
-        "Qwen3.5-397B-A17B"
+        "Qwen3.5-397B-A17B",
+        "qwen3.5-huge"
     ],
     "qwen3-max": [
         "qwen-max",
@@ -201,18 +206,9 @@ const ALIAS_GROUPS = Object.freeze({
         "qwen2.5-72b",
         "Qwen2.5-72B-Instruct"
     ],
-    "qwen3.5-plus": [
-        "qwen3.5-plus-latest",
-        "Qwen3.5-Plus"
-    ],
     "qwen3.5-flash": [
         "qwen3.5-flash-latest",
         "Qwen3.5-Flash"
-    ],
-    "qwen3.5-397b-a17b": [
-        "qwen3.5-397b",
-        "Qwen3.5-397B-A17B",
-        "qwen3.5-huge"
     ],
     "qwen3.5-122b-a10b": [
         "qwen3.5-122b",

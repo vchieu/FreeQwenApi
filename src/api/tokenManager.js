@@ -61,6 +61,22 @@ export function hasValidTokens() {
     return tokens.some(t => (!t.resetAt || new Date(t.resetAt).getTime() <= now) && !t.invalid);
 }
 
+// Returns the earliest timestamp (ms) when any rate-limited account becomes available again.
+// Returns null if no accounts are currently rate-limited.
+export function getEarliestResetMs() {
+    const tokens = loadTokens();
+    const now = Date.now();
+    let earliest = null;
+    for (const t of tokens) {
+        if (!t.resetAt) continue;
+        const resetMs = new Date(t.resetAt).getTime();
+        if (resetMs > now && (earliest === null || resetMs < earliest)) {
+            earliest = resetMs;
+        }
+    }
+    return earliest;
+}
+
 export function markRateLimited(id, hours = RATE_LIMIT_HOURS) {
     const tokens = loadTokens();
     const idx = tokens.findIndex(t => t.id === id);
@@ -103,8 +119,20 @@ export function findAccountIdForToken(token) {
     return match?.id || null;
 }
 
+export function isTokenRateLimited(token, now = Date.now()) {
+    if (!token) return false;
+    const { accountId } = decodeTokenInfo(token);
+    const match = loadTokens().find(t =>
+        t.token === token ||
+        (accountId && decodeTokenInfo(t.token).accountId === accountId)
+    );
+    if (!match?.resetAt) return false;
+    return new Date(match.resetAt).getTime() > now;
+}
+
 // A fresh token read from the Qwen tab must clear `invalid` on the matching
-// account even when getAvailableToken() had no usable token at all.
+// account even when getAvailableToken() had no usable token at all, without
+// wiping an active 429 rate-limit cooldown (`resetAt`).
 export function markValidForToken(token) {
     if (!token) return false;
     const { accountId } = decodeTokenInfo(token);
@@ -114,7 +142,12 @@ export function markValidForToken(token) {
         (accountId && decodeTokenInfo(t.token).accountId === accountId)
     );
     if (idx === -1) return false;
-    markValid(tokens[idx].id, token);
+    tokens[idx].invalid = false;
+    if (tokens[idx].resetAt && new Date(tokens[idx].resetAt).getTime() <= Date.now()) {
+        tokens[idx].resetAt = null;
+    }
+    tokens[idx].token = token;
+    saveTokens(tokens);
     return true;
 }
 

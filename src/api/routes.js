@@ -17,6 +17,8 @@ import { FORGETMEAI_WATERMARK } from '../utils/branding.js';
 import { applySessionSync, getSessionSyncStatus } from './sessionSync.js';
 import { reasoningOptionsFromEffort } from './reasoning.js';
 import { parseToolCalls, mergeToolCalls, toolNames, toolRequiredParams, messagesToQwenPrompt } from './toolCalls.js';
+import { normalizeUsage } from './usage.js';
+import { errorResponseStatus, nonStreamErrorBody } from './resilience.js';
 
 // Control messages (captcha status, upstream errors) must never go into
 // `delta.content`: OpenAI clients concatenate that field into the assistant's
@@ -504,10 +506,14 @@ function stringifyOpenAIContent(content) {
         return content.map(item => {
             if (!item) return '';
             if (typeof item === 'string') return item;
-            if (item.type === 'text') return item.text || '';
+            if (item.type === 'text' || item.type === 'input_text' || item.type === 'output_text') return item.text || '';
             if (item.type === 'image_url') return `[image: ${item.image_url?.url || ''}]`;
             if (item.type === 'image') return `[image: ${item.image || ''}]`;
-            if (item.type === 'file') return `[file: ${item.file || item.name || ''}]`;
+            if (item.type === 'file' || item.type === 'input_file') {
+                const name = item.file?.filename || item.file?.name || item.filename || item.name
+                    || (typeof item.file === 'string' ? item.file : '') || item.file?.file_id || 'attachment';
+                return `[file: ${name}]`;
+            }
             return JSON.stringify(item);
         }).filter(Boolean).join('\n');
     }
@@ -745,7 +751,8 @@ function normalizeOpenAIToolCalls(toolCalls = []) {
     })).filter(c => c.function.name);
 }
 
-function resolveToolCalls(result, combinedTools) {
+function resolveToolCalls(result, combinedTools, toolChoice = null) {
+    if (toolChoice === 'none') return { calls: [], dropped: [], cleanText: '' };
     if (!Array.isArray(combinedTools) || combinedTools.length === 0) return { calls: [], dropped: [], cleanText: '' };
     const allowed = toolNames(combinedTools);
     const required = toolRequiredParams(combinedTools);
@@ -769,7 +776,7 @@ function resolveToolCalls(result, combinedTools) {
     return { calls, dropped, cleanText };
 }
 
-function buildOpenAIToolResponse(result, mappedModel, toolCalls, cleanText = '', reasoning = '') {
+function buildOpenAIToolResponse(result, mappedModel, toolCalls, cleanText = '', reasoning = '', usageContext = {}) {
     const msg = {
         role: 'assistant',
         // prose before the tool_call fence (if any) goes in content; null otherwise
@@ -779,6 +786,12 @@ function buildOpenAIToolResponse(result, mappedModel, toolCalls, cleanText = '',
     // Always surface thinking/reasoning alongside tool_calls (mirrors Python server.py)
     const reasoningContent = reasoning || result?.choices?.[0]?.message?.reasoning_content || '';
     if (reasoningContent) msg.reasoning_content = reasoningContent;
+    const usage = normalizeUsage(result?.usage, {
+        ...usageContext,
+        completionText: cleanText,
+        reasoningText: reasoningContent,
+        toolCalls
+    });
     return {
         id: result.id || 'chatcmpl-' + Date.now(),
         object: 'chat.completion',
@@ -786,15 +799,10 @@ function buildOpenAIToolResponse(result, mappedModel, toolCalls, cleanText = '',
         model: result.model || mappedModel || DEFAULT_MODEL,
         choices: [{
             index: 0,
-            message: {
-                role: 'assistant',
-                content: null,
-                tool_calls: toolCalls.map(({ index, ...call }) => call)
-            },
             message: msg,
             finish_reason: 'tool_calls'
         }],
-        usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        usage,
         chatId: result.chatId,
         parentId: result.parentId || result.response_id,
         x_qwen_chat_id: result.chatId,
@@ -802,7 +810,7 @@ function buildOpenAIToolResponse(result, mappedModel, toolCalls, cleanText = '',
     };
 }
 
-function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', reasoning = '') {
+function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', reasoning = '', options = {}) {
     const base = {
         id: result.id || 'chatcmpl-stream',
         object: 'chat.completion.chunk',
@@ -814,9 +822,9 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
         ...base,
         choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
     }) + '\n\n');
-    // 2) reasoning_content chunk (thinking) — mirrors Python server.py _sse_chunk reasoning
+    // 2) reasoning_content chunk (thinking) — skip if already streamed incrementally
     const reasoningContent = reasoning || result?.choices?.[0]?.message?.reasoning_content || '';
-    if (reasoningContent) {
+    if (reasoningContent && !options.skipReasoning) {
         res.write('data: ' + JSON.stringify({
             ...base,
             choices: [{ index: 0, delta: { reasoning_content: reasoningContent }, finish_reason: null }]
@@ -847,10 +855,18 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
             }]
         }) + '\n\n');
     }
-    // 5) finish chunk
+    // 5) finish chunk with normalized/estimated usage so clients like OpenCode
+    // can track context size and trigger compaction.
+    const usage = normalizeUsage(result?.usage, {
+        ...(options.usageContext || {}),
+        completionText: cleanText,
+        reasoningText: reasoningContent,
+        toolCalls
+    });
     res.write('data: ' + JSON.stringify({
         ...base,
-        choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }]
+        choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }],
+        usage
     }) + '\n\n');
     res.write('data: [DONE]\n\n');
     res.end();
@@ -871,16 +887,20 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
             choices: [{ index: 0, delta: { role: 'assistant' }, finish_reason: null }]
         });
 
+        let hasStreamedChunks = false;
         try {
             const result = await sendMessage(messageContent, mappedModel, chatId, parentId, null, combinedTools, toolChoice, systemMessage);
+            let streamedContent = '';
 
             if (result.error) {
                 writeProxyError(writeSse, mappedModel, `Error: ${result.error}`, false);
             } else if (result.choices?.[0]?.message) {
                 const content = String(result.choices[0].message.content || '');
+                streamedContent = content;
                 const codePoints = Array.from(content);
                 const chunkSize = 16;
                 for (let i = 0; i < codePoints.length; i += chunkSize) {
+                    hasStreamedChunks = true;
                     writeSse({
                         id: 'chatcmpl-stream', object: 'chat.completion.chunk',
                         created: Math.floor(Date.now() / 1000), model: mappedModel,
@@ -890,19 +910,26 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                 }
             }
 
+            const usage = normalizeUsage(result?.usage, {
+                promptText: typeof messageContent === 'string' ? messageContent : '',
+                completionText: streamedContent,
+                reasoningText: result?.choices?.[0]?.message?.reasoning_content || ''
+            });
             writeSse({
                 id: 'chatcmpl-stream', object: 'chat.completion.chunk',
                 created: Math.floor(Date.now() / 1000), model: mappedModel,
-                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
+                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+                usage
             });
             res.write('data: [DONE]\n\n');
             res.end();
         } catch (error) {
             logError('Error handling streaming request', error);
+            writeProxyError(writeSse, mappedModel, 'Internal server error', hasStreamedChunks);
             writeSse({
                 id: 'chatcmpl-stream', object: 'chat.completion.chunk',
                 created: Math.floor(Date.now() / 1000), model: mappedModel,
-                choices: [{ index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }]
+                choices: [{ index: 0, delta: {}, finish_reason: 'stop' }]
             });
             res.write('data: [DONE]\n\n');
             res.end();
@@ -911,16 +938,21 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
 
     function handleNonStreamingResponse(res, result, mappedModel) {
         if (result.error) {
-            return res.status(500).json({ error: { message: result.error, type: 'server_error' } });
+            const { status, body } = nonStreamErrorBody(result);
+            return res.status(status).json(body);
         }
 
+        const msg = result.choices?.[0]?.message;
         res.json({
             id: result.id || 'chatcmpl-' + Date.now(),
             object: 'chat.completion',
             created: Math.floor(Date.now() / 1000),
             model: result.model || mappedModel,
             choices: result.choices || [{ index: 0, message: { role: 'assistant', content: '' }, finish_reason: 'stop' }],
-            usage: result.usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+            usage: normalizeUsage(result.usage, {
+                completionText: msg?.content || '',
+                reasoningText: msg?.reasoning_content || ''
+            }),
             chatId: result.chatId,
             parentId: result.parentId
         });
@@ -987,13 +1019,16 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     res.write('data: ' + JSON.stringify(payload) + '\n\n');
                 };
 
+                let hasStreamedChunks = false;
+                let streamedContent = '';
+                let streamedReasoning = '';
                 try {
                     // Setup streaming callback
                     let streamingCallback = null;
-                    let hasStreamedChunks = false;
                     if (stream) {
                         streamingCallback = (chunk) => {
                             hasStreamedChunks = true;
+                            streamedContent += chunk;
                             writeSse({
                                 id: 'chatcmpl-' + Date.now(),
                                 object: 'chat.completion.chunk',
@@ -1011,6 +1046,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     let hasStreamedReasoning = false;
                     const reasoningCallback = (chunk) => {
                         hasStreamedReasoning = true;
+                        streamedReasoning += chunk;
                         writeSse({
                             id: 'chatcmpl-' + Date.now(),
                             object: 'chat.completion.chunk',
@@ -1059,6 +1095,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         if (typeof streamingCallback === 'function') {
                             streamingCallback(content);
                         } else {
+                            streamedContent += content;
                             writeSse({
                                 id: 'chatcmpl-stream',
                                 object: 'chat.completion.chunk',
@@ -1074,7 +1111,13 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
                     // Chunks were already sent via streamingCallback, don't duplicate!
 
-                    // Final chunk
+                    // Final chunk with usage
+                    const usage = normalizeUsage(result?.usage, {
+                        promptText: typeof messageContent === 'string' ? messageContent : '',
+                        messages: allMessages,
+                        completionText: result?.choices?.[0]?.message?.content || streamedContent,
+                        reasoningText: result?.choices?.[0]?.message?.reasoning_content || streamedReasoning
+                    });
                     writeSse({
                         id: 'chatcmpl-' + Date.now(),
                         object: 'chat.completion.chunk',
@@ -1082,20 +1125,22 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         model: mappedModel || DEFAULT_MODEL,
                         choices: [
                             { index: 0, delta: {}, finish_reason: 'stop' }
-                        ]
+                        ],
+                        usage
                     });
                     res.write('data: [DONE]\n\n');
                     res.end();
                     return;
                 } catch (error) {
                     logError('Error handling streaming request', error);
+                    writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, 'Internal server error', hasStreamedChunks);
                     writeSse({
                         id: 'chatcmpl-stream',
                         object: 'chat.completion.chunk',
                         created: Math.floor(Date.now() / 1000),
                         model: mappedModel || DEFAULT_MODEL,
                         choices: [
-                            { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
+                            { index: 0, delta: {}, finish_reason: 'stop' }
                         ]
                     });
                     res.write('data: [DONE]\n\n');
@@ -1422,7 +1467,10 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
             const chatModel = resolvedModel.model;
             logInfo(`Creating new chat${name ? ` with name: ${name}` : ''}, model: ${chatModel}`);
             const result = await createChatV2(chatModel, name || 'New chat');
-            if (result.error) { logError(`Error creating chat: ${result.error}`); return res.status(500).json({ error: result.error }); }
+            if (result.error) {
+                logError(`Error creating chat: ${result.error}`);
+                return res.status(errorResponseStatus(result)).json({ error: result.error });
+            }
             logInfo(`Created new chat v2 with ID: ${result.chatId}`);
             res.json({ chatId: result.chatId, success: true });
         } catch (error) {
@@ -1523,16 +1571,21 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                 ? !explicitChatId.startsWith('chat_')
                 : effectiveChatId && (conversationScope || ALLOW_UNSCOPED_SESSION_CHAT_RESTORE));
 
-            // Upload OpenAI image_url parts to Qwen OSS and move them into
+            // Upload OpenAI image_url / file parts to Qwen OSS and move them into
             // messages[].files - the shape Qwen Web actually understands.
+            // When creating a brand-new Qwen chat (e.g. stateless or tool-calling
+            // requests), include attachments from earlier history turns too.
             let imageFiles = [];
+            let attachmentTokenObj = null;
             if (Array.isArray(messages)) {
-                const preparedImages = await prepareOpenAIImages(messages);
+                const isNewQwenChat = isMeta || !resolveQwenChatId(effectiveChatId);
+                const preparedImages = await prepareOpenAIImages(messages, { includeHistory: isNewQwenChat });
                 if (preparedImages.error) {
                     return res.status(400).json({ error: { message: preparedImages.error, type: 'invalid_request_error' } });
                 }
                 imageFiles = preparedImages.files || [];
-                if (imageFiles.length) logInfo(`Prepared ${imageFiles.length} image attachment(s) for Qwen`);
+                attachmentTokenObj = preparedImages.tokenObj || null;
+                if (imageFiles.length) logInfo(`Prepared ${imageFiles.length} attachment(s) for Qwen`);
             }
 
             // When tools are present, fold the entire messages array (including system,
@@ -1604,6 +1657,12 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                 logInfo(`Using chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
             }
 
+            const usageContext = {
+                promptText: typeof messageContent === 'string' ? messageContent : '',
+                messages,
+                tools: combinedTools
+            };
+
             if (stream) {
                 res.setHeader('Content-Type', 'text/event-stream');
                 res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
@@ -1629,22 +1688,26 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                 const signal = clientAbortSignal(res);
                 startSseHeartbeat(res);
 
+                let hasStreamedChunks = false;
+                let streamedContent = '';
+                let streamedReasoning = '';
                 try {
                     const qwenChatId = resolveQwenChatId(effectiveChatId);
 
                     let hasStreamedReasoning = false;
                     const reasoningCallback = (text) => {
                         hasStreamedReasoning = true;
+                        streamedReasoning += text;
                         writeReasoningChunk(text);
                     };
 
                     // Setup streaming callback if stream=true
                     let streamingCallback = null;
-                    let hasStreamedChunks = false;
-                    const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0;
+                    const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0 && tool_choice !== 'none';
                     if (stream && !captureToolCalls) {
                         streamingCallback = (chunk) => {
                             hasStreamedChunks = true;
+                            streamedContent += chunk;
                             writeSse({
                                 id: 'chatcmpl-stream',
                                 object: 'chat.completion.chunk',
@@ -1673,6 +1736,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         streamingCallback,
                         {
                             ...reasoningOptions,
+                            tokenObj: attachmentTokenObj,
                             onReasoning: reasoningCallback,
                             // Tool routes need the whole answer for tool-call
                             // parsing: stream it through Node with an internal
@@ -1693,13 +1757,18 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     if (result.error) forgetSessionChat(req, conversationScope);
 
                     let _captureCleanText = '';
+                    let _captureDropped = [];
                     if (captureToolCalls) {
-                        const { calls: toolCalls, dropped, cleanText } = resolveToolCalls(result, combinedTools);
+                        const { calls: toolCalls, dropped, cleanText } = resolveToolCalls(result, combinedTools, tool_choice);
                         _captureCleanText = cleanText;
+                        _captureDropped = dropped;
                         if (toolCalls.length > 0) {
                             if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
                             const reasoning = result?.choices?.[0]?.message?.reasoning_content || '';
-                            writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText, reasoning);
+                            writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText, reasoning, {
+                                skipReasoning: hasStreamedReasoning,
+                                usageContext
+                            });
                             return;
                         }
                         if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
@@ -1707,6 +1776,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     if (!hasStreamedReasoning && result?.choices?.[0]?.message?.reasoning_content) {
                         writeReasoningChunk(result.choices[0].message.reasoning_content);
                         hasStreamedReasoning = true;
+                        streamedReasoning = result.choices[0].message.reasoning_content;
                     }
 
                     // Save chatId to session for subsequent requests
@@ -1718,6 +1788,10 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
 
                     if (result.error) {
                         writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks);
+                    } else if (captureToolCalls && _captureDropped.length > 0 && !_captureCleanText) {
+                        // Tool-call blocks were broken/rejected even after retry and no prose remains.
+                        // Never dump raw ```tool_call fences to the client as finish_reason:"stop".
+                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Invalid tool call: ${_captureDropped.join('; ')}`, hasStreamedChunks);
                     } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                         // Qwen returned JSON/normal response instead of SSE - send final as single chunk
                         // When captureToolCalls is active, use cleanText (fence blocks stripped)
@@ -1729,6 +1803,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         if (typeof streamingCallback === 'function') {
                             streamingCallback(content);
                         } else {
+                            streamedContent += content;
                             writeSse({
                                 id: 'chatcmpl-stream',
                                 object: 'chat.completion.chunk',
@@ -1744,6 +1819,27 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
                     // Chunks were already sent via streamingCallback, don't duplicate!
 
+                    const usage = normalizeUsage(result?.usage, {
+                        ...usageContext,
+                        completionText: result?.choices?.[0]?.message?.content || streamedContent,
+                        reasoningText: result?.choices?.[0]?.message?.reasoning_content || streamedReasoning
+                    });
+                    writeSse({
+                        id: 'chatcmpl-stream',
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: mappedModel || DEFAULT_MODEL,
+                        choices: [
+                            { index: 0, delta: {}, finish_reason: 'stop' }
+                        ],
+                        usage
+                    });
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+
+                } catch (error) {
+                    logError('Error handling streaming request', error);
+                    writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, 'Internal server error', hasStreamedChunks);
                     writeSse({
                         id: 'chatcmpl-stream',
                         object: 'chat.completion.chunk',
@@ -1755,25 +1851,11 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     });
                     res.write('data: [DONE]\n\n');
                     res.end();
-
-                } catch (error) {
-                    logError('Error handling streaming request', error);
-                    writeSse({
-                        id: 'chatcmpl-stream',
-                        object: 'chat.completion.chunk',
-                        created: Math.floor(Date.now() / 1000),
-                        model: mappedModel || DEFAULT_MODEL,
-                        choices: [
-                            { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
-                        ]
-                    });
-                    res.write('data: [DONE]\n\n');
-                    res.end();
                 }
             } else {
                 const qwenChatId = resolveQwenChatId(effectiveChatId);
                 const signal = clientAbortSignal(res);
-                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, { ...reasoningOptions, declaredTools: combinedTools, signal, keepChat });
+                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, { ...reasoningOptions, tokenObj: attachmentTokenObj, declaredTools: combinedTools, signal, keepChat });
 
                 // Cleanup chat by configured policy (default all).
                 cleanupEphemeralChat(result, { explicitChatId, effectiveChatId, isMeta, model: mappedModel, keepChat });
@@ -1787,19 +1869,29 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                 }
 
                 if (result.error) {
-                    return res.status(500).json({
-                        error: { message: result.error, type: "server_error" }
-                    });
+                    const { status, body } = nonStreamErrorBody(result);
+                    return res.status(status).json(body);
                 }
 
-                const { calls: toolCalls, dropped, cleanText: toolCleanText } = resolveToolCalls(result, combinedTools);
+                const { calls: toolCalls, dropped, cleanText: toolCleanText } = resolveToolCalls(result, combinedTools, tool_choice);
                 if (toolCalls.length > 0) {
                     if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
                     const reasoning = result?.choices?.[0]?.message?.reasoning_content || '';
-                    return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls, toolCleanText, reasoning));
+                    return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls, toolCleanText, reasoning, usageContext));
                 }
-                if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
+                if (dropped.length > 0) {
+                    logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
+                    if (!toolCleanText && Array.isArray(combinedTools) && combinedTools.length > 0 && tool_choice !== 'none') {
+                        return res.status(502).json({
+                            error: { message: `Invalid tool call: ${dropped.join('; ')}`, type: 'server_error' }
+                        });
+                    }
+                }
 
+                const finalContent = (Array.isArray(combinedTools) && combinedTools.length > 0 && tool_choice !== 'none' && toolCleanText)
+                    ? toolCleanText
+                    : (result.choices?.[0]?.message?.content || "");
+                const finalReasoning = result.choices?.[0]?.message?.reasoning_content || '';
                 const openaiResponse = {
                     id: result.id || "chatcmpl-" + Date.now(),
                     object: "chat.completion",
@@ -1809,16 +1901,16 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         index: 0,
                         message: {
                             role: "assistant",
-                            content: result.choices?.[0]?.message?.content || "",
-                            ...(result.choices?.[0]?.message?.reasoning_content ? { reasoning_content: result.choices[0].message.reasoning_content } : {})
+                            content: finalContent,
+                            ...(finalReasoning ? { reasoning_content: finalReasoning } : {})
                         },
                         finish_reason: "stop"
                     }],
-                    usage: result.usage || {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        total_tokens: 0
-                    },
+                    usage: normalizeUsage(result.usage, {
+                        ...usageContext,
+                        completionText: finalContent,
+                        reasoningText: finalReasoning
+                    }),
                     chatId: result.chatId,
                     parentId: result.parentId
                 };
@@ -1922,16 +2014,21 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
 
             const hasTools = Array.isArray(combinedTools) && combinedTools.length > 0;
 
-            // Upload OpenAI image_url parts to Qwen OSS and move them into
+            // Upload OpenAI image_url / file parts to Qwen OSS and move them into
             // messages[].files - the shape Qwen Web actually understands.
+            // When creating a brand-new Qwen chat (e.g. stateless or tool-calling
+            // requests), include attachments from earlier history turns too.
             let imageFiles = [];
+            let attachmentTokenObj = null;
             if (Array.isArray(messages)) {
-                const preparedImages = await prepareOpenAIImages(messages);
+                const isNewQwenChat = isMeta || !resolveQwenChatId(effectiveChatId);
+                const preparedImages = await prepareOpenAIImages(messages, { includeHistory: isNewQwenChat });
                 if (preparedImages.error) {
                     return res.status(400).json({ error: { message: preparedImages.error, type: 'invalid_request_error' } });
                 }
                 imageFiles = preparedImages.files || [];
-                if (imageFiles.length) logInfo(`Prepared ${imageFiles.length} image attachment(s) for Qwen`);
+                attachmentTokenObj = preparedImages.tokenObj || null;
+                if (imageFiles.length) logInfo(`Prepared ${imageFiles.length} attachment(s) for Qwen`);
             }
 
             // When tools are present, fold the entire messages array (including system,
@@ -2012,6 +2109,12 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                 logInfo(`Using chatId: ${effectiveChatId}, parentId: ${effectiveParentId || 'null'}`);
             }
 
+            const usageContext = {
+                promptText: typeof messageContent === 'string' ? messageContent : '',
+                messages,
+                tools: combinedTools
+            };
+
             if (stream) {
                 res.setHeader('Content-Type', 'text/event-stream');
                 res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
@@ -2034,22 +2137,26 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     ]
                 });
 
+                let hasStreamedChunks = false;
+                let streamedContent = '';
+                let streamedReasoning = '';
                 try {
                     const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
 
                     let hasStreamedReasoning = false;
                     const reasoningCallback = (text) => {
                         hasStreamedReasoning = true;
+                        streamedReasoning += text;
                         writeReasoningChunk(text);
                     };
 
                     // Setup streaming callback if stream=true
                     let streamingCallback = null;
-                    let hasStreamedChunks = false;
-                    const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0;
+                    const captureToolCalls = Array.isArray(combinedTools) && combinedTools.length > 0 && tool_choice !== 'none';
                     if (stream && !captureToolCalls) {
                         streamingCallback = (chunk) => {
                             hasStreamedChunks = true;
+                            streamedContent += chunk;
                             // OpenWebUI does not expect role in chunks - only content
                             writeSse({
                                 id: 'chatcmpl-' + Date.now(),
@@ -2079,6 +2186,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         streamingCallback,
                         {
                             ...reasoningOptions,
+                            tokenObj: attachmentTokenObj,
                             onReasoning: reasoningCallback,
                             // Tool routes need the whole answer for tool-call
                             // parsing: stream it through Node with an internal
@@ -2093,13 +2201,18 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     );
 
                     let _captureCleanText = '';
+                    let _captureDropped = [];
                     if (captureToolCalls) {
-                        const { calls: toolCalls, dropped, cleanText } = resolveToolCalls(result, combinedTools);
+                        const { calls: toolCalls, dropped, cleanText } = resolveToolCalls(result, combinedTools, tool_choice);
                         _captureCleanText = cleanText;
+                        _captureDropped = dropped;
                         if (toolCalls.length > 0) {
                             if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
                             const reasoning = result?.choices?.[0]?.message?.reasoning_content || '';
-                            writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText, reasoning);
+                            writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText, reasoning, {
+                                skipReasoning: hasStreamedReasoning,
+                                usageContext
+                            });
                             return;
                         }
                         if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
@@ -2107,6 +2220,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     if (!hasStreamedReasoning && result?.choices?.[0]?.message?.reasoning_content) {
                         writeReasoningChunk(result.choices[0].message.reasoning_content);
                         hasStreamedReasoning = true;
+                        streamedReasoning = result.choices[0].message.reasoning_content;
                     }
 
                     // Save chatId to session for subsequent requests
@@ -2118,6 +2232,8 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
 
                     if (result.error) {
                         writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks);
+                    } else if (captureToolCalls && _captureDropped.length > 0 && !_captureCleanText) {
+                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Invalid tool call: ${_captureDropped.join('; ')}`, hasStreamedChunks);
                     } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                         // Qwen returned JSON/normal response instead of SSE - send final as single chunk
                         // When captureToolCalls is active, use cleanText (fence blocks stripped)
@@ -2129,6 +2245,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         if (typeof streamingCallback === 'function') {
                             streamingCallback(content);
                         } else {
+                            streamedContent += content;
                             writeSse({
                                 id: 'chatcmpl-stream',
                                 object: 'chat.completion.chunk',
@@ -2144,6 +2261,27 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
                     // Chunks were already sent via streamingCallback, don't duplicate!
 
+                    const usage = normalizeUsage(result?.usage, {
+                        ...usageContext,
+                        completionText: result?.choices?.[0]?.message?.content || streamedContent,
+                        reasoningText: result?.choices?.[0]?.message?.reasoning_content || streamedReasoning
+                    });
+                    writeSse({
+                        id: 'chatcmpl-stream',
+                        object: 'chat.completion.chunk',
+                        created: Math.floor(Date.now() / 1000),
+                        model: mappedModel || DEFAULT_MODEL,
+                        choices: [
+                            { index: 0, delta: {}, finish_reason: 'stop' }
+                        ],
+                        usage
+                    });
+                    res.write('data: [DONE]\n\n');
+                    res.end();
+
+                } catch (error) {
+                    logError('Error handling streaming request', error);
+                    writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, 'Internal server error', hasStreamedChunks);
                     writeSse({
                         id: 'chatcmpl-stream',
                         object: 'chat.completion.chunk',
@@ -2155,25 +2293,11 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     });
                     res.write('data: [DONE]\n\n');
                     res.end();
-
-                } catch (error) {
-                    logError('Error handling streaming request', error);
-                    writeSse({
-                        id: 'chatcmpl-stream',
-                        object: 'chat.completion.chunk',
-                        created: Math.floor(Date.now() / 1000),
-                        model: mappedModel || DEFAULT_MODEL,
-                        choices: [
-                            { index: 0, delta: { content: 'Internal server error' }, finish_reason: 'stop' }
-                        ]
-                    });
-                    res.write('data: [DONE]\n\n');
-                    res.end();
                 }
             } else {
                 const qwenChatId = await resolveQwenChatId(effectiveChatId, mappedModel);
 
-                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, { ...reasoningOptions, declaredTools: combinedTools });
+                const result = await sendMessage(messageContent, mappedModel, qwenChatId, effectiveParentId, files, qwenTools, tool_choice, toolAwareSystemMessage, 't2t', null, true, 0, null, { ...reasoningOptions, tokenObj: attachmentTokenObj, declaredTools: combinedTools });
 
                 // Save chatId to session for subsequent requests
                 if (!isMeta && result.chatId) {
@@ -2188,9 +2312,8 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                 }
 
                 if (result.error) {
-                    return res.status(500).json({
-                        error: { message: result.error, type: "server_error" }
-                    });
+                    const { status, body } = nonStreamErrorBody(result);
+                    return res.status(status).json(body);
                 }
 
                 // Extract final message content
@@ -2201,14 +2324,22 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     messageText = result.response.text;
                 }
 
-                const { calls: toolCalls, dropped, cleanText: toolCleanText } = resolveToolCalls({ ...result, choices: [{ index: 0, message: { role: 'assistant', content: messageText, ...(result?.choices?.[0]?.message?.reasoning_content ? { reasoning_content: result.choices[0].message.reasoning_content } : {}) }, finish_reason: 'stop' }] }, combinedTools);
+                const { calls: toolCalls, dropped, cleanText: toolCleanText } = resolveToolCalls({ ...result, choices: [{ index: 0, message: { role: 'assistant', content: messageText, ...(result?.choices?.[0]?.message?.reasoning_content ? { reasoning_content: result.choices[0].message.reasoning_content } : {}) }, finish_reason: 'stop' }] }, combinedTools, tool_choice);
                 if (toolCalls.length > 0) {
                     if (dropped.length > 0) logWarn(`Tool call parse dropped: ${dropped.join('; ')}`);
                     const reasoning = result?.choices?.[0]?.message?.reasoning_content || '';
-                    return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls, toolCleanText, reasoning));
+                    return res.json(buildOpenAIToolResponse(result, mappedModel, toolCalls, toolCleanText, reasoning, usageContext));
                 }
-                if (dropped.length > 0) logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
+                if (dropped.length > 0) {
+                    logWarn(`Tool calls dropped with no usable calls: ${dropped.join('; ')}`);
+                    if (!toolCleanText && Array.isArray(combinedTools) && combinedTools.length > 0 && tool_choice !== 'none') {
+                        return res.status(502).json({
+                            error: { message: `Invalid tool call: ${dropped.join('; ')}`, type: 'server_error' }
+                        });
+                    }
+                }
 
+                const finalReasoning = result.choices?.[0]?.message?.reasoning_content || '';
                 const openaiResponse = {
                     id: result.id || "chatcmpl-" + Date.now(),
                     object: "chat.completion",
@@ -2219,15 +2350,15 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                         message: {
                             role: "assistant",
                             content: messageText,
-                            ...(result.choices?.[0]?.message?.reasoning_content ? { reasoning_content: result.choices[0].message.reasoning_content } : {})
+                            ...(finalReasoning ? { reasoning_content: finalReasoning } : {})
                         },
                         finish_reason: "stop"
                     }],
-                    usage: result.usage || {
-                        prompt_tokens: 0,
-                        completion_tokens: 0,
-                        total_tokens: 0
-                    },
+                    usage: normalizeUsage(result.usage, {
+                        ...usageContext,
+                        completionText: messageText,
+                        reasoningText: finalReasoning
+                    }),
                     // Pass through metadata for context preservation
                     x_qwen_chat_id: result.chatId,
                     x_qwen_parent_id: result.parentId || result.response_id

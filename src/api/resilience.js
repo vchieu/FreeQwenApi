@@ -103,3 +103,42 @@ export function isCaptchaResponse(response = {}) {
         title: response.statusText || ''
     }));
 }
+
+/** HTTP status to return to an OpenAI client when sendMessage/createChat fails. */
+export function errorResponseStatus(result = {}) {
+    const status = Number(result?.status);
+    return Number.isFinite(status) && status >= 400 ? status : 500;
+}
+
+/** Build the HTTP status and JSON error body for non-streaming chat endpoints. */
+export function nonStreamErrorBody(result = {}) {
+    const status = errorResponseStatus(result);
+    return {
+        status,
+        body: {
+            error: {
+                message: result?.error || 'Request failed',
+                type: status === 429 ? 'rate_limit_error' : 'server_error',
+                ...(status !== 500 ? { status } : {})
+            }
+        }
+    };
+}
+
+/**
+ * Format a 429 cooldown message from the earliest reset timestamp (ms).
+ * Returns null if no active rate-limit timestamp is in the future.
+ */
+export function formatRateLimitCooldown(resetMs, now = Date.now()) {
+    if (!resetMs || resetMs <= now) return null;
+    const remainMs = resetMs - now;
+    const h = Math.floor(remainMs / 3600000);
+    const m = Math.ceil((remainMs % 3600000) / 60000);
+    const cooldown = h > 0 ? `${h}h ${m}m` : `${m}m`;
+    return `Rate limited: all accounts are on cooldown. Earliest reset in ${cooldown}.`;
+}
+
+/** Suppress onReasoning on retries after reasoning chunks have already streamed. */
+export function applyRetryReasoningSuppression(options = {}, response = {}) {
+    return response?.hasStreamedReasoning ? { ...options, onReasoning: null } : options;
+}

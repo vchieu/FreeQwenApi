@@ -10,7 +10,10 @@ import {
     isChatInProgress,
     isProtocolTimeoutError,
     isNodeStreamTimeout,
-    isVisibleBox
+    isVisibleBox,
+    nonStreamErrorBody,
+    formatRateLimitCooldown,
+    applyRetryReasoningSuppression
 } from '../../src/api/resilience.js';
 import { notificationCommand } from '../../src/utils/notify.js';
 
@@ -138,7 +141,12 @@ check('unsupported platform is a no-op', () => {
 });
 
 console.log('Node stream early failure:');
-const { executeApiRequestWithNodeStreaming } = await import('../../src/api/chat.js');
+const {
+    executeApiRequestWithNodeStreaming,
+    recordBrowserTokenRateLimit,
+    getRateLimitCooldownError,
+    clearBrowserTokenRateLimits
+} = await import('../../src/api/chat.js');
 const savedFetch = globalThis.fetch;
 let earlyFailure;
 try {
@@ -155,11 +163,69 @@ try {
 check('early fetch failure returns a structured result (no ReferenceError)', () => {
     assert.equal(earlyFailure.success, false);
     assert.equal(earlyFailure.hasStreamedChunks, false);
+    assert.equal(earlyFailure.hasStreamedReasoning, false);
     assert.equal(earlyFailure.nodeTimeout, false);
     assert.match(earlyFailure.error, /network error/);
 });
 
-const TOTAL = 7 + 8 + 2 + 3 + 2 + 5 + 1;
+console.log('Thinking retry deduplication & 429 propagation:');
+{
+    const encoder = new TextEncoder();
+    const body = new ReadableStream({
+        async pull(controller) {
+            controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"reasoning_content":"THOUGHT-1","phase":"thinking"}}]}\n\n'));
+            await new Promise(r => setTimeout(r, 10));
+            controller.error(new TypeError('network error mid-stream'));
+        }
+    });
+    const saved = globalThis.fetch;
+    let midFail;
+    const thoughts = [];
+    try {
+        globalThis.fetch = async () => new Response(body, {
+            status: 200,
+            headers: { 'content-type': 'text/event-stream' }
+        });
+        midFail = await executeApiRequestWithNodeStreaming(
+            'https://example.invalid/api/v2/chat/completions',
+            { stream: true, model: 'test' },
+            'test-token',
+            null,
+            (t) => thoughts.push(t)
+        );
+    } finally {
+        globalThis.fetch = saved;
+    }
+    check('catch path after reasoning streamed sets hasStreamedReasoning=true and suppresses retry onReasoning', () => {
+        assert.equal(midFail.success, false);
+        assert.deepEqual(thoughts, ['THOUGHT-1']);
+        assert.equal(midFail.hasStreamedReasoning, true);
+        const retryOpts = applyRetryReasoningSuppression({ onReasoning: () => {} }, midFail);
+        assert.equal(retryOpts.onReasoning, null);
+    });
+}
+
+check('nonStreamErrorBody propagates 429 status instead of defaulting to 500', () => {
+    const out = nonStreamErrorBody({ error: 'Rate limited', status: 429 });
+    assert.equal(out.status, 429);
+    assert.equal(out.body.error.type, 'rate_limit_error');
+    const fallback = nonStreamErrorBody({ error: 'Boom' });
+    assert.equal(fallback.status, 500);
+});
+
+check('tab-only browser token 429 cooldown is reported instead of Auth error', () => {
+    clearBrowserTokenRateLimits();
+    try {
+        recordBrowserTokenRateLimit('browser-only-jwt', Date.now() + 30 * 60 * 1000);
+        const msg = getRateLimitCooldownError();
+        assert.ok(msg && /Rate limited:/i.test(msg), `expected Rate limited cooldown message, got: ${msg}`);
+        assert.equal(formatRateLimitCooldown(Date.now() - 1000), null);
+    } finally {
+        clearBrowserTokenRateLimits();
+    }
+});
+
+const TOTAL = 7 + 8 + 2 + 3 + 2 + 5 + 1 + 3;
 console.log(`\nchecks: ${checks}`);
 console.log(checks === TOTAL ? 'PASS' : `FAIL (expected ${TOTAL} checks, got ${checks})`);
 process.exit(checks === TOTAL ? 0 : 1);
