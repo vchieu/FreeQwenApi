@@ -91,7 +91,7 @@ Run `npm run start:cdp` and log in to Qwen Chat in the Chrome window that opens.
 curl http://localhost:3264/api/health
 ```
 
-Returns service, count of models, accounts, and watermark:
+Returns service, model count, session sync status, and watermark:
 
 ```json
 {
@@ -99,7 +99,13 @@ Returns service, count of models, accounts, and watermark:
   "service": "FreeQwenApi",
   "watermark": "t.me/forgetmeai",
   "baseUrl": "/api",
-  "models": 28
+  "models": 28,
+  "session": {
+    "synced": true,
+    "capturedAt": "2026-11-28T09:00:00.000Z",
+    "tokenExp": "2026-11-28T09:15:00.000Z"
+  },
+  "timestamp": "2026-11-28T09:00:00.000Z"
 }
 ```
 

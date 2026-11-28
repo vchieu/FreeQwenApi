@@ -123,7 +123,7 @@ export function saveAuthToken(token) {
 export function loadAuthToken() {
     try {
         if (fs.existsSync(TOKEN_FILE)) {
-            const token = fs.readFileSync(TOKEN_FILE, 'utf8');
+            const token = fs.readFileSync(TOKEN_FILE, 'utf8').trim();
             logInfo('Auth token loaded');
             return token;
         }
