@@ -897,8 +897,11 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
             if (isQuotaLimitDelta(quotaDelta)) {
                 return { success: false, status: 429, quotaLimited: true, errorBody: JSON.stringify(jsonResponse) };
             }
-            if (jsonResponse.code === 'RateLimited' || jsonResponse.error) {
-                return { success: false, status: 429, errorBody: JSON.stringify(jsonResponse) };
+            // Only RateLimited code maps to 429 (gotcha #21); other errors are 500
+            const hasError = jsonResponse.code || jsonResponse.error;
+            if (hasError) {
+                const status = jsonResponse.code === 'RateLimited' ? 429 : 500;
+                return { success: false, status, errorBody: JSON.stringify(jsonResponse) };
             }
             return { success: true, isTask: true, data: jsonResponse };
         }
@@ -1462,8 +1465,11 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                     if (isQuotaDelta(quotaDelta)) {
                         return { success: false, status: 429, quotaLimited: true, errorBody: JSON.stringify(jsonResponse) };
                     }
-                    if (jsonResponse.code === 'RateLimited' || jsonResponse.error) {
-                        return { success: false, status: 429, errorBody: JSON.stringify(jsonResponse) };
+                    // Only RateLimited code maps to 429 (gotcha #21); other errors are 500
+                    const hasError = jsonResponse.code || jsonResponse.error;
+                    if (hasError) {
+                        const status = jsonResponse.code === 'RateLimited' ? 429 : 500;
+                        return { success: false, status, errorBody: JSON.stringify(jsonResponse) };
                     }
                     return { success: true, isTask: true, data: jsonResponse };
                 }
@@ -1534,9 +1540,7 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                         // Other structured error chunks (ContentFiltered, quota, FAIL_SYS_USER_VALIDATE…)
                         // surface as 500 immediately — do NOT retry as network errors (R3).
                         if (chunk.code && !chunk.choices) {
-                            const errBody = JSON.stringify(chunk);
-                            logWarn(`[upstream-error] stream structured-error code=${chunk.code} model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${errBody.slice(0, 500)}`);
-                            streamError = { status: 500, errorBody: errBody };
+                            streamError = { status: 500, errorBody: JSON.stringify(chunk) };
                             finished = true;
                             return;
                         }
@@ -2259,19 +2263,14 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
             }
             const refreshed = await refreshTokenAfter401(browserContext, requestToken, tokenObj);
             if (!refreshed) {
-                logError('No fresh token available for chat creation retry.');
+                logError('Token expired and refresh failed.');
                 return unauthorizedError;
             }
             // Keep the caller (sendMessage) on the same token we use to retry
-            // so chat creation and message sending stay under one account.
-            tokenObj = adoptToken(tokenObj, refreshed);
+            // so chat creation and message sending stay consistent.
+            tokenObj = refreshed;
             logInfo(`Retrying chat creation with refreshed token (attempt ${retryCount + 2})`);
             return createChatV2(model, title, retryCount + 1, chatType, tokenObj, true, true);
-        }
-
-        // Quota limit is terminal — do not retry
-        if (result.quotaLimited) {
-            return { error: quotaLimitMessage(model), status: 429, quotaLimited: true };
         }
 
         const isTransient = result.status >= 500 && result.status < 600;
