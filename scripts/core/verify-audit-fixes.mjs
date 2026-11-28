@@ -7,6 +7,8 @@ import { normalizeUsage } from '../../src/api/usage.js';
 import { resolveRequestedModel } from '../../src/api/modelMapping.js';
 import { executeApiRequestWithNodeStreaming } from '../../src/api/chat.js';
 import { attachmentSourceToBuffer, prepareOpenAIImages } from '../../src/api/fileUpload.js';
+import { classifySseChunkError, classifyJsonErrorBody, rateLimitMessage } from '../../src/api/upstreamErrors.js';
+import { isQuotaLimitDelta } from '../../src/api/quotaLimit.js';
 
 let checks = 0;
 function check(name, fn) {
@@ -305,7 +307,156 @@ await checkAsync('R4: history 404 image with includeHistory:true does not error 
     }
 });
 
-const TOTAL_NEW = 2 + 1 + 2 + 2 + 1 + 4 + 1; // usage, models, EOF, R3, R3b, R9, R4
+// ---------------------------------------------------------------------------
+// P4: shared upstream classifiers — Node module vs browser evaluate mirror
+// ---------------------------------------------------------------------------
+console.log('\nP4: browser-path classifier mirror stays in sync with Node module:');
+const quotaContent = "You've reached today's Qwen4-Max limit. Upgrade your membership or switch to another model above to continue.";
+let mirror = null;
+check('P4: mirror block extracted from chat.js and reconstructs', () => {
+    const chatSrc = fs.readFileSync('src/api/chat.js', 'utf8');
+    const m = chatSrc.match(/\/\/ --- BEGIN upstream-classifiers mirror ---([\s\S]*?)\/\/ --- END upstream-classifiers mirror ---/);
+    assert.ok(m, 'upstream-classifiers mirror markers must exist in chat.js');
+    mirror = new Function(`${m[1]}\nreturn { isQuotaDelta, classifyChunkError, classifyJsonError };`)();
+    assert.equal(typeof mirror.classifyChunkError, 'function');
+    assert.equal(typeof mirror.classifyJsonError, 'function');
+    assert.equal(typeof mirror.isQuotaDelta, 'function');
+});
+
+const chunkVectors = [
+    null,
+    {},
+    { usage: { total_tokens: 5 } },
+    { code: 'RateLimited', detail: 'exceeded', num: 1 },
+    { code: 'FAIL_SYS_USER_VALIDATE', detail: 'Validation failed' },
+    { code: 'ContentFiltered', detail: 'Content policy violation' },
+    { error: 'upstream exploded' },
+    { code: 'SomeCode', choices: [{ delta: { content: 'ok' } }] },
+    { choices: [{ delta: { content: 'hello', phase: 'answer' } }] },
+    { choices: [{ delta: { content: quotaContent, status: 'finished', extra: { update_member: true } } }] },
+    { choices: [{ delta: { content: quotaContent, status: 'finished', extra: { update_member: false } } }] },
+    { choices: [{ delta: { content: "You've reached today's Qwen4-Max limit. Upgrade your membership.", status: 'finished' } }] },
+    { choices: [{ delta: { content: 'Just switch to another model from the dropdown.', status: 'finished' } }] },
+    { choices: [{ message: { content: quotaContent, status: 'finished' } }] },
+    { choices: [] },
+];
+check('P4: mirror.classifyChunkError matches classifySseChunkError on all vectors', () => {
+    for (const v of chunkVectors) {
+        assert.deepEqual(mirror.classifyChunkError(v), classifySseChunkError(v, isQuotaLimitDelta), JSON.stringify(v));
+    }
+});
+
+const jsonVectors = [
+    null,
+    {},
+    { success: false, data: { code: 'unauthorized', details: '401 Unauthorized' } },
+    { success: false, error: 'x' },
+    { code: 'RateLimited', num: 2 },
+    { data: { code: 'RateLimited', num: 0.5 } },
+    { data: { code: 'InternalError' } },
+    { data: { error: 'boom' } },
+    { success: true, data: { id: 'chat-1' } },
+    { choices: [{ delta: { content: quotaContent, status: 'finished', extra: { update_member: true } } }] },
+    { choices: [{ message: { content: quotaContent, status: 'finished' } }] },
+    { id: 'chatcmpl-1', choices: [{ message: { role: 'assistant', content: 'hi' } }] },
+];
+check('P4: mirror.classifyJsonError matches classifyJsonErrorBody on all vectors', () => {
+    for (const v of jsonVectors) {
+        assert.deepEqual(mirror.classifyJsonError(v), classifyJsonErrorBody(v, isQuotaLimitDelta), JSON.stringify(v));
+    }
+});
+
+const deltaVectors = [
+    null,
+    undefined,
+    {},
+    { content: quotaContent, status: 'finished', extra: { update_member: true } },
+    { content: quotaContent, status: 'finished', extra: { update_member: false } },
+    { content: "You've reached today's Qwen4-Max limit. Upgrade your membership.", status: 'finished' },
+    { content: 'Just switch to another model from the dropdown.', status: 'finished' },
+    { content: quotaContent, status: 'streaming' },
+    { content: 'x'.repeat(400) + quotaContent, status: 'finished' },
+    { content: 42, status: 'finished' },
+];
+check('P4: mirror.isQuotaDelta matches isQuotaLimitDelta on all delta vectors', () => {
+    for (const d of deltaVectors) {
+        assert.equal(mirror.isQuotaDelta(d), isQuotaLimitDelta(d), JSON.stringify(d));
+    }
+});
+
+check('P4: browser mirror surfaces ContentFiltered as 500 (not swallowed)', () => {
+    assert.deepEqual(mirror.classifyChunkError({ code: 'ContentFiltered', detail: 'x' }), { status: 500 });
+});
+check('P4: browser mirror surfaces quota delta as 429 quotaLimited', () => {
+    const r = mirror.classifyChunkError({ choices: [{ delta: { content: quotaContent, status: 'finished', extra: { update_member: true } } }] });
+    assert.deepEqual(r, { status: 429, quotaLimited: true });
+});
+
+// ---------------------------------------------------------------------------
+// P4: 429 cooldown message from RateLimited `num` (hours)
+// ---------------------------------------------------------------------------
+console.log('\nP4: 429 cooldown message from RateLimited num:');
+check('P4: num=1 -> about 1h', () => {
+    assert.ok(rateLimitMessage('{"code":"RateLimited","num":1}').includes('1h'));
+});
+check('P4: num=0.5 -> about 30m', () => {
+    assert.ok(rateLimitMessage('{"code":"RateLimited","num":0.5}').includes('30m'));
+});
+check('P4: nested data.num=2 -> about 2h', () => {
+    assert.ok(rateLimitMessage({ data: { num: 2 } }).includes('2h'));
+});
+check('P4: missing/zero num or non-JSON -> generic wait message', () => {
+    assert.ok(rateLimitMessage('{"code":"RateLimited"}').includes('Please wait before retrying'));
+    assert.ok(rateLimitMessage('{"code":"RateLimited","num":0}').includes('Please wait before retrying'));
+    assert.ok(rateLimitMessage('not json').includes('Please wait before retrying'));
+});
+
+// ---------------------------------------------------------------------------
+// P4: stream=false and non-SSE JSON error classification (nested shapes)
+// ---------------------------------------------------------------------------
+console.log('\nP4: stream=false and non-SSE JSON error classification:');
+async function runWithJsonResponse(json, payload) {
+    const savedFetch = globalThis.fetch;
+    try {
+        globalThis.fetch = async () => new Response(JSON.stringify(json), {
+            status: 200,
+            headers: { 'content-type': 'application/json' }
+        });
+        return await executeApiRequestWithNodeStreaming(
+            'https://example.invalid/api/v2/chat/completions',
+            payload,
+            'test-token',
+            () => {}
+        );
+    } finally {
+        globalThis.fetch = savedFetch;
+    }
+}
+await checkAsync('P4: stream=false success:false + data.code surfaces as 500 (was success:true)', async () => {
+    const res = await runWithJsonResponse({ success: false, data: { code: 'InternalError' } }, { stream: false, model: 'qwen3.7-plus' });
+    assert.equal(res.success, false);
+    assert.equal(res.status, 500);
+});
+await checkAsync('P4: stream=false nested data.code=RateLimited -> 429', async () => {
+    const res = await runWithJsonResponse({ data: { code: 'RateLimited', num: 1 } }, { stream: false, model: 'qwen3.7-plus' });
+    assert.equal(res.status, 429);
+});
+await checkAsync('P4: stream=false top-level RateLimited -> 429 (unchanged)', async () => {
+    const res = await runWithJsonResponse({ code: 'RateLimited', num: 2 }, { stream: false, model: 'qwen3.7-plus' });
+    assert.equal(res.status, 429);
+});
+await checkAsync('P4: stream=false quota delta -> 429 quotaLimited', async () => {
+    const res = await runWithJsonResponse({ choices: [{ delta: { content: quotaContent, status: 'finished', extra: { update_member: true } } }] }, { stream: false, model: 'qwen3.7-plus' });
+    assert.equal(res.status, 429);
+    assert.equal(res.quotaLimited, true);
+});
+await checkAsync('P4: non-SSE 200 with nested data.code error -> 500', async () => {
+    const res = await runWithJsonResponse({ data: { code: 'SomethingWrong' } }, { stream: true, model: 'qwen3.7-plus' });
+    assert.equal(res.success, false);
+    assert.equal(res.status, 500);
+});
+
+const TOTAL_NEW = 2 + 1 + 2 + 2 + 1 + 4 + 1 + 6 + 4 + 5; // usage, models, EOF, R3, R3b, R9, R4, P4-mirror, P4-429-msg, P4-json
 console.log(`\nchecks: ${checks}`);
 console.log(checks === TOTAL_NEW ? 'PASS' : `FAIL (expected ${TOTAL_NEW}, got ${checks})`);
 process.exit(checks === TOTAL_NEW ? 0 : 1);

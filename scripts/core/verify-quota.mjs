@@ -73,6 +73,30 @@ check('empty delta is NOT detected', () => {
     assert.equal(isQuotaLimitDelta({}), false);
 });
 
+check('single weak pattern (switch to another model) is NOT detected', () => {
+    const delta = {
+        content: 'You can switch to another model from the dropdown above.',
+        status: 'finished'
+    };
+    assert.equal(isQuotaLimitDelta(delta), false);
+});
+
+check('single pattern (upgrade your membership) is NOT detected', () => {
+    const delta = {
+        content: 'To upgrade your membership, open the settings page.',
+        status: 'finished'
+    };
+    assert.equal(isQuotaLimitDelta(delta), false);
+});
+
+check('single pattern (reached today limit) needs a second signal', () => {
+    const delta = {
+        content: "You've reached today's Qwen4-Max limit.",
+        status: 'finished'
+    };
+    assert.equal(isQuotaLimitDelta(delta), false);
+});
+
 check('quotaLimitMessage includes model name', () => {
     const msg = quotaLimitMessage('qwen4-max');
     assert.ok(msg.includes('qwen4-max'));
@@ -80,5 +104,5 @@ check('quotaLimitMessage includes model name', () => {
 });
 
 console.log(`\nchecks: ${checks}`);
-console.log(checks === 9 ? 'PASS' : `FAIL (expected 9 checks, got ${checks})`);
-process.exit(checks === 9 ? 0 : 1);
+console.log(checks === 12 ? 'PASS' : `FAIL (expected 12 checks, got ${checks})`);
+process.exit(checks === 12 ? 0 : 1);

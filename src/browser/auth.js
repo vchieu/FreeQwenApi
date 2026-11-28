@@ -17,6 +17,8 @@ async function getPage(context) {
 }
 
 async function promptUser(question) {
+    // Unattended runs have no TTY: never block waiting for stdin (gotcha #36).
+    if (!process.stdin.isTTY) return '';
     return new Promise(resolve => {
         process.stdout.write(question);
         const onData = (data) => {
@@ -51,8 +53,10 @@ export async function checkAuthentication(context) {
             const pageTitle = await page.title();
             if (pageTitle.includes('Verification')) {
                 logWarn('Verification stage detected. Please pass the verification in the browser.');
-                await promptUser('After passing verification, press ENTER to continue...');
-                logInfo('Verification confirmed by user.');
+                if (process.stdin.isTTY) {
+                    await promptUser('After passing verification, press ENTER to continue...');
+                    logInfo('Verification confirmed by user.');
+                }
             }
 
             const loginCount = await countLoginContainers(page, isPW);
@@ -67,6 +71,15 @@ export async function checkAuthentication(context) {
                 } catch (e) { logError('Failed to update session', e); }
                 if (isPW) await page.close();
                 return true;
+            }
+
+            // No TTY (unattended /status call, docker, piped stdin): prompting
+            // would hang forever. Fail fast with an actionable message instead.
+            if (!process.stdin.isTTY) {
+                logWarn('Qwen login required. Sign in inside the Chrome window opened by start:cdp, then retry the request.');
+                setAuthenticationStatus(false);
+                if (isPW) await page.close().catch(() => {});
+                return false;
             }
 
             console.log('------------------------------------------------------');

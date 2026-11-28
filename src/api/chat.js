@@ -2,6 +2,7 @@ import { getBrowserContext, getAuthenticationStatus, ensureBrowserConnection } f
 import { checkAuthentication, checkVerification } from '../browser/auth.js';
 import { saveAuthToken, loadAuthToken } from '../browser/session.js';
 import { isQuotaLimitDelta, quotaLimitMessage } from './quotaLimit.js';
+import { classifySseChunkError, classifyJsonErrorBody, rateLimitMessage } from './upstreamErrors.js';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -788,27 +789,9 @@ function buildPayloadV2(messageContent, model, chatId, parentId, files, systemMe
 function parseNonSseCompletionBody(body) {
     try {
         const parsed = JSON.parse(body);
-        const topLevelCode = parsed?.code;
-        const nestedCode = parsed?.data?.code;
-        const hasStructuredError =
-            parsed?.success === false ||
-            Boolean(parsed?.error) ||
-            Boolean(parsed?.data?.error) ||
-            Boolean(topLevelCode) ||
-            Boolean(nestedCode);
-
-        if (hasStructuredError) {
-            const isRateLimited = topLevelCode === 'RateLimited' || nestedCode === 'RateLimited';
-            return {
-                success: false,
-                status: isRateLimited ? 429 : 500,
-                errorBody: body
-            };
-        }
-
-        const quotaDelta = parsed?.choices?.[0]?.delta || parsed?.choices?.[0]?.message;
-        if (isQuotaLimitDelta(quotaDelta)) {
-            return { success: false, status: 429, quotaLimited: true, errorBody: body };
+        const classified = classifyJsonErrorBody(parsed, isQuotaLimitDelta);
+        if (classified) {
+            return { success: false, ...classified, errorBody: body };
         }
 
         if (parsed.choices || parsed.id || (parsed.success === true && parsed.data)) {
@@ -893,15 +876,11 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
 
         if (payload.stream === false) {
             const jsonResponse = await response.json();
-            const quotaDelta = jsonResponse?.choices?.[0]?.delta || jsonResponse?.choices?.[0]?.message;
-            if (isQuotaLimitDelta(quotaDelta)) {
-                return { success: false, status: 429, quotaLimited: true, errorBody: JSON.stringify(jsonResponse) };
-            }
-            // Only RateLimited code maps to 429 (gotcha #21); other errors are 500
-            const hasError = jsonResponse.code || jsonResponse.error;
-            if (hasError) {
-                const status = jsonResponse.code === 'RateLimited' ? 429 : 500;
-                return { success: false, status, errorBody: JSON.stringify(jsonResponse) };
+            // Shared classifier: nested success:false / data.code count as errors
+            // too; only RateLimited maps to 429 (gotcha #21).
+            const classified = classifyJsonErrorBody(jsonResponse, isQuotaLimitDelta);
+            if (classified) {
+                return { success: false, ...classified, errorBody: JSON.stringify(jsonResponse) };
             }
             return { success: true, isTask: true, data: jsonResponse };
         }
@@ -943,26 +922,15 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
             try {
                 const chunk = JSON.parse(jsonStr);
 
-                if (chunk.code === 'RateLimited') {
+                // Shared pure classifier (upstreamErrors.js): RateLimited → 429,
+                // other structured errors → 500 immediately (R3/R3b), quota delta
+                // → 429 quotaLimited (gotcha #35). The browser evaluate path runs
+                // a behavior-tested mirror of this exact logic.
+                const chunkError = classifySseChunkError(chunk, isQuotaLimitDelta);
+                if (chunkError) {
                     const errBody = JSON.stringify(chunk);
-                    logWarn(`[upstream-error] stream status=429 model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${errBody.slice(0, 500)}`);
-                    streamError = { status: 429, errorBody: errBody };
-                    finished = true;
-                    return;
-                }
-                // Other structured error chunks (ContentFiltered, quota, FAIL_SYS_USER_VALIDATE…)
-                // must surface immediately as 500, not fall through to network-error retry (R3).
-                if (chunk.code && !chunk.choices) {
-                    const errBody = JSON.stringify(chunk);
-                    logWarn(`[upstream-error] stream structured-error code=${chunk.code} model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${errBody.slice(0, 500)}`);
-                    streamError = { status: 500, errorBody: errBody };
-                    finished = true;
-                    return;
-                }
-                if (chunk.error && !chunk.choices) {
-                    const errBody = JSON.stringify(chunk);
-                    logWarn(`[upstream-error] stream status=500 model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${errBody.slice(0, 500)}`);
-                    streamError = { status: 500, errorBody: errBody };
+                    logWarn(`[upstream-error] stream status=${chunkError.status}${chunkError.quotaLimited ? ' quota-limit' : ''} code=${chunk.code || 'n/a'} model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${errBody.slice(0, 500)}`);
+                    streamError = { ...chunkError, errorBody: errBody };
                     finished = true;
                     return;
                 }
@@ -972,16 +940,6 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
 
                 if (chunk.choices && chunk.choices[0]) {
                     const delta = chunk.choices[0].delta || chunk.choices[0].message;
-                    // Qwen signals daily quota with HTTP 200 + extra.update_member.
-                    // Detect BEFORE forwarding any content so the quota notice is
-                    // never streamed to the client as an answer (gotcha #35).
-                    if (isQuotaLimitDelta(delta)) {
-                        const errBody = JSON.stringify(chunk);
-                        logWarn(`[quota-limit] model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'}`);
-                        streamError = { status: 429, quotaLimited: true, errorBody: errBody };
-                        finished = true;
-                        return;
-                    }
                     if (nativeAcc && delta?.function_call) {
                         collectNativeCall(nativeAcc, delta.function_call, allowedToolNames);
                     }
@@ -1421,9 +1379,12 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                 return out;
             };
 
-            // Mirror src/api/quotaLimit.js inside the page context (no ES module
-            // imports available here). Qwen signals daily quota with HTTP 200 +
-            // extra.update_member, not a RateLimited code (gotcha #35).
+            // --- BEGIN upstream-classifiers mirror ---
+            // Mirror of src/api/upstreamErrors.js + quotaLimit.js for the page
+            // context (no ES module imports inside evaluate). Never reference
+            // Node-scope symbols here (gotcha #36). verify-audit-fixes.mjs
+            // extracts this block and compares behavior with the Node modules
+            // on identical vectors — keep the logic in sync.
             const isQuotaDelta = (delta) => {
                 if (!delta) return false;
                 if (delta.extra && 'update_member' in delta.extra) return delta.extra.update_member === true;
@@ -1431,8 +1392,41 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                 if (typeof content !== 'string') return false;
                 if (delta.status !== 'finished') return false;
                 if (content.length > 300) return false;
-                return /you'?ve reached today'?s .+ limit|upgrade your membership|switch to another model/i.test(content);
+                const patterns = [/you'?ve reached today'?s .+ limit/i, /upgrade your membership/i, /switch to another model/i];
+                let hits = 0;
+                for (const pattern of patterns) if (pattern.test(content)) hits++;
+                return hits >= 2;
             };
+            const classifyChunkError = (chunk) => {
+                if (!chunk || typeof chunk !== 'object') return null;
+                if (chunk.code === 'RateLimited') return { status: 429 };
+                if (chunk.code && !chunk.choices) return { status: 500 };
+                if (chunk.error && !chunk.choices) return { status: 500 };
+                const choice = chunk.choices && chunk.choices[0];
+                const delta = choice && (choice.delta || choice.message);
+                if (isQuotaDelta(delta)) return { status: 429, quotaLimited: true };
+                return null;
+            };
+            const classifyJsonError = (parsed) => {
+                if (!parsed || typeof parsed !== 'object') return null;
+                const topLevelCode = parsed.code;
+                const nestedCode = parsed.data && parsed.data.code;
+                const hasStructuredError =
+                    parsed.success === false ||
+                    Boolean(parsed.error) ||
+                    Boolean(parsed.data && parsed.data.error) ||
+                    Boolean(topLevelCode) ||
+                    Boolean(nestedCode);
+                if (hasStructuredError) {
+                    const isRateLimited = topLevelCode === 'RateLimited' || nestedCode === 'RateLimited';
+                    return { status: isRateLimited ? 429 : 500 };
+                }
+                const choice = parsed.choices && parsed.choices[0];
+                const delta = choice && (choice.delta || choice.message);
+                if (isQuotaDelta(delta)) return { status: 429, quotaLimited: true };
+                return null;
+            };
+            // --- END upstream-classifiers mirror ---
 
             const t = data.token;
             if (!t) return { success: false, error: 'Auth token not found' };
@@ -1461,15 +1455,9 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
             if (response.ok) {
                 if (data.payload.stream === false) {
                     const jsonResponse = await response.json();
-                    const quotaDelta = jsonResponse?.choices?.[0]?.delta || jsonResponse?.choices?.[0]?.message;
-                    if (isQuotaDelta(quotaDelta)) {
-                        return { success: false, status: 429, quotaLimited: true, errorBody: JSON.stringify(jsonResponse) };
-                    }
-                    // Only RateLimited code maps to 429 (gotcha #21); other errors are 500
-                    const hasError = jsonResponse.code || jsonResponse.error;
-                    if (hasError) {
-                        const status = jsonResponse.code === 'RateLimited' ? 429 : 500;
-                        return { success: false, status, errorBody: JSON.stringify(jsonResponse) };
+                    const classified = classifyJsonError(jsonResponse);
+                    if (classified) {
+                        return { success: false, ...classified, errorBody: JSON.stringify(jsonResponse) };
                     }
                     return { success: true, isTask: true, data: jsonResponse };
                 }
@@ -1480,29 +1468,12 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                     const body = await response.text();
                     try {
                         const parsed = JSON.parse(body);
-                        const topLevelCode = parsed?.code;
-                        const nestedCode = parsed?.data?.code;
-                        const hasStructuredError =
-                            parsed?.success === false ||
-                            Boolean(parsed?.error) ||
-                            Boolean(parsed?.data?.error) ||
-                            Boolean(topLevelCode) ||
-                            Boolean(nestedCode);
-
                         // API sometimes returns JSON with success=false and code at HTTP 200.
-                        if (hasStructuredError) {
-                            const isRateLimited = topLevelCode === 'RateLimited' || nestedCode === 'RateLimited';
-                            return {
-                                success: false,
-                                status: isRateLimited ? 429 : 500,
-                                errorBody: body
-                            };
+                        const classified = classifyJsonError(parsed);
+                        if (classified) {
+                            return { success: false, ...classified, errorBody: body };
                         }
                         // Valid JSON completion response (sometimes Qwen returns this way)
-                        const quotaDelta = parsed?.choices?.[0]?.delta || parsed?.choices?.[0]?.message;
-                        if (isQuotaDelta(quotaDelta)) {
-                            return { success: false, status: 429, quotaLimited: true, errorBody: body };
-                        }
                         if (parsed.choices || parsed.id || (parsed.success === true && parsed.data)) {
                             return { success: true, isTask: false, data: parsed };
                         }
@@ -1532,20 +1503,13 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                     try {
                         const chunk = JSON.parse(jsonStr);
 
-                        if (chunk.code === 'RateLimited') {
-                            streamError = { status: 429, errorBody: JSON.stringify(chunk) };
-                            finished = true;
-                            return;
-                        }
-                        // Other structured error chunks (ContentFiltered, quota, FAIL_SYS_USER_VALIDATE…)
-                        // surface as 500 immediately — do NOT retry as network errors (R3).
-                        if (chunk.code && !chunk.choices) {
-                            streamError = { status: 500, errorBody: JSON.stringify(chunk) };
-                            finished = true;
-                            return;
-                        }
-                        if (chunk.error && !chunk.choices) {
-                            streamError = { status: 500, errorBody: JSON.stringify(chunk) };
+                        // Behavior-tested mirror of classifySseChunkError. Never
+                        // reference Node-scope symbols here (gotcha #36): the old
+                        // logWarn/payload copy-paste threw ReferenceError inside
+                        // the page and the catch below swallowed structured errors.
+                        const chunkError = classifyChunkError(chunk);
+                        if (chunkError) {
+                            streamError = { ...chunkError, errorBody: JSON.stringify(chunk) };
                             finished = true;
                             return;
                         }
@@ -1555,11 +1519,6 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
                         if (chunk.choices && chunk.choices[0]) {
                             const choice = chunk.choices[0];
                             const delta = choice.delta || choice.message;
-                            if (isQuotaDelta(delta)) {
-                                streamError = { status: 429, quotaLimited: true, errorBody: JSON.stringify(chunk) };
-                                finished = true;
-                                return;
-                            }
                             if (delta && delta.function_call) collectNative(delta.function_call);
                             if (delta && Array.isArray(delta.tool_calls)) {
                                 for (const tc of delta.tool_calls) {
@@ -1661,7 +1620,13 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
             error: CAPTCHA_NOTICE
         };
     }
-    return outcome.value;
+    // Observability for the browser path: logging inside evaluate is impossible
+    // (no Node logger in page context), so log structured failures here instead.
+    const browserResult = outcome.value;
+    if (browserResult && !browserResult.success && (Number(browserResult.status) >= 400 || browserResult.errorBody)) {
+        logWarn(`[upstream-error] browser path status=${browserResult.status || 'n/a'}${browserResult.quotaLimited ? ' quota-limit' : ''} model=${payload?.model || 'n/a'} chat_id=${payload?.chat_id || 'n/a'} body=${String(browserResult.errorBody || browserResult.error || '').slice(0, 500)}`);
+    }
+    return browserResult;
 }
 
 async function handleApiError(response, tokenObj, message, model, chatId, parentId, files, retryCount, chatType, size, waitForCompletion, onChunk = null, options = {}, tools = null, toolChoice = null, systemMessage = null) {
@@ -1756,7 +1721,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         if (response.quotaLimited) {
             return { error: quotaLimitMessage(model), status: 429, quotaLimited: true, chatId };
         }
-        return { error: 'Qwen rate limit reached. Please wait before retrying.', status: 429, chatId };
+        return { error: rateLimitMessage(response.errorBody), status: 429, chatId };
     }
 
     let errorMessage = response.error || response.statusText;

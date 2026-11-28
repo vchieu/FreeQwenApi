@@ -5,36 +5,44 @@
 // This is NOT a `code: 'RateLimited'` error — it's a successful response
 // that signals the account has hit its daily quota.
 
-const QUOTA_LIMIT_PATTERNS = [
-    /you'?ve reached today'?s .+ limit/i,
-    /upgrade your membership/i,
-    /switch to another model/i,
-];
-
 /**
  * Check if a delta object signals a quota limit.
  * Primary signal: `delta.extra?.update_member === true`
- * Fallback: content matches quota patterns AND delta.status === 'finished' AND content is short (<300 chars)
+ * Fallback: content matches >=2 quota patterns AND delta.status === 'finished'
+ * AND content is short (<300 chars). A single weak pattern (e.g. a normal answer
+ * saying "switch to another model") must NOT fake a quota error.
+ *
+ * SELF-CONTAINED on purpose: no module-level references, because the browser
+ * evaluate path keeps a behavior-tested mirror of this function (gotcha #36).
  * @param {object} delta - The delta object from choices[0].delta or choices[0].message
  * @returns {boolean}
  */
 export function isQuotaLimitDelta(delta) {
     if (!delta) return false;
-    
-    // Primary signal: extra.update_member
-    // If extra.update_member is explicitly false, it's NOT a quota limit
+
+    // Primary signal: extra.update_member.
+    // If extra.update_member is explicitly false, it's NOT a quota limit.
     if (delta.extra && 'update_member' in delta.extra) {
         return delta.extra.update_member === true;
     }
-    
-    // Fallback: content pattern + finished status + short content
-    // Only use fallback if extra field doesn't exist or doesn't have update_member
+
+    // Fallback: content patterns + finished status + short content.
+    // Only used when extra doesn't exist or doesn't have update_member.
     const content = delta.content || '';
     if (typeof content !== 'string') return false;
     if (delta.status !== 'finished') return false;
     if (content.length > 300) return false; // Avoid false-positive on long answers discussing "limit"
-    
-    return QUOTA_LIMIT_PATTERNS.some(pattern => pattern.test(content));
+
+    const patterns = [
+        /you'?ve reached today'?s .+ limit/i,
+        /upgrade your membership/i,
+        /switch to another model/i,
+    ];
+    let hits = 0;
+    for (const pattern of patterns) {
+        if (pattern.test(content)) hits++;
+    }
+    return hits >= 2;
 }
 
 /**

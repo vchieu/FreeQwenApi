@@ -33,10 +33,10 @@ Kiểm tra cú pháp & kiểm tra offline (không cần browser, không cần ne
 
 ```bash
 # Cú pháp (Windows CMD)
-node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/resilience.js && node --check src/utils/notify.js && node --check src/api/fileUpload.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node --check src/api/authRecovery.js && node --check src/api/quotaLimit.js && node --check src/api/sessionSync.js
+node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/resilience.js && node --check src/utils/notify.js && node --check src/api/fileUpload.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node --check src/api/authRecovery.js && node --check src/api/quotaLimit.js && node --check src/api/upstreamErrors.js && node --check src/api/sessionSync.js
 
 # Hoặc PowerShell
-node --check index.js; node --check src/api/chat.js; node --check src/api/routes.js; node --check src/api/resilience.js; node --check src/utils/notify.js; node --check src/api/fileUpload.js; node --check src/api/reasoning.js; node --check src/api/toolCalls.js; node --check src/api/authRecovery.js; node --check src/api/quotaLimit.js; node --check src/api/sessionSync.js
+node --check index.js; node --check src/api/chat.js; node --check src/api/routes.js; node --check src/api/resilience.js; node --check src/utils/notify.js; node --check src/api/fileUpload.js; node --check src/api/reasoning.js; node --check src/api/toolCalls.js; node --check src/api/authRecovery.js; node --check src/api/quotaLimit.js; node --check src/api/upstreamErrors.js; node --check src/api/sessionSync.js
 
 # Chạy bộ verify offline
 node scripts/core/verify-parser.mjs            # Kiểm tra parser SSE câu trả lời
@@ -45,7 +45,8 @@ node scripts/core/verify-tools.mjs             # Kiểm tra parser tool_calls, f
 node scripts/core/verify-auth-retry.mjs        # Kiểm tra nhận diện 401, chọn token xoay, chọn tab proxy-owned
 node scripts/core/verify-images.mjs            # Kiểm tra tách/chỉ upload ảnh lượt hiện tại
 node scripts/core/verify-resilience.mjs        # Kiểm tra retry network error, phát hiện captcha, lệnh notification
-node scripts/core/verify-quota.mjs             # Kiểm tra nhận diện quota limit (extra.update_member: true)
+node scripts/core/verify-quota.mjs             # Kiểm tra nhận diện quota limit (extra.update_member: true, fallback ≥2 pattern)
+node scripts/core/verify-audit-fixes.mjs     # Kiểm tra phân loại lỗi upstream (Node + mirror browser), 429 cooldown, nested JSON error
 ```
 
 Kiểm tra trực tiếp endpoint khi proxy đang chạy:
@@ -72,7 +73,8 @@ curl -X POST http://127.0.0.1:3264/api/chat/completions \
 | `src/utils/notify.js` | Fire-and-forget desktop alert (Windows MessageBox, macOS `osascript`, Linux `notify-send`); `notificationCommand()` pure để test | Sửa cách notify user khi cần giải captcha |
 | `src/api/reasoning.js` | Pure module: map `reasoning_effort` → Qwen `feature_config`, accumulator stream thinking | Chỉnh chế độ suy nghĩ (Fast/Auto/Thinking), xử lý stream suy nghĩ |
 | `src/api/sessionSync.js` | Nhận & validate token/Baxia headers từ CDP observer; ghi file atomic `baxia.json`, lưu token vào `auth_token.txt` | Cập nhật WAF headers, logic lọc header, lưu trữ token tự động |
-| `src/api/quotaLimit.js` | Pure module: nhận diện quota limit (`extra.update_member: true`), tạo thông báo lỗi | Xử lý khi account hit daily quota |
+| `src/api/quotaLimit.js` | Pure module: nhận diện quota limit (`extra.update_member: true`, fallback ≥2 pattern), tạo thông báo lỗi | Xử lý khi account hit daily quota |
+| `src/api/upstreamErrors.js` | Pure module: phân loại lỗi SSE/JSON upstream (RateLimited→429, structured→500, quota→429 `quotaLimited`), message cooldown 429 từ `num` | Sửa phân loại lỗi stream/non-stream, thông báo 429 |
 | `src/api/modelMapping.js` | Chuẩn hoá tên model, resolve alias/custom model về canonical Qwen model | Thêm alias model, map model từ client bên thứ ba |
 | `src/api/fileUpload.js` | Upload file lên OSS của Qwen qua STS token; `collectImageParts()` / `prepareOpenAIImages()` chuyển ảnh OpenAI thành `messages[].files` | Upload file đính kèm, tài liệu, hình ảnh, xử lý ảnh OpenAI `image_url` |
 | `src/api/imageGeneration.js` | Sinh ảnh qua Qwen Chat (`chatType: t2i`) hoặc DashScope | Sửa prompt sinh ảnh, đổi tỷ lệ khung hình |
@@ -83,7 +85,7 @@ curl -X POST http://127.0.0.1:3264/api/chat/completions \
 | `src/config.js` | Điểm tập trung đọc biến môi trường và fallback default constants | Xem default timeout, kích thước pool, port, URL endpoints |
 | `src/env.js` | Autoload file `.env` trước khi khởi chạy các module khác | Nạp biến môi trường |
 | `scripts/core/start-cdp.mjs` | Script launcher mở Chrome có CDP port 9222 và chạy proxy | Chỉnh tham số khởi động Chrome, profile dir |
-| `scripts/core/verify-*.mjs` | Bộ 7 script test offline (parser, reasoning, tools, images, auth-retry, resilience, quota) | Kiểm tra regression logic cốt lõi mà không cần mở trình duyệt |
+| `scripts/core/verify-*.mjs` | Bộ 8 script test offline (parser, reasoning, tools, images, auth-retry, resilience, quota, audit-fixes) | Kiểm tra regression logic cốt lõi mà không cần mở trình duyệt |
 | `session/` | Thư mục runtime gitignored (`baxia.json`, `auth_token.txt`, `history/`) | Xem trạng thái token, header WAF thực tế |
 
 ### Luồng xử lý chat completion
@@ -240,6 +242,7 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 34. **Chống lặp thinking ở cả `catch` timeout và retry lỗi mạng + không bỏ âm thầm ảnh gửi lại (`fullReasoning` / `fileUpload.js`)**: `executeApiRequestWithNodeStreaming()` khai báo `fullReasoning` **ngoài `try`** để nhánh `catch` không bị `ReferenceError` khi lỗi sớm và luôn trả `hasStreamedReasoning: fullReasoning.length > 0`; `handleApiError()` dùng `applyRetryReasoningSuppression()` để tắt `onReasoning` ở cả retry timeout lẫn network error. Ở `collectImageParts()`, khi ảnh lỗi trong history bị gửi lại ở lượt hiện tại với `includeHistory: true`, ownership được chuyển sang `currentMessage` thay vì splice bỏ âm thầm, để `prepareOpenAIImages()` giữ placeholder `[image upload failed]` và báo lỗi lượt hiện tại đúng chuẩn. Test regression: `verify-resilience.mjs`, `verify-images.mjs`, `verify-audit-fixes.mjs`.
 
 35. **Quota limit = HTTP 200 + `extra.update_member: true`, KHÔNG PHẢI `code: 'RateLimited'`**: Qwen web API không trả về HTTP 429 hay `code: 'RateLimited'` khi account hit daily quota. Thay vào đó nó trả về response thành công HTTP 200 với `choices[0].delta.extra.update_member === true` và content "You've reached today's Qwen4-Max limit...". Proxy detect pattern này qua `isQuotaLimitDelta()` trong `src/api/quotaLimit.js`, trả error terminal (không retry, không rotation) với `status: 429, quotaLimited: true`. Stream error dùng SSE `error` field + `proxy_notice`, **không inject vào `delta.content`** để history sạch. Test regression: `verify-quota.mjs`.
+36. **Browser evaluate không được tham chiếu symbol Node; mirror phân loại lỗi phải có drift test**: Trong `page.evaluate()` chỉ tồn tại `data` — bản copy-paste `logWarn`/`payload` từ Node path từng ném `ReferenceError` bị `catch` từng chunk nuốt mất, khiến structured error (ContentFiltered, FAIL_SYS_USER_VALIDATE) biến thành `interrupted` và retry oan. Phân loại lỗi giờ nằm trong pure module `src/api/upstreamErrors.js` (`classifySseChunkError`, `classifyJsonErrorBody`, `rateLimitMessage`); browser path không import được ES module nên mang **mirror có marker** `// --- BEGIN/END upstream-classifiers mirror ---` trong `chat.js`, và `verify-audit-fixes.mjs` extract block đó chạy cùng bộ vector với module Node để chống drift (kể cả `isQuotaDelta` vs `isQuotaLimitDelta`). Log `[upstream-error]` của browser path bắn phía Node sau khi evaluate trả về. Fallback quota yêu cầu **≥2 pattern** — câu trả lời ngắn chứa riêng "switch to another model" không phải quota. Nhánh `stream=false` xét cả `success:false`/`data.code`/`data.error` lồng (trước chỉ xét `code`/`error` top-level). 429 RateLimited kèm cooldown parse từ `num` (giờ) trong message. `promptUser()`/`checkAuthentication()` guard `process.stdin.isTTY` — không treo stdin khi chạy unattended. Test regression: `verify-audit-fixes.mjs` (28 checks), `verify-quota.mjs` (12 checks).
 
 ## Quy ước code & test
 
@@ -248,9 +251,9 @@ Tất cả cấu hình được định nghĩa tại `src/config.js`, nạp từ
 - **Pure Modules**: Các module xử lý logic (như `toolCalls.js`, `reasoning.js`, `sessionSync.js`) phải giữ tính chất pure (không gắn chặt vào DOM hay I/O nặng) để có thể chạy test offline qua `scripts/core/verify-*.mjs`.
 - **Bảo mật**: Tuyệt đối không commit thư mục `session/`, `.env`, `logs/`, `.opencode/`.
 - **Chạy kiểm tra trước khi hoàn thành**:
-  - Chạy cú pháp và 6 script verify offline:
+  - Chạy cú pháp và 8 script verify offline:
     ```bash
-    cmd /c "node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/resilience.js && node --check src/utils/notify.js && node --check src/api/fileUpload.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node --check src/api/authRecovery.js && node scripts/core/verify-parser.mjs && node scripts/core/verify-reasoning.mjs && node scripts/core/verify-tools.mjs && node scripts/core/verify-images.mjs && node scripts/core/verify-auth-retry.mjs && node scripts/core/verify-resilience.mjs"
+    cmd /c "node --check index.js && node --check src/api/chat.js && node --check src/api/routes.js && node --check src/api/resilience.js && node --check src/utils/notify.js && node --check src/api/fileUpload.js && node --check src/api/reasoning.js && node --check src/api/toolCalls.js && node --check src/api/authRecovery.js && node --check src/api/quotaLimit.js && node --check src/api/upstreamErrors.js && node --check src/api/sessionSync.js && node scripts/core/verify-parser.mjs && node scripts/core/verify-reasoning.mjs && node scripts/core/verify-tools.mjs && node scripts/core/verify-images.mjs && node scripts/core/verify-auth-retry.mjs && node scripts/core/verify-resilience.mjs && node scripts/core/verify-quota.mjs && node scripts/core/verify-audit-fixes.mjs"
     ```
 
 ## Cập nhật tài liệu
