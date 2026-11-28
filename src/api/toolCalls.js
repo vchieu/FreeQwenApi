@@ -207,7 +207,7 @@ function balancedJsonEnd(text, start) {
 // ``` inside an argument value (README, markdown...) does not close it early.
 function fenceCloseSearchStart(text, from) {
     let pos = from;
-    for (; ;) {
+    for (;;) {
         let j = pos;
         while (j < text.length && /[\s,]/.test(text[j])) j++;
         if (text[j] !== '{' && text[j] !== '[') break;
@@ -236,7 +236,10 @@ function parseLenientJson(raw) {
     const slashSafe = escapeInvalidBackslashesInStrings(candidate);
     const slashNeeded = slashSafe !== candidate;
     function tagRepair(v) {
-        if (slashNeeded && v !== null && typeof v === 'object') v[SLASH_REPAIR_SYM] = true;
+        if (slashNeeded && v !== null && typeof v === 'object') {
+            v[SLASH_REPAIR_SYM] = true;
+            Object.values(v).forEach(tagRepair);
+        }
         return v;
     }
     try { return tagRepair(JSON.parse(slashSafe)); } catch { /* fall through */ }
@@ -555,16 +558,14 @@ function* iterBlocks(text) {
                 yield { start: cand.start, end: blockEnd, data: lenient, kind: cand.kind };
             } else if (cand.kind === 'json') {
                 // Fix 2 (R9): a ```json block that (a) fails whole-block JSON.parse AND
-                // (b) contains both "name" and "arguments" keys is very likely a broken
-                // tool call (e.g. unescaped " inside content). collectJsonObjects may still
-                // extract partial/corrupt objects from it, so we cannot rely on objs.length.
-                // Mark it malformed so ctx.stopped is set and subsequent fences (like a
-                // dependent sh deploy.sh) do not run with a broken or missing predecessor.
-                // Plain config/non-tool broken JSON (no "arguments" key) is left as-is.
+                // (b) contains both "name" and "arguments" keys may be a broken tool call
+                // (e.g. unescaped " inside content). collectJsonObjects may still extract
+                // partial/corrupt objects from it, so we cannot rely on objs.length.
+                // parseToolCalls stops later fences only if it names a declared tool.
                 let wholeBlockValid = false;
                 try { JSON.parse(rawBlock.trim()); wholeBlockValid = true; } catch { /* broken */ }
                 if (!wholeBlockValid && /"name"/.test(rawBlock) && /"arguments"/.test(rawBlock)) {
-                    yield { start: cand.start, end: blockEnd, data: null, kind: cand.kind, malformed: true };
+                    yield { start: cand.start, end: blockEnd, data: null, kind: cand.kind, malformed: true, raw: rawBlock };
                 } else if (objs.length > 0) {
                     // Ordinary ```json block without tool shape stays eligible for isJsonFenceToolCall() -> false
                     for (const obj of objs) yield { start: cand.start, end: blockEnd, data: obj.value, kind: cand.kind };
@@ -581,591 +582,594 @@ function* iterBlocks(text) {
 }
 
 function extractCallsFromData(data) {
-        if (Array.isArray(data)) return data;
-        if (!data || typeof data !== 'object') return [];
-        if (Array.isArray(data.tool_calls)) return data.tool_calls;
-        if (Array.isArray(data.calls)) return data.calls;
-        if (data.function_call || data.tool_call) return [data.function_call || data.tool_call];
-        if (data.name || data.tool || data.tool_name || data.action || data.function?.name) return [data];
+    if (Array.isArray(data)) return data;
+    if (!data || typeof data !== 'object') return [];
+    if (Array.isArray(data.tool_calls)) return data.tool_calls;
+    if (Array.isArray(data.calls)) return data.calls;
+    if (data.function_call || data.tool_call) return [data.function_call || data.tool_call];
+    if (data.name || data.tool || data.tool_name || data.action || data.function?.name) return [data];
+    return [];
+}
+
+// Keep the strict tool shape here: a plain JSON answer like {"name":"Alice"}
+// must not turn into a tool call just because tools were declared on the request.
+function looksLikeToolCallObject(value) {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+    if (value.function && typeof value.function === 'object' && value.function.name) return true;
+    if (!value.name && !value.tool && !value.tool_name && !value.action) return false;
+    return ARGUMENT_KEYS.some(k => Object.prototype.hasOwnProperty.call(value, k));
+}
+
+// A ```json fence is ordinary answer content unless it clearly calls a declared
+// tool; otherwise config examples / package.json get cut out of the reply.
+function isJsonFenceToolCall(data, allowed) {
+    const items = Array.isArray(data) ? data
+        : Array.isArray(data?.tool_calls) ? data.tool_calls
+            : [data?.function_call || data?.tool_call || data];
+    return items.some(item => looksLikeToolCallObject(item) && (!allowed || allowed.has(
+        normalizeToolName(item.name || item.tool || item.tool_name || item.action || item.function?.name)
+    )));
+}
+
+function isToolPayloadObject(value) {
+    if (Array.isArray(value)) return value.length > 0 && value.every(looksLikeToolCallObject);
+    if (!value || typeof value !== 'object') return false;
+    if (Array.isArray(value.tool_calls)) return value.tool_calls.length > 0 && value.tool_calls.every(looksLikeToolCallObject);
+    if (Array.isArray(value.calls)) return value.calls.length > 0 && value.calls.every(looksLikeToolCallObject);
+    if (value.function_call || value.tool_call) return looksLikeToolCallObject(value.function_call || value.tool_call);
+    return looksLikeToolCallObject(value);
+}
+
+// Accept bare JSON tool calls ONLY when the entire trimmed message consists
+// exclusively of tool-call JSON object(s)/array(s) separated by whitespace.
+// "Do NOT run it: {...}" and "I will read it.\n{...}" both stay as text —
+// the model's intent is ambiguous and executing it silently is dangerous
+// (R7 regression: prose + newline + JSON was executing destructive commands).
+//
+// When prose precedes a bare JSON that starts on its own line at the END of
+// the message, we return a sentinel so the caller can nudge with a neutral
+// prompt ("place it on its own line") rather than executing or discarding it.
+// This avoids both the false execution bug (R7/finding #1) and the agent
+// stall that happens when the JSON is completely ignored.
+const BARE_JSON_AT_END = Symbol('bareJsonAtEnd');
+
+function collectWholeMessageBareToolCalls(text) {
+    const trimmed = String(text || '').trim();
+    if (!trimmed) return [];
+    if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
+        // Case: prose + JSON at end-of-message on its own line.
+        // Return the sentinel so caller can decide (nudge, not execute).
+        const objs = collectJsonObjects(trimmed);
+        if (objs.length > 0) {
+            const lastObj = objs[objs.length - 1];
+            if (isToolPayloadObject(lastObj.value) && trimmed.slice(lastObj.end).trim() === '') {
+                // JSON is at the very end of the message.
+                // Check it starts at beginning of a line (not mid-sentence).
+                const lineStart = trimmed.lastIndexOf('\n', lastObj.start - 1) + 1;
+                const prefix = trimmed.slice(lineStart, lastObj.start).trim();
+                if (!prefix) return [BARE_JSON_AT_END];
+            }
+        }
         return [];
     }
+    // Case (a): entire message is bare JSON (no prose at all).
+    const objs = collectJsonObjects(trimmed);
+    if (objs.length === 0) return [];
+    let cursor = 0;
+    for (const obj of objs) {
+        if (trimmed.slice(cursor, obj.start).trim() !== '') return [];
+        if (!isToolPayloadObject(obj.value)) return [];
+        cursor = obj.end;
+    }
+    if (trimmed.slice(cursor).trim() !== '') return [];
+    return objs;
+}
+function addNormalizedCalls(rawCalls, ctx) {
+    const { allowed, dropped, calls } = ctx;
+    for (const raw of rawCalls) {
+        // Fix 1 (R9): parseLenientJson tags every object it produced through backslash
+        // repair. Check BEFORE normalizeRawCall stringifies the args (which drops the Symbol).
+        const usedSlashRepair = !!(raw && (raw[SLASH_REPAIR_SYM] ||
+            (raw.arguments && typeof raw.arguments === 'object' && raw.arguments[SLASH_REPAIR_SYM])));
+        const normalized = normalizeRawCall(raw, calls.length);
+        if (!normalized) continue;
+        const name = normalized.function.name;
+        // Fix #4 (R8): stop at the FIRST broken call of any kind — undeclared tool,
+        // bad arguments — so subsequent calls that may depend on this one never run.
+        // Set ctx.stopped so the outer block loop also stops (each fence block is a
+        // separate addNormalizedCalls call, so break alone is not enough).
+        if (allowed && !allowed.has(name)) { dropped.push(`undeclared tool: ${name}`); ctx.stopped = true; break; }
+        const parsedArgs = parseArgsObject(normalized.function.arguments);
+        if (!parsedArgs.ok) { dropped.push(`unusable arguments for ${name}: ${parsedArgs.error}`); ctx.stopped = true; break; }
+        // Fix #3 (R2): restore control chars back to escaped form in path-like params.
+        // parseLenientJson may have called escapeInvalidBackslashesInStrings which makes
+        // JSON.parse decode \n → newline, \t → tab etc., corrupting Windows paths silently.
+        const restoredArgs = restoreArgsPathParams(parsedArgs.value);
+        // Fix 1 (R9): after backslash repair, a non-path string holding a backslash or a
+        // control char may have been decoded wrongly (\n, \t, \b). Reject the whole call
+        // and retry. Numbers, booleans and plain strings cannot be damaged.
+        if (usedSlashRepair) {
+            // Object.keys() skips Symbols, so only real parameters are checked.
+            const hasEscapes = (v) => typeof v === 'string' ? /[\\\x00-\x1f]/.test(v)
+                : !!v && typeof v === 'object' && Object.values(v).some(hasEscapes);
+            const nonPathKey = Object.keys(parsedArgs.value).find(
+                k => !PATH_PARAM_KEYS.has(k.toLowerCase()) && hasEscapes(parsedArgs.value[k]));
+            if (nonPathKey !== undefined) {
+                dropped.push(`backslash-repair would corrupt non-path param '${nonPathKey}' in ${name} — rejecting call; write every backslash as \\\\ inside JSON strings, or use / in paths`);
+                ctx.stopped = true;
+                break;
+            }
+        }
+        normalized.function.arguments = JSON.stringify(restoredArgs);
+        calls.push(normalized);
+    }
+}
 
-    // Keep the strict tool shape here: a plain JSON answer like {"name":"Alice"}
-    // must not turn into a tool call just because tools were declared on the request.
-    function looksLikeToolCallObject(value) {
-        if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
-        if (value.function && typeof value.function === 'object' && value.function.name) return true;
-        if (!value.name && !value.tool && !value.tool_name && !value.action) return false;
-        return ARGUMENT_KEYS.some(k => Object.prototype.hasOwnProperty.call(value, k));
+export function parseToolCalls(text, allowedNames = null, requiredByName = null) {
+    if (typeof text !== 'string') return { calls: [], dropped: [], text: '' };
+    const allowed = allowedNames instanceof Set ? allowedNames : (Array.isArray(allowedNames) ? new Set(allowedNames) : null);
+    const required = requiredByName || {};
+    const calls = [];
+    const dropped = [];
+    const ctx = { allowed, dropped, calls, stopped: false };
+    let cleanText = text;
+
+    // 1) Structured blocks (fenced/XML)
+    const blocks = [...iterBlocks(text)];
+
+    // Filter out "mid-sentence" blocks: if there is non-whitespace prose on the
+    // same line immediately before the block opening, the model is explaining the
+    // call rather than making it (mirrors Python tools.py lines 732-737).
+    // Record skipped explicit tool blocks in `dropped` so nudge-retry can recover
+    // when the model accidentally wrote "Let me read it: ```tool_call...".
+    const validBlocks = [];
+    for (const block of blocks) {
+        const lineStart = text.lastIndexOf('\n', block.start) + 1;
+        if (block.kind === 'json') {
+            const prefix = text.slice(lineStart, block.start).trim();
+            if (prefix.length === 0 && !block.malformed && isJsonFenceToolCall(block.data, allowed)) {
+                validBlocks.push(block);
+            } else if (prefix.length === 0 && block.malformed) {
+                // Only a block naming a declared tool is a broken call; templates and
+                // commented config examples stay part of the answer.
+                const raw = block.raw || '';
+                const namesTool = /^\s*[\[{]/.test(raw) && /"arguments"\s*:/.test(raw)
+                    && [...raw.matchAll(/"name"\s*:\s*"([^"]+)"/g)]
+                        .some(m => !allowed || allowed.has(normalizeToolName(m[1])));
+                if (!namesTool) continue;
+                // Fix 2 (R9): such a broken call must set ctx.stopped so subsequent fences
+                // do not run. Include it in validBlocks so the malformed loop below handles
+                // it — only if it starts on its own line (same guard as valid calls).
+                validBlocks.push(block);
+            }
+            continue;
+        }
+        // midSentenceUnclosed: unclosed fence with trailing prose — iterBlocks flagged it.
+        if (block.midSentenceUnclosed) {
+            dropped.push(`mid-sentence ${block.kind} block ignored (unclosed fence with trailing prose)`);
+            continue;
+        }
+        // Strip XML tags from prefix before checking (use fresh regex to avoid lastIndex issues)
+        const prefix = text.slice(lineStart, block.start).replace(/<\/?[\w][\w:.-]*(?:\s[^>]*)?>|<\/tool_call>/gi, '').trim();
+        if (prefix.length === 0) {
+            validBlocks.push(block);
+        } else {
+            dropped.push(`mid-sentence ${block.kind} block ignored (preceded by text on same line)`);
+        }
     }
 
-    // A ```json fence is ordinary answer content unless it clearly calls a declared
-    // tool; otherwise config examples / package.json get cut out of the reply.
-    function isJsonFenceToolCall(data, allowed) {
-        const items = Array.isArray(data) ? data
-            : Array.isArray(data?.tool_calls) ? data.tool_calls
-                : [data?.function_call || data?.tool_call || data];
-        return items.some(item => looksLikeToolCallObject(item) && (!allowed || allowed.has(
-            normalizeToolName(item.name || item.tool || item.tool_name || item.action || item.function?.name)
-        )));
+    if (validBlocks.length > 0) {
+        // Remove valid blocks from cleanText in reverse order (preserve positions).
+        // Several objects in one fence share a span: cut each span only once.
+        const sorted = [...new Map(validBlocks.map(b => [b.start, b])).values()]
+            .sort((a, b) => b.start - a.start);
+        for (const b of sorted) {
+            cleanText = cleanText.slice(0, b.start) + cleanText.slice(b.end);
+        }
+        for (const block of validBlocks) {
+            if (block.malformed) {
+                dropped.push(`malformed ${block.kind} block (invalid JSON or missing tool call)`);
+                // Fix D (R8): a malformed explicit tool_call block means the model tried
+                // to call a tool but produced broken JSON — stop processing subsequent blocks
+                // so a dependent call does not run with a broken or missing predecessor result.
+                ctx.stopped = true;
+                continue;
+            }
+            if (ctx.stopped) break; // R8: a previous block broke on bad call — stop all subsequent blocks
+            addNormalizedCalls(extractCallsFromData(block.data), ctx);
+        }
+        if (calls.length === 0 && dropped.length === 0) {
+            dropped.push('malformed tool_call block (no usable tool call)');
+        }
     }
 
-    function isToolPayloadObject(value) {
-        if (Array.isArray(value)) return value.length > 0 && value.every(looksLikeToolCallObject);
-        if (!value || typeof value !== 'object') return false;
-        if (Array.isArray(value.tool_calls)) return value.tool_calls.length > 0 && value.tool_calls.every(looksLikeToolCallObject);
-        if (Array.isArray(value.calls)) return value.calls.length > 0 && value.calls.every(looksLikeToolCallObject);
-        if (value.function_call || value.tool_call) return looksLikeToolCallObject(value.function_call || value.tool_call);
-        return looksLikeToolCallObject(value);
+    // 2) Whole-message bare JSON fallback. Only runs when no structured blocks exist.
+    //    - If the entire message is JSON tool call(s) with no prose: execute.
+    //    - If JSON appears at end-of-message on its own line after prose: record
+    //      a neutral drop so the caller can nudge ("place on its own line") without
+    //      executing the command blindly (finding #1 fix).
+    if (calls.length === 0 && blocks.length === 0) {
+        const bare = collectWholeMessageBareToolCalls(text);
+        if (bare.length === 1 && bare[0] === BARE_JSON_AT_END) {
+            // Model wrote prose + JSON on separate line. Don't execute; nudge.
+            dropped.push('bare-json-after-prose: tool call JSON found after prose — please place it in a ```tool_call block');
+        } else if (bare.length > 0) {
+            const bareCalls = bare.flatMap(obj => extractCallsFromData(obj.value));
+            addNormalizedCalls(bareCalls, ctx);
+            if (calls.length > 0) cleanText = '';
+        }
+        // 3) Lenient repair for malformed single objects (e.g. {"name":"x",{...}}).
+        // Only when the whole trimmed message is a single {...} object.
+        const trimmed = text.trim();
+        if (calls.length === 0 && trimmed.startsWith('{') && trimmed.endsWith('}')) {
+            const lenient = parseLenientJson(trimmed);
+            if (lenient !== NOTHING && isToolPayloadObject(lenient)) {
+                addNormalizedCalls(extractCallsFromData(lenient), ctx);
+                if (calls.length > 0) cleanText = '';
+            }
+        }
     }
 
-    // Accept bare JSON tool calls ONLY when the entire trimmed message consists
-    // exclusively of tool-call JSON object(s)/array(s) separated by whitespace.
-    // "Do NOT run it: {...}" and "I will read it.\n{...}" both stay as text —
-    // the model's intent is ambiguous and executing it silently is dangerous
-    // (R7 regression: prose + newline + JSON was executing destructive commands).
-    //
-    // When prose precedes a bare JSON that starts on its own line at the END of
-    // the message, we return a sentinel so the caller can nudge with a neutral
-    // prompt ("place it on its own line") rather than executing or discarding it.
-    // This avoids both the false execution bug (R7/finding #1) and the agent
-    // stall that happens when the JSON is completely ignored.
-    const BARE_JSON_AT_END = Symbol('bareJsonAtEnd');
-
-    function collectWholeMessageBareToolCalls(text) {
-        const trimmed = String(text || '').trim();
-        if (!trimmed) return [];
-        if (!trimmed.startsWith('{') && !trimmed.startsWith('[')) {
-            // Case: prose + JSON at end-of-message on its own line.
-            // Return the sentinel so caller can decide (nudge, not execute).
-            const objs = collectJsonObjects(trimmed);
-            if (objs.length > 0) {
-                const lastObj = objs[objs.length - 1];
-                if (isToolPayloadObject(lastObj.value) && trimmed.slice(lastObj.end).trim() === '') {
-                    // JSON is at the very end of the message.
-                    // Check it starts at beginning of a line (not mid-sentence).
-                    const lineStart = trimmed.lastIndexOf('\n', lastObj.start - 1) + 1;
-                    const prefix = trimmed.slice(lineStart, lastObj.start).trim();
-                    if (!prefix) return [BARE_JSON_AT_END];
-                }
-            }
-            return [];
+    // Per-call required param validation (R8 fix): stop at the FIRST broken call.
+    // Keeping calls that come after a broken one is dangerous — e.g. if
+    // `write deploy.sh` is missing `content`, we must NOT still run
+    // `sh deploy.sh` which would execute the stale or non-existent file.
+    // The correct behavior is: take all calls up to (but not including) the
+    // first invalid one, record the missing params in `dropped`, and nudge.
+    const validCalls = [];
+    for (const call of calls) {
+        const missing = missingRequiredParams([call], required);
+        if (missing.length > 0) {
+            for (const m of missing) dropped.push(`missing required parameter: ${m}`);
+            break; // Stop here — subsequent calls may depend on this one.
         }
-        // Case (a): entire message is bare JSON (no prose at all).
-        const objs = collectJsonObjects(trimmed);
-        if (objs.length === 0) return [];
-        let cursor = 0;
-        for (const obj of objs) {
-            if (trimmed.slice(cursor, obj.start).trim() !== '') return [];
-            if (!isToolPayloadObject(obj.value)) return [];
-            cursor = obj.end;
-        }
-        if (trimmed.slice(cursor).trim() !== '') return [];
-        return objs;
+        validCalls.push(call);
     }
-    function addNormalizedCalls(rawCalls, ctx) {
-        const { allowed, dropped, calls } = ctx;
-        for (const raw of rawCalls) {
-            // Fix 1 (R9): parseLenientJson tags the parsed object with SLASH_REPAIR_SYM when it
-            // used escapeInvalidBackslashesInStrings. Check BEFORE normalizeRawCall stringifies
-            // the args (which would lose the Symbol). The tag is on the outer call object; the
-            // args object (raw.arguments or similar) may also carry it if it was tagged separately.
-            const usedSlashRepair = !!(raw && (raw[SLASH_REPAIR_SYM] ||
-                (raw.arguments && typeof raw.arguments === 'object' && raw.arguments[SLASH_REPAIR_SYM])));
-            const normalized = normalizeRawCall(raw, calls.length);
-            if (!normalized) continue;
-            const name = normalized.function.name;
-            // Fix #4 (R8): stop at the FIRST broken call of any kind — undeclared tool,
-            // bad arguments — so subsequent calls that may depend on this one never run.
-            // Set ctx.stopped so the outer block loop also stops (each fence block is a
-            // separate addNormalizedCalls call, so break alone is not enough).
-            if (allowed && !allowed.has(name)) { dropped.push(`undeclared tool: ${name}`); ctx.stopped = true; break; }
-            const parsedArgs = parseArgsObject(normalized.function.arguments);
-            if (!parsedArgs.ok) { dropped.push(`unusable arguments for ${name}: ${parsedArgs.error}`); ctx.stopped = true; break; }
-            // Fix #3 (R2): restore control chars back to escaped form in path-like params.
-            // parseLenientJson may have called escapeInvalidBackslashesInStrings which makes
-            // JSON.parse decode \n → newline, \t → tab etc., corrupting Windows paths silently.
-            const restoredArgs = restoreArgsPathParams(parsedArgs.value);
-            // Fix 1 (R9): if parseLenientJson used backslash-repair AND any param is NOT a
-            // path-like key (e.g. content, command), decoded control chars would corrupt the
-            // value silently. Reject the whole call and retry (same as a malformed block).
-                if (usedSlashRepair) {
-                    // Object.keys() only returns string keys (not Symbols), so this correctly
-                    // checks every named param without touching any hidden Symbol tags.
-                    const nonPathKey = Object.keys(parsedArgs.value).find(
-                k => !PATH_PARAM_KEYS.has(k.toLowerCase())
-                    );
-                    if (nonPathKey !== undefined) {
-                        dropped.push(`backslash-repair would corrupt non-path param '${nonPathKey}' in ${name} — rejecting call`);
-                        ctx.stopped = true;
-                        break;
-                    }
+
+    // Ensure indices sequential
+    validCalls.forEach((c, i) => { c.index = i; });
+    return { calls: validCalls, dropped, text: cleanText.trim() };
+}
+
+function jsonComplete(s) {
+    const t = String(s || '').trim();
+    if (!t.startsWith('{') && !t.startsWith('[')) return false;
+    try { JSON.parse(t); return true; } catch { return false; }
+}
+
+export function createNativeToolCallAccumulator() {
+    return { calls: [], order: [] };
+}
+
+export function collectNativeCall(acc, fc, allowedNames = null) {
+    if (!acc || !fc || typeof fc !== 'object') return;
+    const allowed = allowedNames instanceof Set ? allowedNames : (Array.isArray(allowedNames) ? new Set(allowedNames) : null);
+    const name = normalizeToolName(fc.name || fc.function?.name || '');
+    const rawArgs = typeof fc.arguments === 'string' ? fc.arguments : (fc.arguments ? JSON.stringify(fc.arguments) : (typeof fc.function?.arguments === 'string' ? fc.function.arguments : (fc.function?.arguments ? JSON.stringify(fc.function.arguments) : '')));
+    const cid = String(fc.id ?? fc.call_id ?? fc.tool_call_id ?? fc.index ?? '').trim();
+
+    if (!Array.isArray(acc.calls)) acc.calls = [];
+    if (!Array.isArray(acc.order)) acc.order = [];
+
+    let call = null;
+    if (cid) {
+        call = acc.calls.find(c => c.cid === cid && (!name || !c.name || c.name === name)) || null;
+        if (!call) {
+            call = { cid, name, arguments: '', emitted: false };
+            acc.calls.push(call);
+        }
+    } else {
+        call = acc.calls[acc.calls.length - 1] || null;
+        const newByName = !!(name && call && call.name && call.name !== name);
+        const boundary = !!(call && rawArgs && jsonComplete(call.arguments) && String(rawArgs).trim().startsWith('{') && !String(rawArgs).startsWith(call.arguments));
+        if (!call || newByName || boundary) {
+            call = { cid: '', name, arguments: '', emitted: false };
+            acc.calls.push(call);
+        }
+    }
+
+    if (name) call.name = name;
+    if (!rawArgs) return;
+    const prev = call.arguments || '';
+    if (!prev) call.arguments = rawArgs;
+    else if (rawArgs.startsWith(prev)) call.arguments = rawArgs;
+    else if (prev.startsWith(rawArgs)) { /* keep longer */ }
+    else call.arguments += rawArgs;
+}
+
+export function flushNativeToolCalls(acc, allowedNames = null) {
+    const allowed = allowedNames instanceof Set ? allowedNames : (Array.isArray(allowedNames) ? new Set(allowedNames) : null);
+    const out = { calls: [], dropped: [] };
+    if (!acc || !Array.isArray(acc.calls)) return out;
+
+    for (const entry of acc.calls) {
+        const name = normalizeToolName(entry?.name || '');
+        if (!name) continue;
+        if (allowed && !allowed.has(name)) {
+            out.dropped.push(`undeclared tool: ${name}`);
+            continue;
+        }
+        const rawArgs = String(entry.arguments || '').trim() || '{}';
+        const parsed = parseArgsObject(rawArgs);
+        if (!parsed.ok) {
+            out.dropped.push(`unusable arguments for ${name}: ${parsed.error}`);
+            continue;
+        }
+        out.calls.push({
+            id: String(entry.cid || `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`),
+            type: 'function',
+            function: { name, arguments: JSON.stringify(parsed.value) },
+            index: out.calls.length
+        });
+    }
+    return out;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// messagesToQwenPrompt  — port of qwen-web2api/tools.py:messages_to_prompt()
+//
+// Converts an OpenAI messages array (+ optional tools/tool_choice) into a
+// single text prompt that Qwen Web understands.  The tool definitions are
+// rendered as a pinned "# Tool Use" block at the top; each message role is
+// serialised as labelled text; previous tool calls/results are reproduced as
+// ```tool_call fences + "[Tool result for …]" lines so the model has full
+// context.  Returns the finished prompt string.
+//
+// Usage (in routes.js):
+//   const prompt = messagesToQwenPrompt(messages, tools, tool_choice);
+//   // send prompt as the messageContent; do NOT set payload.tools
+// ─────────────────────────────────────────────────────────────────────────────
+
+const _TOOL_REMINDER = '\n\n[Reminder: you have working tools. To know what a file ' +
+    'contains or what a command produced, call the tool -- do ' +
+    'not answer from memory and do not claim to have read or ' +
+    'run anything you have not.]';
+
+function _stringifyContent(content) {
+    if (content === null || content === undefined) return '';
+    if (typeof content === 'string') return content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    if (Array.isArray(content)) {
+        const parts = [];
+        for (const c of content) {
+            if (c && typeof c === 'object') {
+                if (c.type === 'text' || c.type === 'input_text' || c.type === 'output_text') {
+                    if (c.text) parts.push(c.text);
+                } else if (c.type === 'file' || c.type === 'input_file') {
+                    const name = c.file?.filename || c.file?.name || c.filename || c.name
+                        || (typeof c.file === 'string' ? c.file : '') || c.file?.file_id || 'attachment';
+                    parts.push(`[file: ${name}]`);
+                } else if (typeof c.text === 'string') {
+                    parts.push(c.text);
                 }
-                normalized.function.arguments = JSON.stringify(restoredArgs);
-                calls.push(normalized);
+            } else if (typeof c === 'string') {
+                parts.push(c);
             }
         }
+        return parts.filter(Boolean).join('\n').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
+    }
+    return String(content);
+}
 
-        export function parseToolCalls(text, allowedNames = null, requiredByName = null) {
-            if (typeof text !== 'string') return { calls: [], dropped: [], text: '' };
-            const allowed = allowedNames instanceof Set ? allowedNames : (Array.isArray(allowedNames) ? new Set(allowedNames) : null);
-            const required = requiredByName || {};
-            const calls = [];
-            const dropped = [];
-            const ctx = { allowed, dropped, calls, stopped: false };
-            let cleanText = text;
+function _fnOf(t) {
+    return (t && t.type === 'function' && t.function) ? t.function : (t && t.function ? t.function : t);
+}
 
-            // 1) Structured blocks (fenced/XML)
-            const blocks = [...iterBlocks(text)];
+function _choiceInstruction(tool_choice) {
+    if (tool_choice === 'none') return '\n\nIMPORTANT: Do NOT call any tools. Respond with text only.';
+    if (tool_choice === 'required') return '\n\nIMPORTANT: You MUST call at least one tool. Do not respond with text only.';
+    if (tool_choice && typeof tool_choice === 'object') {
+        const fn = tool_choice.function;
+        const name = (fn && typeof fn === 'object') ? fn.name : (tool_choice.name || null);
+        if (name) return `\n\nIMPORTANT: You MUST call the tool "${name}". Do not call other tools.`;
+    }
+    return '';
+}
 
-            // Filter out "mid-sentence" blocks: if there is non-whitespace prose on the
-            // same line immediately before the block opening, the model is explaining the
-            // call rather than making it (mirrors Python tools.py lines 732-737).
-            // Record skipped explicit tool blocks in `dropped` so nudge-retry can recover
-            // when the model accidentally wrote "Let me read it: ```tool_call...".
-            const validBlocks = [];
-            for (const block of blocks) {
-                const lineStart = text.lastIndexOf('\n', block.start) + 1;
-                if (block.kind === 'json') {
-                    const prefix = text.slice(lineStart, block.start).trim();
-                    if (prefix.length === 0 && !block.malformed && isJsonFenceToolCall(block.data, allowed)) {
-                        validBlocks.push(block);
-                    } else if (prefix.length === 0 && block.malformed) {
-                        // Fix 2 (R9): a malformed ```json block that looks like a broken tool call
-                        // (iterBlocks flagged it malformed because whole-block JSON.parse failed and
-                        // the raw text had "name"+"arguments") must set ctx.stopped so subsequent
-                        // fences do not run. Include it in validBlocks so the malformed loop below
-                        // handles it — but only if it starts on its own line (same guard as valid calls).
-                        validBlocks.push(block);
-                    }
-                    continue;
-                }
-                // midSentenceUnclosed: unclosed fence with trailing prose — iterBlocks flagged it.
-                if (block.midSentenceUnclosed) {
-                    dropped.push(`mid-sentence ${block.kind} block ignored (unclosed fence with trailing prose)`);
-                    continue;
-                }
-                // Strip XML tags from prefix before checking (use fresh regex to avoid lastIndex issues)
-                const prefix = text.slice(lineStart, block.start).replace(/<\/?[\w][\w:.-]*(?:\s[^>]*)?>|<\/tool_call>/gi, '').trim();
-                if (prefix.length === 0) {
-                    validBlocks.push(block);
-                } else {
-                    dropped.push(`mid-sentence ${block.kind} block ignored (preceded by text on same line)`);
-                }
-            }
+function _toolUseBlock(toolDefs, constraint) {
+    const toolsJson = JSON.stringify(toolDefs, null, 0);
+    return (
+        '# Tool Use\n\n' +
+        'The tools below are connected to the user\'s machine and execute for ' +
+        'real the moment you call them.\n\n' +
+        'Call format (use this exact format):\n' +
+        '```tool_call\n' +
+        '{"name": "<tool_name>", "arguments": {<parameters>}}\n' +
+        '```\n\n' +
+        'Example (ALWAYS include the \"arguments\" key, even for simple calls):\n' +
+        '```tool_call\n' +
+        '{"name": "read_file", "arguments": {"path": "index.js"}}\n' +
+        '```\n\n' +
+        'Rules:\n' +
+        '- Each turn do exactly ONE of: (A) you need to read or change ' +
+        'something -> output ONLY tool_call block(s); (B) you already have ' +
+        'everything -> answer as plain text with NO block. Never both, and ' +
+        'never any prose after the block.\n' +
+        '- If the conversation\'s own instructions require every reply to use ' +
+        'a tool (for example an error such as "You did not use a tool in ' +
+        'your previous response"), do NOT answer in plain text: deliver the ' +
+        'final answer through the matching completion tool (for example ' +
+        'attempt_completion) as a tool_call block.\n' +
+        '- Every parameter belongs inside the "arguments" object, keyed ' +
+        'exactly like the tool\'s "parameters" properties -- never beside ' +
+        '"name".\n' +
+        '- Emit several blocks in one turn when the calls are independent.\n' +
+        '- Before reviewing or editing code, read the actual files with a ' +
+        'read/search tool first. Listing file names is not reading.\n' +
+        '- Never write [Tool result for ...] yourself and never invent a ' +
+        'result: emit the block and stop.\n' +
+        '- Never claim the tools are unavailable or that you lack ' +
+        'permission: they are connected and will run.\n\n' +
+        `Available tools:\n${toolsJson}${constraint}`
+    );
+}
 
-            if (validBlocks.length > 0) {
-                // Remove valid blocks from cleanText in reverse order (preserve positions).
-                // Several objects in one fence share a span: cut each span only once.
-                const sorted = [...new Map(validBlocks.map(b => [b.start, b])).values()]
-                    .sort((a, b) => b.start - a.start);
-                for (const b of sorted) {
-                    cleanText = cleanText.slice(0, b.start) + cleanText.slice(b.end);
-                }
-                for (const block of validBlocks) {
-                    if (block.malformed) {
-                        dropped.push(`malformed ${block.kind} block (invalid JSON or missing tool call)`);
-                        // Fix D (R8): a malformed explicit tool_call block means the model tried
-                        // to call a tool but produced broken JSON — stop processing subsequent blocks
-                        // so a dependent call does not run with a broken or missing predecessor result.
-                        ctx.stopped = true;
-                        continue;
-                    }
-                    if (ctx.stopped) break; // R8: a previous block broke on bad call — stop all subsequent blocks
-                    addNormalizedCalls(extractCallsFromData(block.data), ctx);
-                }
-                if (calls.length === 0 && dropped.length === 0) {
-                    dropped.push('malformed tool_call block (no usable tool call)');
-                }
-            }
+/**
+ * Convert an OpenAI messages array + tools into a single Qwen-Web prompt string.
+ *
+ * @param {Array}  messages    - OpenAI messages array
+ * @param {Array}  [tools]     - OpenAI tools array (optional)
+ * @param {*}      [tool_choice] - OpenAI tool_choice value (optional)
+ * @returns {string}  Complete prompt ready to send as the user message
+ */
+export function messagesToQwenPrompt(messages, tools = null, tool_choice = null) {
+    const parts = [];
+    let toolBlock = null;
 
-            // 2) Whole-message bare JSON fallback. Only runs when no structured blocks exist.
-            //    - If the entire message is JSON tool call(s) with no prose: execute.
-            //    - If JSON appears at end-of-message on its own line after prose: record
-            //      a neutral drop so the caller can nudge ("place on its own line") without
-            //      executing the command blindly (finding #1 fix).
-            if (calls.length === 0 && blocks.length === 0) {
-                const bare = collectWholeMessageBareToolCalls(text);
-                if (bare.length === 1 && bare[0] === BARE_JSON_AT_END) {
-                    // Model wrote prose + JSON on separate line. Don't execute; nudge.
-                    dropped.push('bare-json-after-prose: tool call JSON found after prose — please place it in a ```tool_call block');
-                } else if (bare.length > 0) {
-                    const bareCalls = bare.flatMap(obj => extractCallsFromData(obj.value));
-                    addNormalizedCalls(bareCalls, ctx);
-                    if (calls.length > 0) cleanText = '';
-                }
-                // 3) Lenient repair for malformed single objects (e.g. {"name":"x",{...}}).
-                // Only when the whole trimmed message is a single {...} object.
-                const trimmed = text.trim();
-                if (calls.length === 0 && trimmed.startsWith('{') && trimmed.endsWith('}')) {
-                    const lenient = parseLenientJson(trimmed);
-                    if (lenient !== NOTHING && isToolPayloadObject(lenient)) {
-                        addNormalizedCalls(extractCallsFromData(lenient), ctx);
-                        if (calls.length > 0) cleanText = '';
-                    }
-                }
-            }
-
-            // Per-call required param validation (R8 fix): stop at the FIRST broken call.
-            // Keeping calls that come after a broken one is dangerous — e.g. if
-            // `write deploy.sh` is missing `content`, we must NOT still run
-            // `sh deploy.sh` which would execute the stale or non-existent file.
-            // The correct behavior is: take all calls up to (but not including) the
-            // first invalid one, record the missing params in `dropped`, and nudge.
-            const validCalls = [];
-            for (const call of calls) {
-                const missing = missingRequiredParams([call], required);
-                if (missing.length > 0) {
-                    for (const m of missing) dropped.push(`missing required parameter: ${m}`);
-                    break; // Stop here — subsequent calls may depend on this one.
-                }
-                validCalls.push(call);
-            }
-
-            // Ensure indices sequential
-            validCalls.forEach((c, i) => { c.index = i; });
-            return { calls: validCalls, dropped, text: cleanText.trim() };
+    // Build pinned tool-use block if tools are present and tool_choice != 'none'
+    if (tools && Array.isArray(tools) && tools.length > 0 && tool_choice !== 'none') {
+        const defs = [];
+        for (const t of tools) {
+            if (!t || typeof t !== 'object') continue;
+            const fn = _fnOf(t);
+            if (!fn || typeof fn !== 'object' || !fn.name) continue;
+            defs.push({
+                name: fn.name,
+                description: fn.description || '',
+                parameters: fn.parameters || {}
+            });
         }
-
-        function jsonComplete(s) {
-            const t = String(s || '').trim();
-            if (!t.startsWith('{') && !t.startsWith('[')) return false;
-            try { JSON.parse(t); return true; } catch { return false; }
+        if (defs.length > 0) {
+            toolBlock = _toolUseBlock(defs, _choiceInstruction(tool_choice));
         }
+    }
 
-        export function createNativeToolCallAccumulator() {
-            return { calls: [], order: [] };
+    // Build id->name map from assistant tool_calls for tool result labelling
+    const idToName = {};
+    for (const m of messages || []) {
+        if (!m || m.role !== 'assistant') continue;
+        for (const tc of m.tool_calls || []) {
+            const fn = (tc && tc.function) || {};
+            if (tc && tc.id && fn.name) idToName[tc.id] = fn.name;
         }
+    }
 
-        export function collectNativeCall(acc, fc, allowedNames = null) {
-            if (!acc || !fc || typeof fc !== 'object') return;
-            const allowed = allowedNames instanceof Set ? allowedNames : (Array.isArray(allowedNames) ? new Set(allowedNames) : null);
-            const name = normalizeToolName(fc.name || fc.function?.name || '');
-            const rawArgs = typeof fc.arguments === 'string' ? fc.arguments : (fc.arguments ? JSON.stringify(fc.arguments) : (typeof fc.function?.arguments === 'string' ? fc.function.arguments : (fc.function?.arguments ? JSON.stringify(fc.function.arguments) : '')));
-            const cid = String(fc.id ?? fc.call_id ?? fc.tool_call_id ?? fc.index ?? '').trim();
+    // Serialise each message
+    const combined = new Set(); // tool_call_ids already included inline with assistant
+    for (let i = 0; i < (messages || []).length; i++) {
+        const m = messages[i];
+        if (!m || typeof m !== 'object') continue;
+        let role = m.role || 'user';
+        if (role === 'developer') role = 'system';
+        const content = _stringifyContent(m.content);
 
-            if (!Array.isArray(acc.calls)) acc.calls = [];
-            if (!Array.isArray(acc.order)) acc.order = [];
-
-            let call = null;
-            if (cid) {
-                call = acc.calls.find(c => c.cid === cid && (!name || !c.name || c.name === name)) || null;
-                if (!call) {
-                    call = { cid, name, arguments: '', emitted: false };
-                    acc.calls.push(call);
-                }
-            } else {
-                call = acc.calls[acc.calls.length - 1] || null;
-                const newByName = !!(name && call && call.name && call.name !== name);
-                const boundary = !!(call && rawArgs && jsonComplete(call.arguments) && String(rawArgs).trim().startsWith('{') && !String(rawArgs).startsWith(call.arguments));
-                if (!call || newByName || boundary) {
-                    call = { cid: '', name, arguments: '', emitted: false };
-                    acc.calls.push(call);
-                }
-            }
-
-            if (name) call.name = name;
-            if (!rawArgs) return;
-            const prev = call.arguments || '';
-            if (!prev) call.arguments = rawArgs;
-            else if (rawArgs.startsWith(prev)) call.arguments = rawArgs;
-            else if (prev.startsWith(rawArgs)) { /* keep longer */ }
-            else call.arguments += rawArgs;
-        }
-
-        export function flushNativeToolCalls(acc, allowedNames = null) {
-            const allowed = allowedNames instanceof Set ? allowedNames : (Array.isArray(allowedNames) ? new Set(allowedNames) : null);
-            const out = { calls: [], dropped: [] };
-            if (!acc || !Array.isArray(acc.calls)) return out;
-
-            for (const entry of acc.calls) {
-                const name = normalizeToolName(entry?.name || '');
-                if (!name) continue;
-                if (allowed && !allowed.has(name)) {
-                    out.dropped.push(`undeclared tool: ${name}`);
-                    continue;
-                }
-                const rawArgs = String(entry.arguments || '').trim() || '{}';
-                const parsed = parseArgsObject(rawArgs);
-                if (!parsed.ok) {
-                    out.dropped.push(`unusable arguments for ${name}: ${parsed.error}`);
-                    continue;
-                }
-                out.calls.push({
-                    id: String(entry.cid || `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`),
-                    type: 'function',
-                    function: { name, arguments: JSON.stringify(parsed.value) },
-                    index: out.calls.length
-                });
-            }
-            return out;
-        }
-
-        // ─────────────────────────────────────────────────────────────────────────────
-        // messagesToQwenPrompt  — port of qwen-web2api/tools.py:messages_to_prompt()
-        //
-        // Converts an OpenAI messages array (+ optional tools/tool_choice) into a
-        // single text prompt that Qwen Web understands.  The tool definitions are
-        // rendered as a pinned "# Tool Use" block at the top; each message role is
-        // serialised as labelled text; previous tool calls/results are reproduced as
-        // ```tool_call fences + "[Tool result for …]" lines so the model has full
-        // context.  Returns the finished prompt string.
-        //
-        // Usage (in routes.js):
-        //   const prompt = messagesToQwenPrompt(messages, tools, tool_choice);
-        //   // send prompt as the messageContent; do NOT set payload.tools
-        // ─────────────────────────────────────────────────────────────────────────────
-
-        const _TOOL_REMINDER = '\n\n[Reminder: you have working tools. To know what a file ' +
-            'contains or what a command produced, call the tool -- do ' +
-            'not answer from memory and do not claim to have read or ' +
-            'run anything you have not.]';
-
-        function _stringifyContent(content) {
-            if (content === null || content === undefined) return '';
-            if (typeof content === 'string') return content.replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-            if (Array.isArray(content)) {
-                const parts = [];
-                for (const c of content) {
-                    if (c && typeof c === 'object') {
-                        if (c.type === 'text' || c.type === 'input_text' || c.type === 'output_text') {
-                            if (c.text) parts.push(c.text);
-                        } else if (c.type === 'file' || c.type === 'input_file') {
-                            const name = c.file?.filename || c.file?.name || c.filename || c.name
-                                || (typeof c.file === 'string' ? c.file : '') || c.file?.file_id || 'attachment';
-                            parts.push(`[file: ${name}]`);
-                        } else if (typeof c.text === 'string') {
-                            parts.push(c.text);
-                        }
-                    } else if (typeof c === 'string') {
-                        parts.push(c);
-                    }
-                }
-                return parts.filter(Boolean).join('\n').replace(/\r\n/g, '\n').replace(/\r/g, '\n');
-            }
-            return String(content);
-        }
-
-        function _fnOf(t) {
-            return (t && t.type === 'function' && t.function) ? t.function : (t && t.function ? t.function : t);
-        }
-
-        function _choiceInstruction(tool_choice) {
-            if (tool_choice === 'none') return '\n\nIMPORTANT: Do NOT call any tools. Respond with text only.';
-            if (tool_choice === 'required') return '\n\nIMPORTANT: You MUST call at least one tool. Do not respond with text only.';
-            if (tool_choice && typeof tool_choice === 'object') {
-                const fn = tool_choice.function;
-                const name = (fn && typeof fn === 'object') ? fn.name : (tool_choice.name || null);
-                if (name) return `\n\nIMPORTANT: You MUST call the tool "${name}". Do not call other tools.`;
-            }
-            return '';
-        }
-
-        function _toolUseBlock(toolDefs, constraint) {
-            const toolsJson = JSON.stringify(toolDefs, null, 0);
-            return (
-                '# Tool Use\n\n' +
-                'The tools below are connected to the user\'s machine and execute for ' +
-                'real the moment you call them.\n\n' +
-                'Call format (use this exact format):\n' +
-                '```tool_call\n' +
-                '{"name": "<tool_name>", "arguments": {<parameters>}}\n' +
-                '```\n\n' +
-                'Example (ALWAYS include the \"arguments\" key, even for simple calls):\n' +
-                '```tool_call\n' +
-                '{"name": "read_file", "arguments": {"path": "index.js"}}\n' +
-                '```\n\n' +
-                'Rules:\n' +
-                '- Each turn do exactly ONE of: (A) you need to read or change ' +
-                'something -> output ONLY tool_call block(s); (B) you already have ' +
-                'everything -> answer as plain text with NO block. Never both, and ' +
-                'never any prose after the block.\n' +
-                '- If the conversation\'s own instructions require every reply to use ' +
-                'a tool (for example an error such as "You did not use a tool in ' +
-                'your previous response"), do NOT answer in plain text: deliver the ' +
-                'final answer through the matching completion tool (for example ' +
-                'attempt_completion) as a tool_call block.\n' +
-                '- Every parameter belongs inside the "arguments" object, keyed ' +
-                'exactly like the tool\'s "parameters" properties -- never beside ' +
-                '"name".\n' +
-                '- Emit several blocks in one turn when the calls are independent.\n' +
-                '- Before reviewing or editing code, read the actual files with a ' +
-                'read/search tool first. Listing file names is not reading.\n' +
-                '- Never write [Tool result for ...] yourself and never invent a ' +
-                'result: emit the block and stop.\n' +
-                '- Never claim the tools are unavailable or that you lack ' +
-                'permission: they are connected and will run.\n\n' +
-                `Available tools:\n${toolsJson}${constraint}`
-            );
-        }
-
-        /**
-         * Convert an OpenAI messages array + tools into a single Qwen-Web prompt string.
-         *
-         * @param {Array}  messages    - OpenAI messages array
-         * @param {Array}  [tools]     - OpenAI tools array (optional)
-         * @param {*}      [tool_choice] - OpenAI tool_choice value (optional)
-         * @returns {string}  Complete prompt ready to send as the user message
-         */
-        export function messagesToQwenPrompt(messages, tools = null, tool_choice = null) {
-            const parts = [];
-            let toolBlock = null;
-
-            // Build pinned tool-use block if tools are present and tool_choice != 'none'
-            if (tools && Array.isArray(tools) && tools.length > 0 && tool_choice !== 'none') {
-                const defs = [];
-                for (const t of tools) {
-                    if (!t || typeof t !== 'object') continue;
-                    const fn = _fnOf(t);
-                    if (!fn || typeof fn !== 'object' || !fn.name) continue;
-                    defs.push({
-                        name: fn.name,
-                        description: fn.description || '',
-                        parameters: fn.parameters || {}
-                    });
-                }
-                if (defs.length > 0) {
-                    toolBlock = _toolUseBlock(defs, _choiceInstruction(tool_choice));
-                }
-            }
-
-            // Build id->name map from assistant tool_calls for tool result labelling
-            const idToName = {};
-            for (const m of messages || []) {
-                if (!m || m.role !== 'assistant') continue;
-                for (const tc of m.tool_calls || []) {
+        if (role === 'system') {
+            parts.push(`[System instruction]: ${content}`);
+        } else if (role === 'assistant') {
+            if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+                // Render tool calls as fence blocks, then inline any following tool results
+                const blocks = [];
+                for (const tc of m.tool_calls) {
                     const fn = (tc && tc.function) || {};
-                    if (tc && tc.id && fn.name) idToName[tc.id] = fn.name;
+                    let args = fn.arguments || '{}';
+                    if (typeof args !== 'string') args = JSON.stringify(args, null, 0);
+                    try { JSON.parse(args); } catch { args = '{}'; }
+                    blocks.push(
+                        '```tool_call\n' +
+                        JSON.stringify({ name: fn.name || '', arguments: JSON.parse(args) }) +
+                        '\n```'
+                    );
                 }
-            }
-
-            // Serialise each message
-            const combined = new Set(); // tool_call_ids already included inline with assistant
-            for (let i = 0; i < (messages || []).length; i++) {
-                const m = messages[i];
-                if (!m || typeof m !== 'object') continue;
-                let role = m.role || 'user';
-                if (role === 'developer') role = 'system';
-                const content = _stringifyContent(m.content);
-
-                if (role === 'system') {
-                    parts.push(`[System instruction]: ${content}`);
-                } else if (role === 'assistant') {
-                    if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
-                        // Render tool calls as fence blocks, then inline any following tool results
-                        const blocks = [];
-                        for (const tc of m.tool_calls) {
-                            const fn = (tc && tc.function) || {};
-                            let args = fn.arguments || '{}';
-                            if (typeof args !== 'string') args = JSON.stringify(args, null, 0);
-                            try { JSON.parse(args); } catch { args = '{}'; }
-                            blocks.push(
-                                '```tool_call\n' +
-                                JSON.stringify({ name: fn.name || '', arguments: JSON.parse(args) }) +
-                                '\n```'
-                            );
-                        }
-                        let text = `[Assistant]: ${content}\n` + blocks.join('\n');
-                        // Collect following tool result messages and inline them
-                        for (let j = i + 1; j < messages.length; j++) {
-                            const nm = messages[j];
-                            if (!nm || nm.role !== 'tool') break;
-                            const tcid = nm.tool_call_id || '';
-                            combined.add(tcid);
-                            const name = nm.name || idToName[tcid] || 'tool';
-                            text += `\n[Tool result for ${name} (id=${tcid})]: ` + _stringifyContent(nm.content);
-                        }
-                        parts.push(text);
-                    } else {
-                        parts.push(`[Assistant]: ${content}`);
-                    }
-                } else if (role === 'tool') {
-                    const tcid = m.tool_call_id || '';
-                    if (combined.has(tcid)) continue; // already inlined above
-                    const name = m.name || idToName[tcid] || 'tool';
-                    parts.push(`[Tool result for ${name} (id=${tcid})]: ${content}`);
-                } else {
-                    // user (or unknown role)
-                    parts.push(content);
+                let text = `[Assistant]: ${content}\n` + blocks.join('\n');
+                // Collect following tool result messages and inline them
+                for (let j = i + 1; j < messages.length; j++) {
+                    const nm = messages[j];
+                    if (!nm || nm.role !== 'tool') break;
+                    const tcid = nm.tool_call_id || '';
+                    combined.add(tcid);
+                    const name = nm.name || idToName[tcid] || 'tool';
+                    text += `\n[Tool result for ${name} (id=${tcid})]: ` + _stringifyContent(nm.content);
                 }
+                parts.push(text);
+            } else {
+                parts.push(`[Assistant]: ${content}`);
             }
-
-            if (toolBlock) parts.push(_TOOL_REMINDER);
-
-            const bodyText = parts.filter(Boolean).join('\n\n');
-            return toolBlock ? `${toolBlock}\n\n${bodyText}` : bodyText;
+        } else if (role === 'tool') {
+            const tcid = m.tool_call_id || '';
+            if (combined.has(tcid)) continue; // already inlined above
+            const name = m.name || idToName[tcid] || 'tool';
+            parts.push(`[Tool result for ${name} (id=${tcid})]: ${content}`);
+        } else {
+            // user (or unknown role)
+            parts.push(content);
         }
+    }
 
-        export function mergeToolCalls(nativeCalls = [], textCalls = []) {
-            const merged = [];
-            const seen = new Set();
-            const seenIds = new Set();
-            for (const call of [...(nativeCalls || []), ...(textCalls || [])]) {
-                const name = normalizeToolName(call?.function?.name || '');
-                const args = typeof call?.function?.arguments === 'string' ? call.function.arguments : JSON.stringify(call?.function?.arguments || {});
-                if (!name) continue;
-                const key = `${name}\n${args}`;
-                if (seen.has(key)) continue;
-                seen.add(key);
-                let id = call.id && !seenIds.has(call.id)
-                    ? String(call.id)
-                    : `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
-                while (seenIds.has(id)) {
-                    id = `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
-                }
-                seenIds.add(id);
-                merged.push({
-                    id,
-                    type: 'function',
-                    function: { name, arguments: args },
-                    index: merged.length
-                });
-            }
-            return merged;
-        }
+    if (toolBlock) parts.push(_TOOL_REMINDER);
 
-        /**
-         * Decide whether sendMessage should issue a one-shot nudge retry when tools were
-         * declared. Plain-text replies under tool_choice="auto" are left alone; only
-         * rejected/broken tool calls or explicit tool requirements trigger a retry.
-         */
-        export function shouldRetryToolCall({ merged = [], dropped = [], toolChoice = null } = {}) {
-            if (Array.isArray(merged) && merged.length > 0) return false;
-            if (toolChoice === 'none') return false;
-            // tool_choice=required / specific function: always retry aggressively if no call was produced,
-            // regardless of whether drops look like soft examples. Check this BEFORE soft-drop detection
-            // so "required" is never downgraded to a neutral nudge.
-            if (toolChoice === 'required') return true;
-            if (toolChoice && typeof toolChoice === 'object') {
-                const fn = toolChoice.function;
-                const name = (fn && typeof fn === 'object') ? fn.name : toolChoice.name;
-                if (name) return true;
-            }
-            if (Array.isArray(dropped) && dropped.length > 0) {
-                // Classify each drop:
-                //   • "mid-sentence ... block ignored" — model wrote an example fence
-                //     mid-prose. Do NOT nudge aggressively ("Use a tool NOW"), as that
-                //     would turn the explanation into an actual command. But DO retry
-                //     with a neutral prompt so the model can clarify its intent.
-                //   • "bare-json-after-prose" — model placed JSON on its own line after
-                //     prose. Same treatment: neutral nudge.
-                //   • anything else (malformed block, missing param, undeclared tool) —
-                //     real failure; nudge assertively.
-                const realDrops = dropped.filter(d =>
-                    !d.startsWith('mid-sentence') &&
-                    !d.includes('block ignored') &&
-                    !d.startsWith('bare-json-after-prose')
-                );
-                if (realDrops.length > 0) return true;
-                // Soft retry for mid-sentence/bare-json-after-prose: the model may have
-                // intended a real tool call but wrote it in an ambiguous position.
-                // Use a neutral nudge ("if you meant a tool call, place it on its own line;
-                // if this was an example, reply normally") — do NOT use the aggressive
-                // "IMPORTANT: Use a tool call NOW" which would turn an explanation into a command.
-                const hasSoftDrop = dropped.some(d =>
-                    d.startsWith('mid-sentence') || d.includes('block ignored') || d.startsWith('bare-json-after-prose')
-                );
-                if (hasSoftDrop) return 'soft';
-            }
-            return false;
+    const bodyText = parts.filter(Boolean).join('\n\n');
+    return toolBlock ? `${toolBlock}\n\n${bodyText}` : bodyText;
+}
+
+export function mergeToolCalls(nativeCalls = [], textCalls = []) {
+    const merged = [];
+    const seen = new Set();
+    const seenIds = new Set();
+    for (const call of [...(nativeCalls || []), ...(textCalls || [])]) {
+        const name = normalizeToolName(call?.function?.name || '');
+        const args = typeof call?.function?.arguments === 'string' ? call.function.arguments : JSON.stringify(call?.function?.arguments || {});
+        if (!name) continue;
+        const key = `${name}\n${args}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        let id = call.id && !seenIds.has(call.id)
+            ? String(call.id)
+            : `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
+        while (seenIds.has(id)) {
+            id = `call_${crypto.randomUUID().replace(/-/g, '').slice(0, 24)}`;
         }
+        seenIds.add(id);
+        merged.push({
+            id,
+            type: 'function',
+            function: { name, arguments: args },
+            index: merged.length
+        });
+    }
+    return merged;
+}
+
+/**
+ * Decide whether sendMessage should issue a one-shot nudge retry when tools were
+ * declared. Plain-text replies under tool_choice="auto" are left alone; only
+ * rejected/broken tool calls or explicit tool requirements trigger a retry.
+ */
+export function shouldRetryToolCall({ merged = [], dropped = [], toolChoice = null } = {}) {
+    if (Array.isArray(merged) && merged.length > 0) return false;
+    if (toolChoice === 'none') return false;
+    // tool_choice=required / specific function: always retry aggressively if no call was produced,
+    // regardless of whether drops look like soft examples. Check this BEFORE soft-drop detection
+    // so "required" is never downgraded to a neutral nudge.
+    if (toolChoice === 'required') return true;
+    if (toolChoice && typeof toolChoice === 'object') {
+        const fn = toolChoice.function;
+        const name = (fn && typeof fn === 'object') ? fn.name : toolChoice.name;
+        if (name) return true;
+    }
+    if (Array.isArray(dropped) && dropped.length > 0) {
+        // Classify each drop:
+        //   • "mid-sentence ... block ignored" — model wrote an example fence
+        //     mid-prose. Do NOT nudge aggressively ("Use a tool NOW"), as that
+        //     would turn the explanation into an actual command. But DO retry
+        //     with a neutral prompt so the model can clarify its intent.
+        //   • "bare-json-after-prose" — model placed JSON on its own line after
+        //     prose. Same treatment: neutral nudge.
+        //   • anything else (malformed block, missing param, undeclared tool) —
+        //     real failure; nudge assertively.
+        const realDrops = dropped.filter(d =>
+            !d.startsWith('mid-sentence') &&
+            !d.includes('block ignored') &&
+            !d.startsWith('bare-json-after-prose')
+        );
+        if (realDrops.length > 0) return true;
+        // Soft retry for mid-sentence/bare-json-after-prose: the model may have
+        // intended a real tool call but wrote it in an ambiguous position.
+        // Use a neutral nudge ("if you meant a tool call, place it on its own line;
+        // if this was an example, reply normally") — do NOT use the aggressive
+        // "IMPORTANT: Use a tool call NOW" which would turn an explanation into a command.
+        const hasSoftDrop = dropped.some(d =>
+            d.startsWith('mid-sentence') || d.includes('block ignored') || d.startsWith('bare-json-after-prose')
+        );
+        if (hasSoftDrop) return 'soft';
+    }
+    return false;
+}

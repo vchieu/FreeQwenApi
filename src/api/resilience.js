@@ -132,8 +132,9 @@ export function nonStreamErrorBody(result = {}) {
 export function formatRateLimitCooldown(resetMs, now = Date.now()) {
     if (!resetMs || resetMs <= now) return null;
     const remainMs = resetMs - now;
-    const h = Math.floor(remainMs / 3600000);
-    const m = Math.ceil((remainMs % 3600000) / 60000);
+    const total = Math.ceil(remainMs / 60000);
+    const h = Math.floor(total / 60);
+    const m = total % 60;
     const cooldown = h > 0 ? `${h}h ${m}m` : `${m}m`;
     return `Rate limited: all accounts are on cooldown. Earliest reset in ${cooldown}.`;
 }

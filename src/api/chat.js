@@ -1103,7 +1103,7 @@ export async function executeApiRequestWithNodeStreaming(apiUrl, payload, token,
         reader.cancel().catch(() => {});
 
         if (streamError) {
-            return { success: false, ...streamError, hasStreamedChunks };
+            return { success: false, ...streamError, hasStreamedChunks, hasStreamedReasoning: fullReasoning.length > 0 };
         }
 
         if (!finished) {
@@ -1320,6 +1320,13 @@ async function executeApiRequest(page, apiUrl, payload, token, onChunk = null, o
         const wafBlockedNodeStream =
             streamedResponse.success !== true &&
             /Unexpected non-SSE 200/i.test(String(streamedResponse.error || ''));
+
+        // Thinking already reached the client: do not re-POST into the same chat.
+        if (!streamedResponse.success && !streamedResponse.status && streamedResponse.hasStreamedReasoning
+            && !streamedResponse.hasStreamedChunks) {
+            captchaWatcher.stop();
+            return { ...streamedResponse, interrupted: true };
+        }
 
         const canReturnDirectly = options.signal?.aborted || !wafBlockedNodeStream && (
             streamedResponse.success ||
@@ -1792,7 +1799,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
                 saveAuthToken(fresh);
                 markValidForToken(fresh);
                 logInfo('Retrying with freshly rotated browser token');
-                return sendMessage(message, model, chatId, parentId, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, options);
+                return sendMessage(message, model, chatId, parentId, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, retryOpts);
             }
         }
 
@@ -1800,7 +1807,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
             // chatId/parentId are reset: when switching accounts the old chat
             // belongs to the previous token and under the new one "does not exist".
-            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, { ...options, tokenObj: null });
+            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, { ...retryOpts, tokenObj: null });
         }
         logError('No valid tokens left or retries exhausted.');
         return { error: 'All tokens are invalid (401). Re-authentication required.', chatId };
@@ -1815,7 +1822,7 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
         if (hasValidTokens() && retryCount < MAX_RETRY_COUNT && response.hasStreamedChunks !== true) {
             // chatId/parentId are reset: when switching accounts the old chat
             // belongs to the previous token and under the new one "does not exist".
-            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, { ...options, tokenObj: null });
+            return sendMessage(message, model, null, null, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, { ...retryOpts, tokenObj: null });
         }
         const cooldownMsg = getRateLimitCooldownError() || `All tokens are rate limited (${hours}h)`;
         return { error: cooldownMsg, status: 429, chatId };
@@ -2271,6 +2278,15 @@ async function refreshTokenAfter401(browserContext, failedToken, tokenObj) {
     return null;
 }
 
+// Switch the caller's token object to another account in place: sendMessage keeps
+// this reference for error attribution. Every old field is dropped, so a previous
+// `source: 'browser'` cannot stick to a stored account.
+function adoptToken(target, next) {
+    if (!target || target === next) return next;
+    for (const key of Object.keys(target)) delete target[key];
+    return Object.assign(target, next);
+}
+
 // --- createChatV2 ----------------------------------------------------------
 
 export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', retryCount = 0, chatType = 't2t', tokenObj = null, skipPageTokenSync = false, authRetried = false) {
@@ -2346,7 +2362,7 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
             }
             // Keep the caller (sendMessage) on the same token we use to retry
             // so chat creation and message sending stay under one account.
-            if (tokenObj) Object.assign(tokenObj, refreshed);
+            tokenObj = adoptToken(tokenObj, refreshed);
             logInfo(`Retrying chat creation with refreshed token (attempt ${retryCount + 2})`);
             return createChatV2(model, title, retryCount + 1, chatType, tokenObj, true, true);
         }
@@ -2356,7 +2372,12 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
             authToken = null;
             const { hasValidTokens } = await import('./tokenManager.js');
             if (hasValidTokens() && retryCount < MAX_RETRY_COUNT) {
-                return createChatV2(model, title, retryCount + 1, chatType, null, true, authRetried);
+                // Same selection as sendMessage: skips rate-limited tabs and waits for
+                // an expiring tab token. No usable account => report the cooldown.
+                const next = await resolveAuthToken(browserContext);
+                if (next?.token && next.token !== requestToken) {
+                    return createChatV2(model, title, retryCount + 1, chatType, adoptToken(tokenObj, next), true, authRetried);
+                }
             }
             const cooldownMsg = getRateLimitCooldownError() || `All tokens are rate limited (${hours}h)`;
             return { error: cooldownMsg, status: 429 };

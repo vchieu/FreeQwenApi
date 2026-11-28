@@ -644,7 +644,40 @@ check('Fix 2 (R9): broken ```json fence WITHOUT tool shape does NOT stop subsequ
     assert.equal(r.calls[0].function.name, 'get_weather');
 });
 
-const TOTAL = 10 + 16 + 4 + 5 + 1 + 7 + 8 + 5 + 6 + 5 + 5; // +5 new R9 tests (incl. workdir)
+check('R10: unescaped Windows path with harmless other params is still executed', () => {
+    const text = '```tool_call\n' + String.raw`{"name":"get_weather","arguments":{"path":"C:\Users\me\a.txt","limit":200,"city":"Hanoi"}}` + '\n```';
+    const r = parseToolCalls(text, allowed, required);
+    assert.equal(r.calls.length, 1);
+    assert.equal(JSON.parse(r.calls[0].function.arguments).path, String.raw`C:\Users\me\a.txt`);
+});
+
+check('R10: wrapper forms cannot bypass the backslash-repair rejection', () => {
+    const call = String.raw`{"name":"bash","arguments":{"command":"type C:\Users\me\new.txt"}}`;
+    for (const body of [`{"tool_calls":[${call}]}`, `{"function_call":${call}}`, `{"tool_call":${call}}`]) {
+        const r = parseToolCalls('```tool_call\n' + body + '\n```', new Set(['bash']));
+        assert.equal(r.calls.length, 0, body);
+    }
+});
+
+check('R10: an explanatory ```json template stays in the answer and triggers no retry', () => {
+    const text = 'Format:\n```json\n{\n  "name": "<tool-name>",\n  "arguments": { ... }\n}\n```\nDone.';
+    const r = parseToolCalls(text, allowed, required);
+    assert.equal(r.dropped.length, 0);
+    assert.ok(r.text.includes('<tool-name>'));
+});
+
+check('R10: a broken ```json call still stops the next fence for any key order or wrapper', () => {
+    const next = '```json\n{"name":"bash","arguments":{"command":"sh a.sh"}}\n```';
+    for (const bad of [
+        '{"arguments":{"path":"a.sh","content":"echo "x""},"name":"write_file"}',
+        '{"tool_calls":[{"name":"write_file","arguments":{"path":"a.sh","content":"echo "x""}}]}',
+    ]) {
+        const r = parseToolCalls('```json\n' + bad + '\n```\n' + next, new Set(['write_file', 'bash']));
+        assert.equal(r.calls.length, 0, bad);
+    }
+});
+
+const TOTAL = 10 + 16 + 4 + 5 + 1 + 7 + 8 + 5 + 6 + 5 + 5 + 4; // +5 R9 tests (incl. workdir), +4 R10
 console.log(`\nchecks: ${checks}`);
 console.log(checks === TOTAL ? 'PASS' : `FAIL (expected ${TOTAL} checks, got ${checks})`);
 process.exit(checks === TOTAL ? 0 : 1);
