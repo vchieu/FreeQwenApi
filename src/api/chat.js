@@ -1104,7 +1104,7 @@ async function qwenCookieHeader(page) {
 
 // Qwen web tokens live ~15 minutes; the page keeps refreshing them. Take the
 // freshest token straight from the tab before each request.
-async function syncTokenFromPage(page, tokenObj = null) {
+async function syncTokenFromPage(page) {
     try {
         const fresh = await readTokenFromQwenTab(getBrowserContext())
             || await page.evaluate(() => localStorage.getItem('token'));
@@ -1127,9 +1127,9 @@ export async function deleteChatV2(chatId) {
 
     let page = null;
     try {
-        const tokenObj = await resolveAuthToken(browserContext);
+        await resolveAuthToken(browserContext);
         page = await pagePool.getPage(browserContext);
-        await syncTokenFromPage(page, tokenObj);
+        await syncTokenFromPage(page);
 
         const headers = loadBaxiaHeaders() || {};
         const result = await page.evaluate(async ({ id, token, extraHeaders }) => {
@@ -1697,18 +1697,22 @@ async function handleApiError(response, tokenObj, message, model, chatId, parent
     if (response.status === 401 || (response.errorBody && (response.errorBody.includes('Unauthorized') || response.errorBody.includes('Token has expired')))) {
         logWarn('Browser token rejected (401); attempting refresh.');
         if (response.errorBody) logWarn(`401 response body: ${String(response.errorBody).slice(0, 300)}`);
+        // Capture the token actually sent (may differ from tokenObj.token after
+        // a createChatV2 refresh) before clearing authToken, so recovery excludes it.
+        const failedToken = authToken || tokenObj?.token || null;
         authToken = null;
 
         // A browser token can be rejected simply because Qwen rotated it a
         // second before our request. Wait for the natural rotation, or force a
         // reload of the proxy-owned tab, then retry the SAME chat.
         if (retryCount < MAX_RETRY_COUNT) {
-            const fresh = await recoverBrowserToken(getBrowserContext(), tokenObj?.token);
+            const fresh = await recoverBrowserToken(getBrowserContext(), failedToken);
             if (fresh) {
                 authToken = fresh;
                 saveAuthToken(fresh);
                 logInfo('Retrying with freshly rotated browser token');
-                return sendMessage(message, model, chatId, parentId, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, retryOpts);
+                const refreshedTokenObj = { id: 'browser', token: fresh, source: 'browser' };
+                return sendMessage(message, model, chatId, parentId, files, tools, toolChoice, systemMessage, chatType, size, waitForCompletion, retryCount + 1, onChunk, { ...retryOpts, tokenObj: refreshedTokenObj });
             }
         }
         logError('No fresh token available; re-authentication required.');
@@ -1815,7 +1819,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     let page = null;
     try {
         page = await pagePool.getPage(browserContext);
-        if (!chatAuthRetried) await syncTokenFromPage(page, tokenObj);
+        if (!chatAuthRetried) await syncTokenFromPage(page);
 
         // Detect a captcha BEFORE firing the request. The old checkVerification()
         // blocked on stdin (which hangs under NON_INTERACTIVE) and only looked at
@@ -2175,7 +2179,7 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
         page = await pagePool.getPage(browserContext);
         // On an auth retry the token was just refreshed/switched; do not let a
         // stale token still sitting in the page overwrite it.
-        if (!skipPageTokenSync) await syncTokenFromPage(page, tokenObj);
+        if (!skipPageTokenSync) await syncTokenFromPage(page);
         const requestToken = authToken;
 
         const payload = { title, models: [model], chat_mode: 'normal', chat_type: chatType, timestamp: Date.now() };

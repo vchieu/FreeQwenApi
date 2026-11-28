@@ -18,7 +18,7 @@ import { applySessionSync, getSessionSyncStatus } from './sessionSync.js';
 import { reasoningOptionsFromEffort } from './reasoning.js';
 import { parseToolCalls, mergeToolCalls, toolNames, toolRequiredParams, messagesToQwenPrompt } from './toolCalls.js';
 import { normalizeUsage } from './usage.js';
-import { errorResponseStatus, nonStreamErrorBody } from './resilience.js';
+import { errorResponseStatus, errorTypeForResult, nonStreamErrorBody } from './resilience.js';
 
 // Control messages (captcha status, upstream errors) must never go into
 // `delta.content`: OpenAI clients concatenate that field into the assistant's
@@ -43,7 +43,7 @@ function writeProxyNotice(writeSse, model, text, kind = 'notice', finishReason =
 // corrupt what the client already received. Captcha notices keep using
 // writeProxyNotice() alone because the request will continue and produce an
 // answer; putting them in `content` used to glue them onto that answer.
-function writeProxyError(writeSse, model, text, hasContent = false) {
+function writeProxyError(writeSse, model, text, hasContent = false, errorType = 'server_error') {
     const message = String(text);
     writeProxyNotice(writeSse, model, message, 'error');
     writeSse({
@@ -51,7 +51,7 @@ function writeProxyError(writeSse, model, text, hasContent = false) {
         object: 'chat.completion.chunk',
         created: Math.floor(Date.now() / 1000),
         model: model || DEFAULT_MODEL,
-        error: { message, type: 'server_error' },
+        error: { message, type: errorType },
         choices: [{ index: 0, delta: {}, finish_reason: null }]
     });
     if (!hasContent) {
@@ -891,7 +891,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
             let streamedContent = '';
 
             if (result.error) {
-                writeProxyError(writeSse, mappedModel, `Error: ${result.error}`, Boolean(result.quotaLimited));
+                writeProxyError(writeSse, mappedModel, `Error: ${result.error}`, Boolean(result.quotaLimited), errorTypeForResult(result));
             } else if (result.choices?.[0]?.message) {
                 const content = String(result.choices[0].message.content || '');
                 streamedContent = content;
@@ -1085,7 +1085,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
 
                     if (result.error) {
-                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks || Boolean(result.quotaLimited));
+                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks || Boolean(result.quotaLimited), errorTypeForResult(result));
                     } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {
                         // Qwen returned JSON/normal response instead of SSE - send final as single chunk
                         const content = result.choices[0].message.content;
@@ -1639,7 +1639,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
 
                     if (result.error) {
-                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks || Boolean(result.quotaLimited));
+                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks || Boolean(result.quotaLimited), errorTypeForResult(result));
                     } else if (captureToolCalls && _captureDropped.length > 0 && !_captureCleanText) {
                         // Tool-call blocks were broken/rejected even after retry and no prose remains.
                         // Never dump raw ```tool_call fences to the client as finish_reason:"stop".
@@ -2083,7 +2083,7 @@ function writeToolCallsSse(res, mappedModel, result, toolCalls, cleanText = '', 
                     }
 
                     if (result.error) {
-                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks || Boolean(result.quotaLimited));
+                        writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Error: ${result.error}`, hasStreamedChunks || Boolean(result.quotaLimited), errorTypeForResult(result));
                     } else if (captureToolCalls && _captureDropped.length > 0 && !_captureCleanText) {
                         writeProxyError(writeSse, mappedModel || DEFAULT_MODEL, `Invalid tool call: ${_captureDropped.join('; ')}`, hasStreamedChunks);
                     } else if (!hasStreamedChunks && result.choices && result.choices[0] && result.choices[0].message && result.choices[0].message.content) {

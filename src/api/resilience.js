@@ -110,6 +110,12 @@ export function errorResponseStatus(result = {}) {
     return Number.isFinite(status) && status >= 400 ? status : 500;
 }
 
+/** OpenAI error.type for an upstream failure result (used by both SSE and JSON paths). */
+export function errorTypeForResult(result = {}) {
+    if (result?.quotaLimited || errorResponseStatus(result) === 429) return 'rate_limit_error';
+    return 'server_error';
+}
+
 /** Build the HTTP status and JSON error body for non-streaming chat endpoints. */
 export function nonStreamErrorBody(result = {}) {
     const status = errorResponseStatus(result);
@@ -118,7 +124,7 @@ export function nonStreamErrorBody(result = {}) {
         body: {
             error: {
                 message: result?.error || 'Request failed',
-                type: status === 429 ? 'rate_limit_error' : 'server_error',
+                type: errorTypeForResult(result),
                 ...(status !== 500 ? { status } : {})
             }
         }

@@ -11,6 +11,7 @@ import {
     isProtocolTimeoutError,
     isNodeStreamTimeout,
     isVisibleBox,
+    errorTypeForResult,
     nonStreamErrorBody,
     applyRetryReasoningSuppression
 } from '../../src/api/resilience.js';
@@ -209,7 +210,14 @@ check('nonStreamErrorBody propagates 429 status instead of defaulting to 500', (
     assert.equal(fallback.status, 500);
 });
 
-const TOTAL = 7 + 8 + 2 + 3 + 2 + 5 + 1 + 2;
+check('errorTypeForResult maps 429 and quotaLimited to rate_limit_error', () => {
+    assert.equal(errorTypeForResult({ status: 429 }), 'rate_limit_error');
+    assert.equal(errorTypeForResult({ quotaLimited: true }), 'rate_limit_error');
+    assert.equal(errorTypeForResult({ status: 500 }), 'server_error');
+    assert.equal(errorTypeForResult({ error: 'Boom' }), 'server_error');
+});
+
+const TOTAL = 7 + 8 + 2 + 3 + 2 + 5 + 1 + 3;
 console.log(`\nchecks: ${checks}`);
 console.log(checks === TOTAL ? 'PASS' : `FAIL (expected ${TOTAL} checks, got ${checks})`);
 process.exit(checks === TOTAL ? 0 : 1);
