@@ -1787,7 +1787,7 @@ export async function sendMessage(message, model = DEFAULT_MODEL, chatId = null,
     let chatAuthRetried = false;
     if (!chatId) {
         const newChatResult = await createChatV2(model, 'New chat', 0, chatType, tokenObj);
-        if (newChatResult.error) return { error: 'Failed to create chat: ' + newChatResult.error, status: newChatResult.status, unauthorized: newChatResult.unauthorized };
+        if (newChatResult.error) return { error: 'Failed to create chat: ' + newChatResult.error, status: newChatResult.status, unauthorized: newChatResult.unauthorized, quotaLimited: newChatResult.quotaLimited };
         chatId = newChatResult.chatId;
         chatAuthRetried = Boolean(newChatResult.authRetried);
         logInfo(`Created new chat v2 with ID: ${chatId}`);
@@ -2227,6 +2227,24 @@ export async function createChatV2(model = DEFAULT_MODEL, title = 'New chat', re
             tokenObj = refreshed;
             logInfo(`Retrying chat creation with refreshed token (attempt ${retryCount + 2})`);
             return createChatV2(model, title, retryCount + 1, chatType, tokenObj, true, true);
+        }
+
+        // Shared classifier (gotcha #36): HTTP 429 and HTTP 200 error bodies
+        // (success:false / data.code) must surface a real status + message.
+        // Before this, a 200 body with an error fell through to "Unknown error"
+        // and a 429 dumped the raw JSON body at the client. Unauthorized bodies
+        // were already handled above (retryable, gotcha #8).
+        const classified = result.success ? classifyJsonErrorBody(result.data, isQuotaLimitDelta) : null;
+        if (result.status === 429 || classified?.status === 429) {
+            if (classified?.quotaLimited) {
+                return { error: quotaLimitMessage(model), status: 429, quotaLimited: true };
+            }
+            return { error: rateLimitMessage(result.errorBody || result.data), status: 429 };
+        }
+        if (classified) {
+            const body = result.data || {};
+            const code = body?.data?.code || body?.code || body?.data?.error || body?.error;
+            return { error: `Qwen chat creation failed: ${code || 'unknown error'}`, status: classified.status };
         }
 
         const isTransient = result.status >= 500 && result.status < 600;
